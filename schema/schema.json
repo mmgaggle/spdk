@@ -539,9 +539,31 @@
           "description": "array of objects describing @ref rpc_vhost_get_controllers_scsi_luns"
         }
       ]
+    },
+    {
+      "name": "nvmf_kv_exec_allow",
+      "fields": [
+        {
+          "name": "op_id",
+          "type": "uint32",
+          "required": true,
+          "description": "Permitted KV Exec operation ID (ADR-0005)"
+        },
+        {
+          "name": "binding",
+          "type": "string",
+          "description": "Optional opaque binding descriptor the backend interprets"
+        }
+      ]
     }
   ],
   "arrays": [
+    {
+      "name": "nvmf_kv_exec_allowlist",
+      "item_type": "object",
+      "class": "nvmf_kv_exec_allow",
+      "max_count": 256
+    },
     {
       "name": "bdev_histogram_borders",
       "item_type": "uint64",
@@ -4645,6 +4667,57 @@
           "type": "string",
           "required": true,
           "description": "Host NQN"
+        },
+        {
+          "name": "tgt_name",
+          "type": "string",
+          "description": "The name of the parent NVMe-oF target (optional)"
+        }
+      ]
+    },
+    {
+      "name": "nvmf_ns_set_kv_exec_allowlist",
+      "params": [
+        {
+          "name": "nqn",
+          "type": "string",
+          "required": true,
+          "description": "Subsystem NQN"
+        },
+        {
+          "name": "nsid",
+          "type": "uint32",
+          "required": true,
+          "description": "Namespace ID"
+        },
+        {
+          "name": "allowlist",
+          "type": "array",
+          "class": "nvmf_kv_exec_allowlist",
+          "required": true,
+          "description": "Replacement KV Exec allowlist (array of {op_id, binding}); empty clears it"
+        },
+        {
+          "name": "tgt_name",
+          "type": "string",
+          "description": "The name of the parent NVMe-oF target (optional)"
+        }
+      ]
+    },
+    {
+      "name": "nvmf_ns_get_kv_exec_allowlist",
+      "params": [
+        {
+          "name": "nqn",
+          "type": "string",
+          "required": true,
+          "description": "Subsystem NQN"
+        },
+        {
+          "name": "nsid",
+          "type": "uint32",
+          "required": true,
+          "description": "Namespace ID"
         },
         {
           "name": "tgt_name",

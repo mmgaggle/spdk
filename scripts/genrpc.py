@@ -52,7 +52,9 @@ def lint_c_code(schema: Dict[str, Any]) -> None:
     # manual rpc_<method>_decoders[] for these — the autogen array is the
     # single source of truth. Phase 3 lockdown will require every schema
     # method to appear here.
-    migrated_decoders: set[str] = {"nvmf_subsystem_add_kv_ns"}
+    migrated_decoders: set[str] = {"nvmf_subsystem_add_kv_ns",
+                                   "nvmf_ns_set_kv_exec_allowlist",
+                                   "nvmf_ns_get_kv_exec_allowlist"}
     c_code_methods = dict()
     c_code_aliases = dict()
     c_code_free = set()
