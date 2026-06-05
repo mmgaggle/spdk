@@ -317,6 +317,21 @@ def add_parser(subparsers):
                    help='[Deprecated] Enable hide_metadata option to the bdev (optional)')
     p.set_defaults(func=nvmf_subsystem_add_ns)
 
+    def nvmf_subsystem_add_kv_ns(args):
+        params = strip_globals(vars(args))
+        params = apply_defaults(params, tgt_name=None)
+        args.client.nvmf_subsystem_add_kv_ns(**params)
+
+    p = subparsers.add_parser('nvmf_subsystem_add_kv_ns',
+                              help='Add a Key-Value namespace to an NVMe-oF subsystem')
+    p.add_argument('nqn', help='NVMe-oF subsystem NQN')
+    p.add_argument('kvdev_name', help='The name of the kvdev that will back this KV namespace')
+    p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
+    p.add_argument('-n', '--nsid', help='The requested NSID (optional)', type=int)
+    p.add_argument('-u', '--uuid', help='Namespace UUID (optional)')
+    p.add_argument('-a', '--anagrpid', help='ANA group ID (optional)', type=int)
+    p.set_defaults(func=nvmf_subsystem_add_kv_ns)
+
     def nvmf_subsystem_set_ns_ana_group(args):
         args.client.nvmf_subsystem_set_ns_ana_group(
                                                  nqn=args.nqn,

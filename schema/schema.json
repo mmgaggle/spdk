@@ -1760,6 +1760,80 @@
       ]
     },
     {
+      "name": "kvdev_mem_create",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the in-memory kvdev to create"
+        },
+        {
+          "name": "uuid",
+          "type": "uuid",
+          "description": "UUID of the new kvdev"
+        },
+        {
+          "name": "max_value_len",
+          "type": "uint32",
+          "description": "Maximum value length in bytes (0 for default)"
+        },
+        {
+          "name": "max_num_keys",
+          "type": "uint32",
+          "description": "Maximum number of keys (0 for unlimited)"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_mem_delete",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the in-memory kvdev to delete"
+        }
+      ]
+    },
+    {
+      "name": "nvmf_subsystem_add_kv_ns",
+      "params": [
+        {
+          "name": "nqn",
+          "type": "string",
+          "required": true,
+          "description": "Subsystem NQN"
+        },
+        {
+          "name": "kvdev_name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the kvdev to bind as a Key-Value namespace"
+        },
+        {
+          "name": "nsid",
+          "type": "uint32",
+          "description": "Namespace ID (0 to auto-assign)"
+        },
+        {
+          "name": "anagrpid",
+          "type": "uint32",
+          "description": "ANA group ID"
+        },
+        {
+          "name": "uuid",
+          "type": "uuid",
+          "description": "Namespace UUID"
+        },
+        {
+          "name": "tgt_name",
+          "type": "string",
+          "description": "Parent NVMe-oF target name"
+        }
+      ]
+    },
+    {
       "name": "bdev_null_resize",
       "params": [
         {
