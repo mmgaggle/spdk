@@ -29,7 +29,6 @@ struct kv_host_shim {
 	bool			owns_env;
 	/* Per-op completion state. */
 	volatile bool		done;
-	volatile bool		failed;
 	volatile uint8_t	last_sct;
 	volatile uint8_t	last_sc;
 	volatile uint32_t	last_cdw0;
@@ -59,7 +58,6 @@ io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 	sh->last_sct = cpl->status.sct;
 	sh->last_sc = cpl->status.sc;
 	sh->last_cdw0 = cpl->cdw0;
-	sh->failed = spdk_nvme_cpl_is_error(cpl);
 	sh->done = true;
 }
 
@@ -100,6 +98,12 @@ kv_host_shim_open(const struct kv_host_shim_opts *opts, struct kv_host_shim **ou
 	if (opts == NULL || out == NULL) {
 		return -EINVAL;
 	}
+	/*
+	 * Define the out-param up front so every failure path below (env-init
+	 * failure, probe/attach failure, no KV ns, qpair alloc failure) leaves
+	 * the caller's handle defined rather than stale.
+	 */
+	*out = NULL;
 	/* Size-version validation: require the field we read here. */
 	if (opts->opts_size < sizeof(struct kv_host_shim_opts)) {
 		return -EINVAL;
@@ -246,7 +250,6 @@ kv_host_shim_store(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 		return -EINVAL;
 	}
 	sh->done = false;
-	sh->failed = false;
 	rc = spdk_nvme_kv_store(sh->ns, sh->qpair, key, key_len, value, value_len,
 				io_complete, sh, 0);
 	if (rc != 0) {
@@ -266,7 +269,6 @@ kv_host_shim_retrieve(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 		return -EINVAL;
 	}
 	sh->done = false;
-	sh->failed = false;
 	rc = spdk_nvme_kv_retrieve(sh->ns, sh->qpair, key, key_len, value, buf_len,
 				   io_complete, sh, 0);
 	if (rc != 0) {
@@ -290,7 +292,6 @@ kv_host_shim_exist(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 		return -EINVAL;
 	}
 	sh->done = false;
-	sh->failed = false;
 	rc = spdk_nvme_kv_exist(sh->ns, sh->qpair, key, key_len, io_complete, sh);
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;
@@ -308,7 +309,6 @@ kv_host_shim_delete(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 		return -EINVAL;
 	}
 	sh->done = false;
-	sh->failed = false;
 	rc = spdk_nvme_kv_delete(sh->ns, sh->qpair, key, key_len, io_complete, sh);
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;

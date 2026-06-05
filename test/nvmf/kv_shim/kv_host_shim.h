@@ -6,10 +6,16 @@
  * \file
  * In-process NVMe Key-Value host (initiator) client shim.
  *
- * A small, reusable, in-process NVMe KV host (initiator) client over the SPDK
- * NVMe driver. It attaches to an NVMf controller over the VFIOUSER transport,
+ * A small, in-process NVMe KV host (initiator) client over the SPDK NVMe
+ * driver. It attaches to an NVMf controller over the VFIOUSER transport,
  * binds a Key-Value namespace, and exposes synchronous Store/Retrieve/Exist/
  * Delete primitives backed by SPDK-DMA buffers and a qpair poll loop.
+ *
+ * "Reusable" here means a single open shim is reusable across many KV
+ * operations and linkable by the in-process NIXL plugin -- NOT that the SPDK
+ * env can be re-initialized. See kv_host_shim_open()/kv_host_shim_close() for
+ * the single-instance / single-lifetime constraint that applies when
+ * init_env=true.
  *
  * This header is the public C ABI that downstream consumers (e.g. the NIXL
  * RADOS_KV plugin, which is C++) link against, so it is a plain C API wrapped
@@ -55,6 +61,22 @@ struct kv_host_shim_opts {
 	 * When true, the shim calls spdk_env_init() in open() and
 	 * spdk_env_fini() in close(). When false, the caller owns the SPDK env
 	 * (must have initialized it already).
+	 *
+	 * IMPORTANT (single-instance / single-lifetime): DPDK cannot
+	 * re-initialize the SPDK env within one process, so an init_env=true
+	 * shim initializes the process's SPDK env exactly ONCE for its whole
+	 * lifetime. After kv_host_shim_close() releases the env (via
+	 * spdk_env_fini()), you CANNOT open another init_env=true shim in the
+	 * same process -- a second spdk_env_init() fails with "Invalid arguments
+	 * to reinitialize SPDK env". The init_env=false path (used by the NIXL
+	 * plugin, where the host process owns the env) is unaffected and may be
+	 * opened/closed repeatedly.
+	 *
+	 * Env policy when init_env=true: the env is initialized with
+	 * no-hugepages (no_huge=true, which selects IOVA=VA) and a 512 MB heap
+	 * (mem_size=512) so an unprivileged in-process host works without
+	 * reserved hugepages or root/PA access. These values are fixed by the
+	 * shim; a root/hugepage environment still works.
 	 */
 	bool		init_env;
 };
@@ -64,14 +86,26 @@ struct kv_host_shim_opts {
  * VFIOUSER, bind the KV namespace, allocate an I/O qpair, and cache the KV
  * namespace key/value max lengths.
  *
+ * When opts->init_env is true this is single-instance / single-lifetime per
+ * process: after the shim is closed you cannot open another init_env=true
+ * shim in the same process (see the init_env field doc). The init_env=false
+ * path may be opened/closed repeatedly.
+ *
  * \param opts Size-versioned options (opts_size must be set).
- * \param out  Receives the new shim handle on success.
+ * \param out  Receives the new shim handle. Always written: set to NULL on
+ *             entry, so on any failure *out is NULL (never left stale).
  *
  * \return 0 on success, a negated errno on failure.
  */
 int kv_host_shim_open(const struct kv_host_shim_opts *opts, struct kv_host_shim **out);
 
-/** Close a shim opened by kv_host_shim_open(). Safe to call with NULL. */
+/**
+ * Close a shim opened by kv_host_shim_open(). Safe to call with NULL.
+ *
+ * For an init_env=true shim this also calls spdk_env_fini(), releasing the
+ * process's SPDK env; per the single-lifetime constraint above, no further
+ * init_env=true shim can be opened in this process afterwards.
+ */
 void kv_host_shim_close(struct kv_host_shim *sh);
 
 /** Allocate a DMA-capable buffer of \c len bytes (zeroed). NULL on failure. */
@@ -101,6 +135,10 @@ int kv_host_shim_store(struct kv_host_shim *sh, const void *key, uint8_t key_len
  * set to the device's TRUE value length (the completion cdw0), which may exceed
  * \c buf_len if the buffer was too small (the returned data is then truncated to
  * \c buf_len bytes, matching the NVMe KV Retrieve contract).
+ *
+ * \c *value_len_out is written ONLY on success (return 0); on any failure
+ * (positive logical status or negated errno) it is left untouched, so the
+ * caller must not read it unless the call returned 0.
  *
  * \return per the return convention documented at the top of this header.
  */
