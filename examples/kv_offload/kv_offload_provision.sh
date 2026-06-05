@@ -21,9 +21,12 @@
 #   * /dev/vfio access + IPC_LOCK for the vfio-user data path
 #   * a reachable Ceph cluster (ceph.conf + keyring + cephx user) and a pool
 #
-# The script is idempotent-ish: re-running against an existing RPC socket reuses
-# the running target, and create steps that already exist are tolerated. A trap
-# tears down anything THIS invocation started.
+# The script is idempotent: re-running against an existing RPC socket reuses the
+# running target, and per-tenant bindings that already match the intended kvdev
+# are skipped. A re-run with the SAME tenant list converges to the same nsid->
+# tenant map and exits 0; a conflicting binding (nsid already bound to a
+# DIFFERENT kvdev) fails fast with a clear message. A trap tears down anything
+# THIS invocation started.
 
 set -euo pipefail
 
@@ -51,7 +54,18 @@ Topology / runtime options:
   --nqn NQN             subsystem NQN     (default nqn.2026-06.io.spdk:kv-offload0)
   --serial SN           subsystem serial  (default SPDKKVOFF1)
   --cpumask MASK        nvmf_tgt core mask (default 0x3)
-  --rados-bin PATH      rados CLI (only used by --selftest; default: rados)
+  --rados-bin PATH      rados CLI used by --selftest          (env RADOS_BIN,
+                        default: rados)
+
+Self-test (tenant-isolation check):
+  --selftest            after wiring up, Store a value to nsid 1 via the
+                        in-process KV host shim (test/nvmf/kv_shim) and confirm
+                        with the rados CLI that the resulting object lands ONLY
+                        in tenant 1's rados namespace (present there, absent
+                        from tenant 2's namespace when >=2 tenants). Requires
+                        the kv_shim_test binary (built under test/nvmf/kv_shim)
+                        and rados CLI access to the cluster. Implies the target
+                        is left up only as long as the script runs.
 
 Hugepages / privilege:
   --no-huge             pass --no-huge -s <MB> to nvmf_tgt for an unprivileged
@@ -92,6 +106,7 @@ NO_HUGE=0
 MEM_SIZE=1024
 KEEP=0
 TEARDOWN_EXISTING=0
+SELFTEST=0
 CLUSTER_NAME="ceph0"
 
 tenants=()
@@ -151,6 +166,10 @@ while [[ $# -gt 0 ]]; do
 			KEEP=1
 			shift
 			;;
+		--selftest)
+			SELFTEST=1
+			shift
+			;;
 		--teardown-existing)
 			TEARDOWN_EXISTING=1
 			shift
@@ -193,6 +212,29 @@ die() {
 [[ -f $CEPH_CONF ]] || die "ceph conf not found: $CEPH_CONF"
 [[ -f $CEPH_KEYRING ]] || die "keyring not found: $CEPH_KEYRING"
 
+# Validate every tenant spec UP FRONT, and reject duplicate tenant names or
+# duplicate rados namespaces before touching the target. A duplicate tenant
+# would otherwise collide on the kvdev name (KvOff_<tenant>) and a duplicate
+# rados namespace would silently break per-tenant isolation -- both would
+# mislabel the nsid->tenant->namespace map. Fail fast with a clear message.
+declare -A _seen_tenant _seen_ns
+for spec in "${tenants[@]}"; do
+	tenant="${spec%%:*}"
+	radosns="${spec#*:}"
+	if [[ -z $tenant || -z $radosns || $tenant == "$spec" ]]; then
+		die "bad tenant spec '$spec' (expected TENANT:RADOS_NS)"
+	fi
+	if [[ -n ${_seen_tenant[$tenant]:-} ]]; then
+		die "duplicate tenant name '$tenant' (each tenant must be unique; specs: ${tenants[*]})"
+	fi
+	if [[ -n ${_seen_ns[$radosns]:-} ]]; then
+		die "duplicate rados namespace '$radosns' (tenant '$tenant' collides with tenant '${_seen_ns[$radosns]}'; each tenant needs its own namespace for isolation)"
+	fi
+	_seen_tenant[$tenant]=1
+	_seen_ns[$radosns]=$tenant
+done
+unset _seen_tenant _seen_ns
+
 # Resolve the SPDK tree this script lives under, to locate rpc.py and nvmf_tgt.
 # Allow override so a sidecar image can point at an installed prefix.
 rootdir="${SPDK_ROOT_DIR:-$(readlink -f "$(dirname "$0")/../..")}"
@@ -219,24 +261,57 @@ rpc() { "$RPC_PY_BIN" -s "$RPC_SOCK" "$@"; }
 
 # Return the nsid bound to a given kvdev under a subsystem, by reading
 # nvmf_get_subsystems. Prefer jq when present; fall back to a python parse so
-# the script works without jq installed. Prints the nsid (or nothing).
+# the script works without jq installed. Asserts EXACTLY ONE matching binding
+# exists and prints that single nsid; prints nothing (empty) if none match, and
+# fails (rc 3) if more than one nsid is bound to the same kvdev -- never returns
+# a stale/duplicate nsid via head -n1.
 kvdev_nsid() {
-	local nqn="$1" kvdev="$2"
+	local nqn="$1" kvdev="$2" matches
 	if command -v jq > /dev/null 2>&1; then
-		rpc nvmf_get_subsystems 2> /dev/null | jq -r \
+		matches=$(rpc nvmf_get_subsystems 2> /dev/null | jq -r \
 			--arg nqn "$nqn" --arg kv "$kvdev" \
 			'.[] | select(.nqn==$nqn) | .namespaces[]?
-			 | select(.kvdev_name==$kv) | .nsid' | head -n1
+			 | select(.kvdev_name==$kv) | .nsid')
 	else
-		rpc nvmf_get_subsystems 2> /dev/null | python3 -c '
+		matches=$(rpc nvmf_get_subsystems 2> /dev/null | python3 -c '
 import json,sys
 nqn,kv=sys.argv[1],sys.argv[2]
 for s in json.load(sys.stdin):
     if s.get("nqn")==nqn:
         for ns in s.get("namespaces",[]):
             if ns.get("kvdev_name")==kv:
-                print(ns.get("nsid")); break
-' "$nqn" "$kvdev"
+                print(ns.get("nsid"))
+' "$nqn" "$kvdev")
+	fi
+	local n
+	n=$(grep -c . <<< "$matches" 2> /dev/null || echo 0)
+	[[ -z $matches ]] && n=0
+	if [[ $n -gt 1 ]]; then
+		echo "$prog: kvdev '$kvdev' is bound to multiple nsids ($(tr '\n' ' ' <<< "$matches")) under $nqn" >&2
+		return 3
+	fi
+	printf '%s\n' "$matches"
+}
+
+# Return the kvdev_name bound to a given nsid under a subsystem (empty if the
+# nsid is unbound). Used to decide idempotency before adding a KV namespace.
+nsid_kvdev() {
+	local nqn="$1" want="$2"
+	if command -v jq > /dev/null 2>&1; then
+		rpc nvmf_get_subsystems 2> /dev/null | jq -r \
+			--arg nqn "$nqn" --argjson n "$want" \
+			'.[] | select(.nqn==$nqn) | .namespaces[]?
+			 | select(.nsid==$n) | .kvdev_name // ""'
+	else
+		rpc nvmf_get_subsystems 2> /dev/null | python3 -c '
+import json,sys
+nqn=sys.argv[1]; want=int(sys.argv[2])
+for s in json.load(sys.stdin):
+    if s.get("nqn")==nqn:
+        for ns in s.get("namespaces",[]):
+            if ns.get("nsid")==want:
+                print(ns.get("kvdev_name") or "")
+' "$nqn" "$want"
 	fi
 }
 
@@ -345,20 +420,49 @@ for spec in "${tenants[@]}"; do
 	idx=$((idx + 1))
 	kvdev="KvOff_${tenant}"
 
-	rpc_idempotent kvdev_rados_create "$kvdev" "$CLUSTER_NAME" "$KV_POOL" \
-		--namespace "$radosns" > /dev/null
+	# Genuine idempotency: inspect what (if anything) nsid $idx is already bound
+	# to under this subsystem BEFORE trying to add it. nvmf_subsystem_add_kv_ns
+	# on an already-bound nsid returns JSON-RPC -32602 "Invalid parameters",
+	# which is NOT an "already exists" string -- so we must not blindly call it.
+	bound_kvdev=$(nsid_kvdev "$NQN" "$idx")
+	if [[ -n $bound_kvdev ]]; then
+		if [[ $bound_kvdev == "$kvdev" ]]; then
+			# nsid $idx already maps to THIS tenant's kvdev: nothing to do.
+			# The kvdev itself necessarily already exists (it is bound), so we
+			# do NOT recreate it -- this is the idempotent re-run path.
+			echo "### nsid $idx already bound to $kvdev (tenant $tenant); skipping (idempotent)" >&2
+			nsid="$idx"
+			map_nsid+=("$nsid")
+			map_tenant+=("$tenant")
+			map_ns+=("$radosns")
+			continue
+		fi
+		die "nsid $idx is already bound to a DIFFERENT kvdev '$bound_kvdev' (intended '$kvdev' for tenant '$tenant'); refusing to clobber an existing mapping -- tear down the existing subsystem or use a different --nqn"
+	fi
+
+	# nsid $idx is unbound. Create the per-tenant kvdev. Because tenant names are
+	# validated unique up front, a "already exists" kvdev here while its nsid is
+	# unbound indicates a stale/orphaned device from a prior run with a different
+	# nsid layout (or a real bug) -- treat it as fatal rather than swallowing it,
+	# so we never silently bind two nsids to one namespace.
+	if ! out=$(rpc kvdev_rados_create "$kvdev" "$CLUSTER_NAME" "$KV_POOL" \
+		--namespace "$radosns" 2>&1); then
+		die "kvdev_rados_create for tenant '$tenant' ($kvdev) failed: $out"
+	fi
 
 	# Request an explicit, deterministic nsid (1..N in tenant order) so the
 	# host-facing nsid->tenant map is stable across runs. The add_kv_ns RPC
 	# returns the assigned nsid, but the CLI wrapper does not echo it, so we
 	# confirm the binding by reading it back from nvmf_get_subsystems below.
-	if ! rpc_idempotent nvmf_subsystem_add_kv_ns "$NQN" "$kvdev" -n "$idx" > /dev/null; then
-		die "failed to add KV ns for tenant $tenant ($kvdev)"
+	if ! out=$(rpc nvmf_subsystem_add_kv_ns "$NQN" "$kvdev" -n "$idx" 2>&1); then
+		die "nvmf_subsystem_add_kv_ns for tenant '$tenant' ($kvdev, nsid $idx) failed: $out"
 	fi
 
 	# Read back the nsid actually bound to this kvdev under the subsystem.
-	nsid=$(kvdev_nsid "$NQN" "$kvdev")
+	# kvdev_nsid asserts exactly one binding (no stale/duplicate via head -n1).
+	nsid=$(kvdev_nsid "$NQN" "$kvdev") || die "ambiguous nsid for tenant $tenant ($kvdev)"
 	[[ -n $nsid && $nsid != "0" ]] || die "KV ns for tenant $tenant ($kvdev) not found after add"
+	[[ $nsid == "$idx" ]] || die "tenant $tenant ($kvdev) bound to nsid $nsid, expected $idx"
 
 	map_nsid+=("$nsid")
 	map_tenant+=("$tenant")
@@ -366,7 +470,30 @@ for spec in "${tenants[@]}"; do
 done
 
 # Single vfio-user listener for the subsystem (all nsids are reachable through it).
-rpc_idempotent nvmf_subsystem_add_listener "$NQN" -t VFIOUSER -a "$muser_dir" -s 0 > /dev/null
+# Adding a listener that already exists returns JSON-RPC -32602 (not an "already
+# exists" string), so on a re-run we must check first to stay idempotent.
+listener_exists() {
+	if command -v jq > /dev/null 2>&1; then
+		rpc nvmf_subsystem_get_listeners "$NQN" 2> /dev/null | jq -e \
+			--arg a "$muser_dir" \
+			'.[] | select(.address.trtype=="VFIOUSER" and .address.traddr==$a)' \
+			> /dev/null 2>&1
+	else
+		rpc nvmf_subsystem_get_listeners "$NQN" 2> /dev/null | python3 -c '
+import json,sys
+a=sys.argv[1]
+ls=json.load(sys.stdin)
+sys.exit(0 if any(l.get("address",{}).get("trtype")=="VFIOUSER" and
+                  l.get("address",{}).get("traddr")==a for l in ls) else 1)
+' "$muser_dir"
+	fi
+}
+if listener_exists; then
+	echo "### vfio-user listener on $muser_dir already present; skipping (idempotent)" >&2
+else
+	rpc nvmf_subsystem_add_listener "$NQN" -t VFIOUSER -a "$muser_dir" -s 0 > /dev/null \
+		|| die "failed to add vfio-user listener on $muser_dir"
+fi
 
 # ---- report --------------------------------------------------------------
 echo
@@ -383,8 +510,71 @@ for i in "${!map_nsid[@]}"; do
 done
 echo "=================================================="
 
+# ---- optional self-test (tenant isolation) -------------------------------
+# Store a value to nsid 1 via the in-process KV host shim, then use the rados
+# CLI to confirm the resulting object lands ONLY in tenant 1's rados namespace
+# (present there; absent from tenant 2's namespace when there is one). This
+# proves the nsid->namespace mapping actually isolates tenants in rados.
+run_selftest() {
+	local shim_dir="$rootdir/test/nvmf/kv_shim"
+	local shim_bin="$shim_dir/kv_shim_test"
+
+	echo
+	echo "### --selftest: proving nsid 1 isolates to tenant '${map_tenant[0]}' (ns '${map_ns[0]}')"
+
+	if [[ ! -x $shim_bin ]]; then
+		echo "### building kv host shim test ($shim_dir)" >&2
+		make -C "$shim_dir" > /dev/null || die "selftest: failed to build $shim_bin"
+	fi
+	command -v "$RADOS_BIN" > /dev/null 2>&1 || die "selftest: rados CLI not found: $RADOS_BIN (set --rados-bin/RADOS_BIN)"
+
+	# kv_shim_test attaches nsid 0 (== first KV namespace == nsid 1) and Stores
+	# keys "kvshim-big" (left present) and "kvshim-tiny" (deleted). We assert on
+	# "kvshim-big": its rados oid is the lowercase-hex encoding of the key bytes
+	# (kvdev_rados_key_to_oid). Run the shim and require its PASS line.
+	local log="$DOMAIN_DIR/selftest.kv_shim_test.log"
+	if ! "$shim_bin" "$muser_dir" > "$log" 2>&1 || ! grep -q "kv_shim_test: PASS" "$log"; then
+		echo "--- kv_shim_test output ---" >&2
+		cat "$log" >&2 || true
+		die "selftest: kv_shim_test did not PASS against $muser_dir"
+	fi
+	echo "### kv_shim_test PASS (Store/Retrieve to nsid 1)"
+
+	local oid
+	oid=$(printf '%s' "kvshim-big" | od -An -tx1 | tr -d ' \n')
+	local rcli=("$RADOS_BIN" -c "$CEPH_CONF" -k "$CEPH_KEYRING" -p "$KV_POOL")
+
+	# Present in tenant 1's namespace.
+	if ! "${rcli[@]}" -N "${map_ns[0]}" stat "$oid" > /dev/null 2>&1; then
+		die "selftest: object '$oid' NOT found in tenant 1 namespace '${map_ns[0]}' (Store did not land where expected)"
+	fi
+	echo "### object present in rados namespace '${map_ns[0]}' (nsid 1) -- correct"
+
+	# Absent from every OTHER tenant's namespace (proves isolation).
+	local i
+	for i in "${!map_ns[@]}"; do
+		[[ $i -eq 0 ]] && continue
+		if "${rcli[@]}" -N "${map_ns[$i]}" stat "$oid" > /dev/null 2>&1; then
+			die "selftest: ISOLATION FAILURE -- object '$oid' also present in tenant $((i + 1)) namespace '${map_ns[$i]}'"
+		fi
+		echo "### object absent from rados namespace '${map_ns[$i]}' (nsid $((i + 1))) -- isolated"
+	done
+
+	# Clean up the object we created so the pool is left pristine.
+	"${rcli[@]}" -N "${map_ns[0]}" rm "$oid" > /dev/null 2>&1 || true
+	echo "### selftest PASS: nsid 1 isolates to namespace '${map_ns[0]}' (test object removed)"
+}
+
+if [[ $SELFTEST -eq 1 ]]; then
+	run_selftest
+fi
+
 if [[ $KEEP -eq 1 ]]; then
 	echo
 	echo "### --keep set: target left running (pid ${nvmfpid:-<external>}). Attach with the vfio-user sock above."
-	echo "### To tear down later: $RPC_PY_BIN -s $RPC_SOCK nvmf_delete_subsystem $NQN ; kill ${nvmfpid:-<pid>}"
+	echo "### To tear down later:"
+	echo "###   $RPC_PY_BIN -s $RPC_SOCK nvmf_delete_subsystem $NQN ; kill ${nvmfpid:-<pid>}"
+	if [[ $owns_domain_dir -eq 1 ]]; then
+		echo "###   rm -rf $DOMAIN_DIR   # remove the minted domain dir this run owns"
+	fi
 fi

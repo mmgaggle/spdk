@@ -31,9 +31,27 @@ the same key never collide, and per-tenant reclaim is a single namespace drop.
 5. Prints the resulting **nsid → tenant → rados-namespace** map and the
    vfio-user socket path a host attaches to.
 
-It is idempotent-ish (re-running against a live RPC socket reuses the target and
-tolerates already-created resources) and installs an `EXIT`/`INT`/`TERM` trap
-that tears down only what *this* invocation started (unless `--keep`).
+It is **idempotent**: re-running against a live RPC socket reuses the target,
+and for each tenant it inspects what nsid `i` is already bound to *before*
+adding it. If nsid `i` already maps to that tenant's kvdev the step is skipped;
+a re-run with the same tenant list converges to the same `nsid → tenant →
+rados-namespace` map and exits 0. If nsid `i` is already bound to a **different**
+kvdev (an incompatible layout), it fails fast with a clear message rather than
+emitting a raw JSON-RPC error. Tenant names and rados namespaces are validated
+**unique up front** — a duplicate of either is rejected before any RPC, so the
+nsid map can never silently mislabel a namespace. The script installs an
+`EXIT`/`INT`/`TERM` trap that tears down only what *this* invocation started
+(unless `--keep`).
+
+### Self-test (`--selftest`)
+
+Pass `--selftest` to verify tenant isolation end-to-end after bring-up: the
+script Stores a value to **nsid 1** via the in-process KV host shim
+(`test/nvmf/kv_shim`), then uses the `rados` CLI to confirm the resulting object
+is present in tenant 1's rados namespace and **absent** from every other
+tenant's namespace. It cleans up the test object so the pool is left pristine.
+Requires the `kv_shim_test` binary (built under `test/nvmf/kv_shim`) and `rados`
+CLI access (`--rados-bin`/`RADOS_BIN`, `--ceph-conf`, `--keyring`).
 
 ## Running it
 
