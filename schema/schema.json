@@ -1851,7 +1851,7 @@
         },
         {
           "name": "config_param",
-          "type": "string",
+          "type": "object",
           "description": "Explicit librados configuration key/value object"
         },
         {
