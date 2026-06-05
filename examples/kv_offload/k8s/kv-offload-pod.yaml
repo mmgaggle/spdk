@@ -1,0 +1,115 @@
+#  SPDX-License-Identifier: BSD-3-Clause
+#  Copyright (C) 2026 IBM Corporation. All rights reserved.
+# =============================================================================
+# REFERENCE TEMPLATE ONLY -- NOT VALIDATED ON THIS BOX.
+#
+# This manifest is a documented skeleton showing how the co-located KV-cache
+# offload target (kv_offload_provision.sh) would be wired into a Kubernetes Pod
+# as a sidecar alongside a vLLM worker. It has NOT been applied or tested; image
+# names, paths, resource sizes, and securityContext are placeholders to be
+# adapted to your cluster. Treat hugepages/VFIO/privilege settings as a starting
+# point and tighten them for your security posture.
+#
+# Tenancy model: ADR-0006 (one pool, one KV namespace -> one rados namespace per
+# tenant tuple). The sidecar provisions nsid 1..N; the co-located host attaches
+# the vfio-user socket from the shared `kv-domain` volume.
+# =============================================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-kv-offload
+  labels:
+    app: vllm-kv-offload
+spec:
+  # Hugepages + memory locking are required for the SPDK/DPDK env and the
+  # vfio-user data path in production. (For an unprivileged CI run, drop the
+  # hugepage volume/limits and pass `--no-huge -s <MB>` to the provision script.)
+  volumes:
+    # Shared vfio-user domain dir + RPC socket: the sidecar creates the socket
+    # here; the vLLM host attaches to it from the same path.
+    - name: kv-domain
+      emptyDir: {}
+    # Hugepage-backed memory for the SPDK target.
+    - name: hugepage
+      emptyDir:
+        medium: HugePages
+    # VFIO device node for the vfio-user transport.
+    - name: dev-vfio
+      hostPath:
+        path: /dev/vfio
+        type: Directory
+    # Ceph client config + cephx keyring (scope the keyring to the offload pool).
+    - name: ceph-config
+      secret:
+        secretName: kv-offload-ceph   # keys: ceph.conf, keyring
+
+  initContainers:
+    # Option A (shown): run the provisioner as an initContainer with --keep so
+    # the target keeps running for the lifetime of the pod's shared namespaces.
+    # Option B: run it as a long-lived sidecar container (restartPolicy: Always
+    # initContainer, k8s >= 1.29) so its lifecycle is managed and teardown runs
+    # on pod stop. Pick one; do not run both.
+    - name: kv-offload-provision
+      image: ghcr.io/example/spdk-kv-offload:latest   # PLACEHOLDER image w/ nvmf_tgt + rpc.py + script
+      command: ["/bin/bash", "/opt/kv_offload/kv_offload_provision.sh"]
+      args:
+        - "--ceph-conf"
+        - "/etc/ceph/ceph.conf"
+        - "--keyring"
+        - "/etc/ceph/keyring"
+        - "--ceph-user"
+        - "kvcache"
+        - "--pool"
+        - "kvpool"
+        - "--domain-dir"
+        - "/run/kv-offload"
+        - "--keep"
+        # One arg per tenant tuple: LOGICAL_TENANT:RADOS_NAMESPACE (nsid 1..N).
+        - "modelA-tp0:kvns_modelA_tp0"
+        - "modelB-tp0:kvns_modelB_tp0"
+      securityContext:
+        # privileged is the simplest path for /dev/vfio + IPC_LOCK; tighten in
+        # production to the minimal capability set below.
+        privileged: true
+        capabilities:
+          add: ["IPC_LOCK", "SYS_ADMIN"]
+      resources:
+        limits:
+          hugepages-2Mi: 512Mi
+          memory: 512Mi
+        requests:
+          memory: 512Mi
+      volumeMounts:
+        - name: kv-domain
+          mountPath: /run/kv-offload
+        - name: hugepage
+          mountPath: /dev/hugepages
+        - name: dev-vfio
+          mountPath: /dev/vfio
+        - name: ceph-config
+          mountPath: /etc/ceph
+          readOnly: true
+
+  containers:
+    # The co-located host. It attaches the vfio-user socket the sidecar created
+    # under the shared kv-domain volume (e.g. /run/kv-offload/domain/muser0/0).
+    - name: vllm
+      image: ghcr.io/example/vllm-kv-offload:latest    # PLACEHOLDER
+      env:
+        - name: KV_OFFLOAD_VFU_ADDR
+          value: "/run/kv-offload/domain/muser0/0"
+      securityContext:
+        # The host also maps DMA memory for vfio-user; needs IPC_LOCK + hugepages.
+        capabilities:
+          add: ["IPC_LOCK"]
+      resources:
+        limits:
+          hugepages-2Mi: 512Mi
+          memory: 8Gi
+      volumeMounts:
+        - name: kv-domain
+          mountPath: /run/kv-offload
+        - name: hugepage
+          mountPath: /dev/hugepages
+        - name: dev-vfio
+          mountPath: /dev/vfio
