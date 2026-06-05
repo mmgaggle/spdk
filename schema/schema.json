@@ -1836,6 +1836,107 @@
       ]
     },
     {
+      "name": "kvdev_rados_register_cluster",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Registered Rados cluster object name"
+        },
+        {
+          "name": "user_id",
+          "type": "string",
+          "description": "Ceph client id (e.g. admin, not client.admin)"
+        },
+        {
+          "name": "config_param",
+          "type": "string",
+          "description": "Explicit librados configuration key/value object"
+        },
+        {
+          "name": "config_file",
+          "type": "string",
+          "description": "Path of the librados configuration (ceph.conf) file"
+        },
+        {
+          "name": "key_file",
+          "type": "string",
+          "description": "Path of the librados keyring file"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_rados_unregister_cluster",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Rados cluster object name"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_rados_get_clusters",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "description": "Rados cluster object name (omit for all)"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_rados_create",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the rados kvdev to create"
+        },
+        {
+          "name": "cluster_name",
+          "type": "string",
+          "required": true,
+          "description": "Name of a registered rados cluster"
+        },
+        {
+          "name": "pool_name",
+          "type": "string",
+          "required": true,
+          "description": "Rados pool (operator pre-provisioned; maps to the subsystem)"
+        },
+        {
+          "name": "namespace",
+          "type": "string",
+          "description": "Rados namespace (maps to the KV namespace)"
+        },
+        {
+          "name": "uuid",
+          "type": "uuid",
+          "description": "UUID of the new kvdev"
+        },
+        {
+          "name": "max_value_len",
+          "type": "uint32",
+          "description": "Maximum value length in bytes (0 for the 64 MB default)"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_rados_delete",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the rados kvdev to delete"
+        }
+      ]
+    },
+    {
       "name": "nvmf_subsystem_add_kv_ns",
       "params": [
         {
