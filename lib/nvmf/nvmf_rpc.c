@@ -162,11 +162,18 @@ dump_nvmf_subsystem(struct spdk_json_write_ctx *w, struct spdk_nvmf_subsystem *s
 			spdk_nvmf_ns_get_opts(ns, &ns_opts, sizeof(ns_opts));
 			spdk_json_write_object_begin(w);
 			spdk_json_write_named_int32(w, "nsid", spdk_nvmf_ns_get_id(ns));
-			spdk_json_write_named_string(w, "bdev_name",
-						     spdk_bdev_get_name(spdk_nvmf_ns_get_bdev(ns)));
-			/* NOTE: "name" is kept for compatibility only - new code should use bdev_name. */
-			spdk_json_write_named_string(w, "name",
-						     spdk_bdev_get_name(spdk_nvmf_ns_get_bdev(ns)));
+			if (ns->kvdev != NULL) {
+				/* Key-Value namespace: no bdev. Report the backing kvdev
+				 * instead of dereferencing a NULL bdev. */
+				spdk_json_write_named_string(w, "kvdev_name",
+							     spdk_kvdev_get_name(ns->kvdev));
+			} else {
+				spdk_json_write_named_string(w, "bdev_name",
+							     spdk_bdev_get_name(spdk_nvmf_ns_get_bdev(ns)));
+				/* NOTE: "name" is kept for compatibility only - new code should use bdev_name. */
+				spdk_json_write_named_string(w, "name",
+							     spdk_bdev_get_name(spdk_nvmf_ns_get_bdev(ns)));
+			}
 
 			if (!spdk_mem_all_zero(ns_opts.nguid, sizeof(ns_opts.nguid))) {
 				spdk_json_write_named_bytearray(w, "nguid", ns_opts.nguid, sizeof(ns_opts.nguid));
@@ -1363,15 +1370,6 @@ struct rpc_nvmf_subsystem_add_kv_ns_ext {
 	bool					response_sent;
 };
 
-static const struct spdk_json_object_decoder rpc_nvmf_subsystem_add_kv_ns_decoders[] = {
-	{"nqn", offsetof(struct rpc_nvmf_subsystem_add_kv_ns_ctx, nqn), spdk_json_decode_string},
-	{"kvdev_name", offsetof(struct rpc_nvmf_subsystem_add_kv_ns_ctx, kvdev_name), spdk_json_decode_string},
-	{"nsid", offsetof(struct rpc_nvmf_subsystem_add_kv_ns_ctx, nsid), spdk_json_decode_uint32, true},
-	{"anagrpid", offsetof(struct rpc_nvmf_subsystem_add_kv_ns_ctx, anagrpid), spdk_json_decode_uint32, true},
-	{"uuid", offsetof(struct rpc_nvmf_subsystem_add_kv_ns_ctx, uuid), spdk_json_decode_uuid, true},
-	{"tgt_name", offsetof(struct rpc_nvmf_subsystem_add_kv_ns_ctx, tgt_name), spdk_json_decode_string, true},
-};
-
 static void
 free_rpc_nvmf_subsystem_add_kv_ns_ext(struct rpc_nvmf_subsystem_add_kv_ns_ext *ereq)
 {
@@ -1446,8 +1444,8 @@ rpc_nvmf_subsystem_add_kv_ns(struct spdk_jsonrpc_request *request,
 	}
 	req = &ereq->req;
 
-	if (spdk_json_decode_object(params, rpc_nvmf_subsystem_add_kv_ns_decoders,
-				    SPDK_COUNTOF(rpc_nvmf_subsystem_add_kv_ns_decoders), req)) {
+	if (spdk_json_decode_object(params, rpc_nvmf_subsystem_add_kv_ns_decoders_autogen,
+				    SPDK_COUNTOF(rpc_nvmf_subsystem_add_kv_ns_decoders_autogen), req)) {
 		SPDK_ERRLOG("spdk_json_decode_object failed\n");
 		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
 						 "Invalid parameters");
