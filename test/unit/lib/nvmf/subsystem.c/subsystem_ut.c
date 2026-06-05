@@ -38,6 +38,12 @@ DEFINE_STUB(spdk_bdev_io_type_supported, bool,
 	    (struct spdk_bdev *bdev,
 	     enum spdk_bdev_io_type io_type), false);
 
+DEFINE_STUB(spdk_kvdev_open, int,
+	    (const char *name, bool write, struct spdk_kvdev_desc **desc), -ENODEV);
+DEFINE_STUB_V(spdk_kvdev_close, (struct spdk_kvdev_desc *desc));
+DEFINE_STUB(spdk_kvdev_desc_get_kvdev, struct spdk_kvdev *,
+	    (struct spdk_kvdev_desc *desc), NULL);
+
 DEFINE_STUB_V(spdk_nvmf_send_discovery_log_notice,
 	      (struct spdk_nvmf_tgt *tgt, const char *hostnqn));
 DEFINE_STUB(spdk_nvmf_qpair_disconnect, int, (struct spdk_nvmf_qpair *qpair), 0);
