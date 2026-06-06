@@ -330,6 +330,9 @@ def add_parser(subparsers):
     p.add_argument('-n', '--nsid', help='The requested NSID (optional)', type=int)
     p.add_argument('-u', '--uuid', help='Namespace UUID (optional)')
     p.add_argument('-a', '--anagrpid', help='ANA group ID (optional)', type=int)
+    p.add_argument('-R', '--read-only', dest='read_only', action='store_true',
+                   help='Mark the KV namespace read-only: accept Retrieve/Exist/List, '
+                        'reject Store/Delete/KV-Exec (optional)')
     p.set_defaults(func=nvmf_subsystem_add_kv_ns)
 
     def nvmf_subsystem_set_ns_ana_group(args):

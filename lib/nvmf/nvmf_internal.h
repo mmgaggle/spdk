@@ -274,6 +274,16 @@ struct spdk_nvmf_ns {
 	 */
 	struct spdk_nvmf_kv_exec_allow_entry *kv_exec_allowlist;
 	uint32_t kv_exec_allowlist_count;
+	/*
+	 * Read-only KV namespace flag (ADR-0008 trust split). When set, the KV
+	 * command dispatch (lib/nvmf/ctrlr_kvdev.c) ACCEPTS the read/lookup ops
+	 * (Retrieve, Exist, List) and REJECTS the write/compute ops (Store,
+	 * Delete, KV Exec) with SPDK_NVME_SC_ATTEMPTED_WRITE_TO_RO_RANGE before
+	 * the backend runs. Settable at attach time via the
+	 * nvmf_subsystem_add_kv_ns --read-only option. Only meaningful for KV
+	 * namespaces (kvdev != NULL).
+	 */
+	bool kv_read_only;
 };
 
 /* One entry in a namespace's KV Exec allowlist (ADR-0005). */

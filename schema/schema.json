@@ -1970,6 +1970,11 @@
           "name": "tgt_name",
           "type": "string",
           "description": "Parent NVMe-oF target name"
+        },
+        {
+          "name": "read_only",
+          "type": "boolean",
+          "description": "Mark the KV namespace read-only: accept Retrieve/Exist/List, reject Store/Delete/KV-Exec (ADR-0008)"
         }
       ]
     },

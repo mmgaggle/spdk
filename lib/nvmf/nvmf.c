@@ -744,6 +744,11 @@ nvmf_write_subsystem_add_kv_ns_config(struct spdk_json_write_ctx *w,
 		spdk_json_write_named_uint32(w, "anagrpid", ns_opts.anagrpid);
 	}
 
+	/* Persist the read-only trust split (ADR-0008) so save/load round-trips. */
+	if (ns->kv_read_only) {
+		spdk_json_write_named_bool(w, "read_only", true);
+	}
+
 	/*     } "params" */
 	spdk_json_write_object_end(w);
 

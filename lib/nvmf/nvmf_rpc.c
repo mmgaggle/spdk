@@ -1413,7 +1413,8 @@ rpc_nvmf_subsystem_add_kv_ns_paused(struct spdk_nvmf_subsystem *subsystem,
 		ns_opts.uuid = req->uuid;
 	}
 
-	req->nsid = spdk_nvmf_subsystem_add_kv_ns(subsystem, req->kvdev_name, &ns_opts, sizeof(ns_opts));
+	req->nsid = spdk_nvmf_subsystem_add_kv_ns(subsystem, req->kvdev_name, &ns_opts, sizeof(ns_opts),
+			req->read_only);
 	if (req->nsid == 0) {
 		SPDK_ERRLOG("Unable to add KV namespace\n");
 		spdk_jsonrpc_send_error_response(req->request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,

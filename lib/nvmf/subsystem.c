@@ -2729,7 +2729,8 @@ err:
 
 uint32_t
 spdk_nvmf_subsystem_add_kv_ns(struct spdk_nvmf_subsystem *subsystem, const char *kvdev_name,
-			      const struct spdk_nvmf_ns_opts *user_opts, size_t opts_size)
+			      const struct spdk_nvmf_ns_opts *user_opts, size_t opts_size,
+			      bool read_only)
 {
 	struct spdk_nvmf_transport *transport;
 	struct spdk_nvmf_ns_opts opts;
@@ -2805,6 +2806,9 @@ spdk_nvmf_subsystem_add_kv_ns(struct spdk_nvmf_subsystem *subsystem, const char 
 
 	ns->kvdev = spdk_kvdev_desc_get_kvdev(ns->kvdev_desc);
 	ns->csi = SPDK_NVME_CSI_KV;
+	/* Read-only trust split (ADR-0008): reject Store/Delete/KV-Exec, allow
+	 * Retrieve/Exist/List. Enforced in lib/nvmf/ctrlr_kvdev.c. */
+	ns->kv_read_only = read_only;
 
 	if (spdk_uuid_is_null(&opts.uuid)) {
 		spdk_uuid_copy(&opts.uuid, &ns->kvdev->uuid);

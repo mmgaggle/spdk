@@ -1362,12 +1362,16 @@ uint32_t spdk_nvmf_subsystem_add_ns_ext(struct spdk_nvmf_subsystem *subsystem,
  * \param kvdev_name kvdev name to bind as a namespace.
  * \param opts Namespace options, or NULL to use defaults.
  * \param opts_size sizeof(*opts)
+ * \param read_only When true, mark the KV namespace read-only: the dispatch
+ * accepts Retrieve/Exist/List and rejects Store/Delete/KV-Exec with an NVMe
+ * write-protected status (ADR-0008 trust split).
  *
  * \return newly added NSID on success, or 0 on failure.
  */
 uint32_t spdk_nvmf_subsystem_add_kv_ns(struct spdk_nvmf_subsystem *subsystem,
 				       const char *kvdev_name,
-				       const struct spdk_nvmf_ns_opts *opts, size_t opts_size);
+				       const struct spdk_nvmf_ns_opts *opts, size_t opts_size,
+				       bool read_only);
 
 /**
  * One entry of a namespace's KV Exec allowlist (vendor extension, ADR-0005).

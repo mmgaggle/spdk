@@ -319,6 +319,32 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 	}
 
+	/*
+	 * Per-namespace read-only enforcement (ADR-0008 trust split). A read-only
+	 * KV namespace ACCEPTS the read/lookup ops (Retrieve, Exist, List) and
+	 * REJECTS the write/compute ops (Store, Delete, KV Exec) here, BEFORE any
+	 * backend dispatch. KV Exec is treated as a write because it can mutate
+	 * the value (e.g. the in-memory append op / a rados object-class method).
+	 * We report Command-Specific status "Attempted Write to Read Only Range"
+	 * (SCT 0x1, SC 0x82) — the same status the NVM command set uses for the
+	 * namespace write-protection feature, and the most accurate fit for a
+	 * write rejected because the namespace is read-only.
+	 */
+	if (ns->kv_read_only) {
+		switch (cmd->opc) {
+		case SPDK_NVME_OPC_KV_STORE:
+		case SPDK_NVME_OPC_KV_DELETE:
+		case SPDK_NVME_OPC_KV_EXEC:
+			SPDK_DEBUGLOG(nvmf, "KV opcode 0x%02x rejected on read-only nsid %u\n",
+				      cmd->opc, ns->nsid);
+			rsp->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+			rsp->status.sc = SPDK_NVME_SC_ATTEMPTED_WRITE_TO_RO_RANGE;
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		default:
+			break;
+		}
+	}
+
 	kv_req = calloc(1, sizeof(*kv_req));
 	if (kv_req == NULL) {
 		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
