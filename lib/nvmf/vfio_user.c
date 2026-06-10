@@ -4760,16 +4760,24 @@ get_nvmf_io_req_length(struct spdk_nvmf_request *req)
 	 * opcodes have a payload; Delete/Exist carry no host data. */
 	if (ns->csi == SPDK_NVME_CSI_KV) {
 		uint32_t kv_len;
+		/*
+		 * Bound host-supplied KV transfer lengths by the transport's
+		 * max_io_size, exactly as the SGL parsers do for block I/O. This
+		 * caps the per-command buffer the target will allocate/map and
+		 * prevents an initiator from forcing a multi-GB allocation via a
+		 * large vsize/osize. (max_io_size < INT_MAX, so the signed-int
+		 * return value also cannot wrap negative.)
+		 */
+		uint32_t max_io = req->qpair->transport->opts.max_io_size;
 
 		switch (cmd->opc) {
 		case SPDK_NVME_OPC_KV_STORE:
 		case SPDK_NVME_OPC_KV_RETRIEVE:
 		case SPDK_NVME_OPC_KV_LIST:
 			kv_len = cmd->cdw10_bits.kv.vsize;
-			/* The caller treats the return value as a signed int; clamp so a
-			 * host-supplied vsize > INT_MAX cannot wrap to a negative length. */
-			if (kv_len > INT_MAX) {
-				SPDK_ERRLOG("KV transfer length %u exceeds INT_MAX\n", kv_len);
+			if (kv_len > max_io) {
+				SPDK_ERRLOG("KV transfer length %u exceeds max_io_size %u\n",
+					    kv_len, max_io);
 				return -EINVAL;
 			}
 			return kv_len;
@@ -4779,8 +4787,9 @@ get_nvmf_io_req_length(struct spdk_nvmf_request *req)
 			 * to CDW12 (output buffer size) bytes back. Size the data buffer to
 			 * hold the larger of the two. */
 			kv_len = spdk_max(cmd->cdw10_bits.kv.vsize, cmd->cdw12_bits.kv_exec.osize);
-			if (kv_len > INT_MAX) {
-				SPDK_ERRLOG("KV Exec transfer length %u exceeds INT_MAX\n", kv_len);
+			if (kv_len > max_io) {
+				SPDK_ERRLOG("KV Exec transfer length %u exceeds max_io_size %u\n",
+					    kv_len, max_io);
 				return -EINVAL;
 			}
 			return kv_len;

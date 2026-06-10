@@ -56,11 +56,19 @@ struct kvdev_mem {
 	struct spdk_kvdev				kvdev;
 	RB_HEAD(kvdev_mem_tree, kvdev_mem_entry)	tree;
 	uint32_t					num_keys;
+	/*
+	 * The store (tree + entries) is shared by every io_channel, and a KV
+	 * subsystem is served across all of the target's poll groups (one per
+	 * core). This mutex serializes the data-path ops so concurrent
+	 * Store/Delete/Exec from different threads cannot corrupt the tree or
+	 * race a free of entry->value.
+	 */
+	pthread_mutex_t					lock;
 	TAILQ_ENTRY(kvdev_mem)				tailq;
 };
 
-/* Per-thread io_channel. The store is global (single-threaded in this slice),
- * so the channel itself carries no state yet, but keeping it mirrors the bdev
+/* Per-thread io_channel. The store is global and serialized by mdev->lock, so
+ * the channel itself carries no state yet, but keeping it mirrors the bdev
  * runtime model and gives later slices a home for per-thread queues. */
 struct kvdev_mem_io_channel {
 	struct kvdev_mem	*mdev;
@@ -403,11 +411,18 @@ kvdev_mem_exec_append(struct kvdev_mem *mdev, const void *key, uint8_t key_len,
 		return 0;
 	}
 
-	new_len = entry->value_len + input_len;
-	if (new_len > mdev->kvdev.caps.max_value_len) {
+	/*
+	 * entry->value_len is always <= max_value_len (enforced on Store), so the
+	 * subtraction cannot underflow. Checking input_len against the remaining
+	 * headroom avoids the uint32_t overflow that "value_len + input_len" would
+	 * suffer for a large host-supplied input_len (which would wrap below the
+	 * cap and then heap-overflow the malloc'd buffer below).
+	 */
+	if (input_len > mdev->kvdev.caps.max_value_len - entry->value_len) {
 		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
 		return 0;
 	}
+	new_len = entry->value_len + input_len;
 
 	buf = malloc(new_len ? new_len : 1);
 	if (buf == NULL) {
@@ -492,6 +507,7 @@ kvdev_mem_free(struct kvdev_mem *mdev)
 		free(entry);
 	}
 
+	pthread_mutex_destroy(&mdev->lock);
 	free(mdev->kvdev.name);
 	free(mdev);
 }
@@ -514,15 +530,109 @@ kvdev_mem_destruct(void *ctx)
 	return 0;
 }
 
+/*
+ * Locking wrappers. fn_table dispatches through these so every data-path op
+ * runs under mdev->lock. The completion callback is invoked synchronously by
+ * the inner op and does not re-enter this kvdev, so holding the lock across it
+ * is safe and avoids exposing a half-updated entry to a concurrent op.
+ */
+#define KVDEV_MEM_MDEV(ch) (((struct kvdev_mem_io_channel *)spdk_io_channel_get_ctx(ch))->mdev)
+
+static int
+kvdev_mem_store_locked(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+		       const void *value, uint32_t value_len,
+		       const struct spdk_kvdev_store_opts *opts,
+		       spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_mem *mdev = KVDEV_MEM_MDEV(ch);
+	int rc;
+
+	pthread_mutex_lock(&mdev->lock);
+	rc = kvdev_mem_store(ch, key, key_len, value, value_len, opts, cb_fn, cb_arg);
+	pthread_mutex_unlock(&mdev->lock);
+	return rc;
+}
+
+static int
+kvdev_mem_retrieve_locked(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+			  void *value_buf, uint32_t buf_len,
+			  spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_mem *mdev = KVDEV_MEM_MDEV(ch);
+	int rc;
+
+	pthread_mutex_lock(&mdev->lock);
+	rc = kvdev_mem_retrieve(ch, key, key_len, value_buf, buf_len, cb_fn, cb_arg);
+	pthread_mutex_unlock(&mdev->lock);
+	return rc;
+}
+
+static int
+kvdev_mem_delete_locked(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+			spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_mem *mdev = KVDEV_MEM_MDEV(ch);
+	int rc;
+
+	pthread_mutex_lock(&mdev->lock);
+	rc = kvdev_mem_op_delete(ch, key, key_len, cb_fn, cb_arg);
+	pthread_mutex_unlock(&mdev->lock);
+	return rc;
+}
+
+static int
+kvdev_mem_exist_locked(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+		       spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_mem *mdev = KVDEV_MEM_MDEV(ch);
+	int rc;
+
+	pthread_mutex_lock(&mdev->lock);
+	rc = kvdev_mem_exist(ch, key, key_len, cb_fn, cb_arg);
+	pthread_mutex_unlock(&mdev->lock);
+	return rc;
+}
+
+static int
+kvdev_mem_list_locked(struct spdk_io_channel *ch, const void *start_key, uint8_t start_key_len,
+		      spdk_kvdev_list_cb iter_cb, void *iter_arg,
+		      spdk_kvdev_list_done_cb done_cb, void *done_arg)
+{
+	struct kvdev_mem *mdev = KVDEV_MEM_MDEV(ch);
+	int rc;
+
+	pthread_mutex_lock(&mdev->lock);
+	rc = kvdev_mem_list(ch, start_key, start_key_len, iter_cb, iter_arg, done_cb, done_arg);
+	pthread_mutex_unlock(&mdev->lock);
+	return rc;
+}
+
+static int
+kvdev_mem_exec_locked(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+		      uint32_t op_id, const char *binding,
+		      const void *input, uint32_t input_len,
+		      void *output_buf, uint32_t output_buf_len,
+		      spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_mem *mdev = KVDEV_MEM_MDEV(ch);
+	int rc;
+
+	pthread_mutex_lock(&mdev->lock);
+	rc = kvdev_mem_exec(ch, key, key_len, op_id, binding, input, input_len,
+			    output_buf, output_buf_len, cb_fn, cb_arg);
+	pthread_mutex_unlock(&mdev->lock);
+	return rc;
+}
+
 static const struct spdk_kvdev_fn_table kvdev_mem_fn_table = {
 	.destruct	= kvdev_mem_destruct,
 	.get_io_channel	= kvdev_mem_get_io_channel,
-	.store		= kvdev_mem_store,
-	.retrieve	= kvdev_mem_retrieve,
-	.del		= kvdev_mem_op_delete,
-	.exist		= kvdev_mem_exist,
-	.list		= kvdev_mem_list,
-	.exec		= kvdev_mem_exec,
+	.store		= kvdev_mem_store_locked,
+	.retrieve	= kvdev_mem_retrieve_locked,
+	.del		= kvdev_mem_delete_locked,
+	.exist		= kvdev_mem_exist_locked,
+	.list		= kvdev_mem_list_locked,
+	.exec		= kvdev_mem_exec_locked,
 };
 
 int
@@ -561,6 +671,8 @@ kvdev_mem_create(const struct kvdev_mem_opts *opts, struct spdk_kvdev **_kvdev)
 		spdk_uuid_copy(&mdev->kvdev.uuid, &opts->uuid);
 	}
 
+	pthread_mutex_init(&mdev->lock, NULL);
+
 	/* Register the io_device before the kvdev so a channel can be obtained
 	 * immediately after spdk_kvdev_register() returns. */
 	spdk_io_device_register(mdev, kvdev_mem_create_channel_cb, kvdev_mem_destroy_channel_cb,
@@ -569,6 +681,7 @@ kvdev_mem_create(const struct kvdev_mem_opts *opts, struct spdk_kvdev **_kvdev)
 	rc = spdk_kvdev_register(&mdev->kvdev);
 	if (rc != 0) {
 		spdk_io_device_unregister(mdev, NULL);
+		pthread_mutex_destroy(&mdev->lock);
 		free(mdev->kvdev.name);
 		free(mdev);
 		return rc;
