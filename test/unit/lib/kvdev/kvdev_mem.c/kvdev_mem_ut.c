@@ -817,6 +817,66 @@ test_kvdev_mem_exec_append(void)
 	CU_ASSERT(rc == 0);
 }
 
+static void
+test_kvdev_mem_exec_append_overflow(void)
+{
+	struct spdk_kvdev_desc *desc;
+	struct spdk_io_channel *ch;
+	const char key[] = "ovf";
+	char big[128];
+	char out[256];
+	int rc;
+
+	/* Small value cap so the boundary is reachable without large buffers. */
+	create_test_kvdev("kvovf", 100, 0);
+	rc = spdk_kvdev_open("kvovf", true, &desc);
+	CU_ASSERT(rc == 0);
+	ch = spdk_kvdev_get_io_channel(desc);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+
+	memset(big, 'A', sizeof(big));
+
+	/* Seed a 10-byte value, then append up to exactly the cap (10 + 90 == 100). */
+	g_completed = false;
+	rc = spdk_kvdev_store(desc, ch, key, sizeof(key), big, 10, NULL, kv_op_cb, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_SUCCESS);
+
+	g_completed = false;
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, NULL,
+			     big, 90, out, sizeof(out), kv_op_cb, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(g_value_len == 100);
+
+	/* One more byte exceeds the cap: rejected INVALID. */
+	g_completed = false;
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, NULL,
+			     big, 1, out, sizeof(out), kv_op_cb, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_INVALID);
+
+	/*
+	 * Regression for the uint32_t append overflow: with value_len == 100,
+	 * input_len == UINT32_MAX makes (value_len + input_len) wrap to 99, which
+	 * would slip under the 100-byte cap and then heap-overflow an undersized
+	 * malloc. The fix checks input_len against the remaining headroom, so this
+	 * is rejected INVALID before any copy -- the 1-byte input buffer is never
+	 * read. (Pre-fix, this call corrupted the heap / crashed.)
+	 */
+	g_completed = false;
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, NULL,
+			     "X", (uint32_t)0xFFFFFFFFu, out, sizeof(out), kv_op_cb, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_INVALID);
+
+	spdk_put_io_channel(ch);
+	spdk_kvdev_close(desc);
+	poll_threads();
+	rc = kvdev_mem_delete("kvovf");
+	CU_ASSERT(rc == 0);
+}
+
 /*
  * KV Exec truncation: when the output does not fit the host buffer, the status
  * is BUFFER_TOO_SMALL, the true output length is reported, and only buf_len
@@ -894,6 +954,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_kvdev_mem_store_ttl);
 	CU_ADD_TEST(suite, test_kvdev_mem_exec_echo);
 	CU_ADD_TEST(suite, test_kvdev_mem_exec_append);
+	CU_ADD_TEST(suite, test_kvdev_mem_exec_append_overflow);
 	CU_ADD_TEST(suite, test_kvdev_mem_exec_truncate);
 
 	allocate_threads(1);
