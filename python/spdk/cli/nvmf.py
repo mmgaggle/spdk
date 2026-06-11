@@ -311,6 +311,24 @@ def add_parser(subparsers):
                    help='[Deprecated] Enable hide_metadata option to the bdev (optional)')
     p.set_defaults(func=nvmf_subsystem_add_ns)
 
+    def nvmf_subsystem_add_kv_ns(args):
+        params = strip_globals(vars(args))
+        params = apply_defaults(params, tgt_name=None)
+        args.client.nvmf_subsystem_add_kv_ns(**params)
+
+    p = subparsers.add_parser('nvmf_subsystem_add_kv_ns',
+                              help='Add a Key-Value namespace to an NVMe-oF subsystem')
+    p.add_argument('nqn', help='NVMe-oF subsystem NQN')
+    p.add_argument('kvdev_name', help='The name of the kvdev that will back this KV namespace')
+    p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
+    p.add_argument('-n', '--nsid', help='The requested NSID (optional)', type=int)
+    p.add_argument('-u', '--uuid', help='Namespace UUID (optional)')
+    p.add_argument('-a', '--anagrpid', help='ANA group ID (optional)', type=int)
+    p.add_argument('-R', '--read-only', dest='read_only', action='store_true',
+                   help='Mark the KV namespace read-only: accept Retrieve/Exist/List, '
+                        'reject Store/Delete/KV-Exec (optional)')
+    p.set_defaults(func=nvmf_subsystem_add_kv_ns)
+
     def nvmf_subsystem_set_ns_ana_group(args):
         args.client.nvmf_subsystem_set_ns_ana_group(
                                                  nqn=args.nqn,
@@ -364,6 +382,46 @@ def add_parser(subparsers):
     p = subparsers.add_parser('nvmf_ns_remove_host', help='Make namespace not visible to controllers of host')
     nvmf_ns_visible_add_args(p)
     p.set_defaults(func=nvmf_ns_remove_host)
+
+    def nvmf_ns_set_kv_exec_allowlist(args):
+        allowlist = []
+        for u in args.allowlist:
+            if not u:
+                # An empty string (or trailing whitespace) clears the allowlist.
+                continue
+            fields = u.split(':', 1)
+            entry = {"op_id": int(fields[0])}
+            if len(fields) > 1 and fields[1] != "":
+                entry["binding"] = fields[1]
+            allowlist.append(entry)
+        args.client.nvmf_ns_set_kv_exec_allowlist(
+                                    nqn=args.nqn,
+                                    nsid=args.nsid,
+                                    allowlist=allowlist,
+                                    tgt_name=args.tgt_name)
+
+    p = subparsers.add_parser('nvmf_ns_set_kv_exec_allowlist',
+                              help='Replace the KV Exec allowlist of a namespace (ADR-0005)')
+    p.add_argument('nqn', help='NVMe-oF subsystem NQN')
+    p.add_argument('nsid', help='The requested NSID', type=int)
+    p.add_argument('allowlist', type=partial(str.split, sep=' '), default=[],
+                   help="""Whitespace-separated KV Exec allowlist entries, each 'op_id' or
+                   'op_id:binding' (e.g. '1 2:cls.method'). Pass an empty string to clear.""")
+    p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
+    p.set_defaults(func=nvmf_ns_set_kv_exec_allowlist)
+
+    def nvmf_ns_get_kv_exec_allowlist(args):
+        print_dict(args.client.nvmf_ns_get_kv_exec_allowlist(
+                                    nqn=args.nqn,
+                                    nsid=args.nsid,
+                                    tgt_name=args.tgt_name))
+
+    p = subparsers.add_parser('nvmf_ns_get_kv_exec_allowlist',
+                              help='Get the KV Exec allowlist of a namespace (ADR-0005)')
+    p.add_argument('nqn', help='NVMe-oF subsystem NQN')
+    p.add_argument('nsid', help='The requested NSID', type=int)
+    p.add_argument('-t', '--tgt-name', help='The name of the parent NVMe-oF target (optional)', type=str)
+    p.set_defaults(func=nvmf_ns_get_kv_exec_allowlist)
 
     def nvmf_subsystem_add_host(args):
         args.client.nvmf_subsystem_add_host(

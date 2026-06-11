@@ -105,6 +105,67 @@ spdk_nvme_kv_store(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 				     cb_fn, cb_arg);
 }
 
+/*
+ * Read the TTL (seconds) from a size-versioned ext-opts struct, honouring its
+ * size field so a caller built against an older/newer header is safe. Returns 0
+ * (no TTL) when opts is NULL, too small, or carries a zero ttl.
+ */
+static uint32_t
+nvme_kv_store_ext_ttl(const struct spdk_nvme_kv_store_ext_opts *opts)
+{
+	if (opts == NULL ||
+	    opts->size < offsetof(struct spdk_nvme_kv_store_ext_opts, ttl) + sizeof(opts->ttl)) {
+		return 0;
+	}
+	return opts->ttl;
+}
+
+int
+spdk_nvme_kv_store_ext(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+		       const void *key, uint8_t key_len,
+		       const void *value, uint32_t value_len,
+		       spdk_nvme_cmd_cb cb_fn, void *cb_arg,
+		       uint8_t options,
+		       const struct spdk_nvme_kv_store_ext_opts *opts)
+{
+	struct nvme_request *req;
+	struct spdk_nvme_cmd *cmd;
+	uint32_t ttl = nvme_kv_store_ext_ttl(opts);
+
+	if (key == NULL || key_len < SPDK_NVME_KV_KEY_MIN_LEN || key_len > SPDK_NVME_KV_KEY_MAX_LEN ||
+	    value == NULL || value_len == 0) {
+		return -EINVAL;
+	}
+
+	req = nvme_allocate_request_contig(qpair, (void *)value, value_len, cb_fn, cb_arg);
+	if (req == NULL) {
+		return -ENOMEM;
+	}
+
+	cmd = &req->cmd;
+	cmd->opc = SPDK_NVME_OPC_KV_STORE;
+	cmd->nsid = ns->id;
+
+	/* CDW10: Value size. */
+	cmd->cdw10_bits.kv.vsize = value_len;
+
+	/*
+	 * CDW11: key length + request options. Set the TTL Valid Store Option
+	 * bit and CDW12 = TTL (vendor extension, ADR-0003) only when a non-zero
+	 * TTL was requested, so this stays backward compatible with the plain
+	 * store path.
+	 */
+	cmd->cdw11_bits.kv.ro = options;
+	if (ttl != 0) {
+		cmd->cdw11_bits.kv.ro |= SPDK_NVME_KV_STORE_OPT_TTL_VALID;
+		cmd->cdw12_bits.kv_store.ttl = ttl;
+	}
+
+	nvme_kv_cmd_set_key(cmd, key, key_len);
+
+	return nvme_qpair_submit_request(qpair, req);
+}
+
 int
 spdk_nvme_kv_retrieve(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 		      const void *key, uint8_t key_len,
@@ -133,6 +194,63 @@ spdk_nvme_kv_exist(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 {
 	return nvme_kv_cmd_without_data(ns, qpair, SPDK_NVME_OPC_KV_EXIST,
 					key, key_len, cb_fn, cb_arg);
+}
+
+int
+spdk_nvme_kv_exec(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+		  const void *key, uint8_t key_len, uint32_t op_id,
+		  const void *input, uint32_t input_len,
+		  void *output, uint32_t output_len,
+		  spdk_nvme_cmd_cb cb_fn, void *cb_arg)
+{
+	struct nvme_request *req;
+	struct spdk_nvme_cmd *cmd;
+	uint32_t xfer_len;
+
+	if (key == NULL || key_len < SPDK_NVME_KV_KEY_MIN_LEN || key_len > SPDK_NVME_KV_KEY_MAX_LEN ||
+	    output == NULL || output_len == 0) {
+		return -EINVAL;
+	}
+
+	if (input_len > output_len) {
+		/* The single data buffer (output) must be able to carry the input. */
+		return -EINVAL;
+	}
+
+	if (input == NULL && input_len > 0) {
+		/* An input length with no input buffer would stage uninitialized bytes. */
+		return -EINVAL;
+	}
+
+	/*
+	 * KV Exec is bidirectional and uses one data buffer: the input blob is
+	 * gathered host->controller, then the controller scatters the output
+	 * back into the same buffer. Stage the input into the output buffer (a
+	 * no-op when the caller already passed the same pointer), then transfer
+	 * max(input_len, output_len) == output_len bytes both ways.
+	 */
+	if (input != NULL && input_len > 0 && input != output) {
+		memcpy(output, input, input_len);
+	}
+	xfer_len = output_len;
+
+	req = nvme_allocate_request_contig(qpair, output, xfer_len, cb_fn, cb_arg);
+	if (req == NULL) {
+		return -ENOMEM;
+	}
+
+	cmd = &req->cmd;
+	cmd->opc = SPDK_NVME_OPC_KV_EXEC;
+	cmd->nsid = ns->id;
+
+	/* CDW10: input length. CDW12: output buffer size. CDW13: operation ID. */
+	cmd->cdw10_bits.kv.vsize = input_len;
+	cmd->cdw12_bits.kv_exec.osize = output_len;
+	cmd->cdw13_bits.kv_exec.op_id = op_id;
+
+	nvme_kv_cmd_set_key(cmd, key, key_len);
+
+	return nvme_qpair_submit_request(qpair, req);
 }
 
 int

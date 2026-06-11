@@ -22,6 +22,9 @@ DEFINE_STUB(nvmf_transport_poll_group_create, struct spdk_nvmf_transport_poll_gr
 	     struct spdk_nvmf_poll_group *group), NULL);
 DEFINE_STUB(spdk_bdev_get_io_channel, struct spdk_io_channel *, (struct spdk_bdev_desc *desc),
 	    NULL);
+DEFINE_STUB(spdk_kvdev_get_io_channel, struct spdk_io_channel *, (struct spdk_kvdev_desc *desc),
+	    NULL);
+DEFINE_STUB(spdk_kvdev_get_name, const char *, (const struct spdk_kvdev *kvdev), "kvdev0");
 DEFINE_STUB(nvmf_ctrlr_async_event_ns_notice, int, (struct spdk_nvmf_ctrlr *ctrlr), 0);
 DEFINE_STUB(nvmf_ctrlr_async_event_ana_change_notice, int,
 	    (struct spdk_nvmf_ctrlr *ctrlr), 0);

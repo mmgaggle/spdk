@@ -1,0 +1,24 @@
+#  SPDX-License-Identifier: BSD-3-Clause
+#  Copyright (C) 2026 IBM Corporation. All rights reserved.
+#
+
+SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../..)
+include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
+
+SO_VER := 5
+SO_MINOR := 0
+
+CFLAGS += -I$(SPDK_ROOT_DIR)/module/kvdev/mem
+
+# When the librados kvdev is built (--with-rbd), let the subsystem emit its
+# config (cluster registrations + kvdev_rados_create) too.
+ifeq ($(CONFIG_RBD),y)
+CFLAGS += -I$(SPDK_ROOT_DIR)/module/kvdev/rados -DSPDK_CONFIG_KVDEV_RADOS
+endif
+
+C_SRCS = kvdev.c
+LIBNAME = event_kvdev
+
+SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
+
+include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk

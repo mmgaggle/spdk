@@ -718,11 +718,57 @@ spdk_nvmf_get_next_tgt(struct spdk_nvmf_tgt *prev)
 }
 
 static void
+nvmf_write_subsystem_add_kv_ns_config(struct spdk_json_write_ctx *w,
+				      struct spdk_nvmf_subsystem *subsystem,
+				      struct spdk_nvmf_ns *ns)
+{
+	struct spdk_nvmf_ns_opts ns_opts;
+
+	spdk_nvmf_ns_get_opts(ns, &ns_opts, sizeof(ns_opts));
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "method", "nvmf_subsystem_add_kv_ns");
+
+	/*     "params" : { */
+	spdk_json_write_named_object_begin(w, "params");
+
+	spdk_json_write_named_string(w, "nqn", spdk_nvmf_subsystem_get_nqn(subsystem));
+	spdk_json_write_named_string(w, "kvdev_name", spdk_kvdev_get_name(ns->kvdev));
+	spdk_json_write_named_uint32(w, "nsid", spdk_nvmf_ns_get_id(ns));
+
+	if (!spdk_uuid_is_null(&ns_opts.uuid)) {
+		spdk_json_write_named_uuid(w, "uuid", &ns_opts.uuid);
+	}
+
+	if (subsystem->opts.ana_reporting) {
+		spdk_json_write_named_uint32(w, "anagrpid", ns_opts.anagrpid);
+	}
+
+	/* Persist the read-only trust split (ADR-0008) so save/load round-trips. */
+	if (ns->kv_read_only) {
+		spdk_json_write_named_bool(w, "read_only", true);
+	}
+
+	/*     } "params" */
+	spdk_json_write_object_end(w);
+
+	/* } */
+	spdk_json_write_object_end(w);
+}
+
+static void
 nvmf_write_subsystem_add_ns_config(struct spdk_json_write_ctx *w,
 				   struct spdk_nvmf_subsystem *subsystem,
 				   struct spdk_nvmf_ns *ns)
 {
 	struct spdk_nvmf_ns_opts ns_opts;
+
+	/* Key-Value namespaces have no bdev; emit a dedicated add_kv_ns RPC so the
+	 * saved config can recreate them (and never dereference a NULL bdev). */
+	if (ns->kvdev != NULL) {
+		nvmf_write_subsystem_add_kv_ns_config(w, subsystem, ns);
+		return;
+	}
 
 	spdk_nvmf_ns_get_opts(ns, &ns_opts, sizeof(ns_opts));
 
@@ -823,6 +869,41 @@ nvmf_write_ns_add_host_config(struct spdk_json_write_ctx *w,
 	spdk_json_write_named_string(w, "nqn", spdk_nvmf_subsystem_get_nqn(subsystem));
 	spdk_json_write_named_uint32(w, "nsid", spdk_nvmf_ns_get_id(ns));
 	spdk_json_write_named_string(w, "host", spdk_nvmf_host_get_nqn(host));
+	spdk_json_write_object_end(w);
+	spdk_json_write_object_end(w);
+}
+
+/* Emit the per-namespace KV Exec allowlist (ADR-0005) so save_config/load_config
+ * round-trips it. Only KV namespaces with a non-empty allowlist produce an RPC. */
+static void
+nvmf_write_ns_kv_exec_allowlist_config(struct spdk_json_write_ctx *w,
+				       struct spdk_nvmf_subsystem *subsystem,
+				       struct spdk_nvmf_ns *ns)
+{
+	const struct spdk_nvmf_kv_exec_allow *entries = NULL;
+	uint32_t count = 0;
+	uint32_t i;
+
+	if (spdk_nvmf_ns_get_kv_exec_allowlist(subsystem, spdk_nvmf_ns_get_id(ns),
+					       &entries, &count) != 0 || count == 0) {
+		return;
+	}
+
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_string(w, "method", "nvmf_ns_set_kv_exec_allowlist");
+	spdk_json_write_named_object_begin(w, "params");
+	spdk_json_write_named_string(w, "nqn", spdk_nvmf_subsystem_get_nqn(subsystem));
+	spdk_json_write_named_uint32(w, "nsid", spdk_nvmf_ns_get_id(ns));
+	spdk_json_write_named_array_begin(w, "allowlist");
+	for (i = 0; i < count; i++) {
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_uint32(w, "op_id", entries[i].op_id);
+		if (entries[i].binding != NULL) {
+			spdk_json_write_named_string(w, "binding", entries[i].binding);
+		}
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
 	spdk_json_write_object_end(w);
 	spdk_json_write_object_end(w);
 }
@@ -993,6 +1074,18 @@ spdk_nvmf_tgt_write_config_json(struct spdk_json_write_ctx *w, struct spdk_nvmf_
 				TAILQ_FOREACH(host, &ns->hosts, link) {
 					nvmf_write_ns_add_host_config(w, subsystem, ns, host);
 				}
+			}
+		}
+	}
+	spdk_json_write_batch_end(w);
+
+	/* Emit nvmf_ns_set_kv_exec_allowlist RPCs as a batch (ADR-0005) */
+	spdk_json_write_batch_begin(w);
+	NVMF_SUBSYSTEM_FOREACH(tgt, subsystem) {
+		if (spdk_nvmf_subsystem_get_type(subsystem) == SPDK_NVMF_SUBTYPE_NVME) {
+			for (ns = spdk_nvmf_subsystem_get_first_ns(subsystem); ns != NULL;
+			     ns = spdk_nvmf_subsystem_get_next_ns(subsystem, ns)) {
+				nvmf_write_ns_kv_exec_allowlist_config(w, subsystem, ns);
 			}
 		}
 	}
@@ -1754,6 +1847,27 @@ poll_group_update_subsystem(struct spdk_nvmf_poll_group *group,
 		ns = subsystem->ns[i];
 		ns_info = &sgroup->ns_info[i];
 		ch = ns_info->channel;
+
+		/* Key-Value namespaces are backed by a kvdev, not a bdev, and use a
+		 * kvdev io_channel. Handle their channel lifecycle separately. */
+		if (ns != NULL && ns->csi == SPDK_NVME_CSI_KV) {
+			if (ch == NULL) {
+				ns_changed = true;
+				ch = spdk_kvdev_get_io_channel(ns->kvdev_desc);
+				if (ch == NULL) {
+					SPDK_ERRLOG("Could not allocate KV I/O channel.\n");
+					return -ENOMEM;
+				}
+				ns_info->channel = ch;
+			}
+			/* An ANA group change on a KV namespace must still raise an AEN,
+			 * so detect it here before updating the cached anagrpid. */
+			if (ns_info->anagrpid != ns->anagrpid) {
+				ana_changed = true;
+			}
+			ns_info->anagrpid = ns->anagrpid;
+			continue;
+		}
 
 		if (ns == NULL && ch == NULL) {
 			/* Both NULL. Leave empty */

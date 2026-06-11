@@ -547,9 +547,31 @@
           "description": "array of objects describing @ref rpc_vhost_get_controllers_scsi_luns"
         }
       ]
+    },
+    {
+      "name": "nvmf_kv_exec_allow",
+      "fields": [
+        {
+          "name": "op_id",
+          "type": "uint32",
+          "required": true,
+          "description": "Permitted KV Exec operation ID (ADR-0005)"
+        },
+        {
+          "name": "binding",
+          "type": "string",
+          "description": "Optional opaque binding descriptor the backend interprets"
+        }
+      ]
     }
   ],
   "arrays": [
+    {
+      "name": "nvmf_kv_exec_allowlist",
+      "item_type": "object",
+      "class": "nvmf_kv_exec_allow",
+      "max_count": 256
+    },
     {
       "name": "bdev_histogram_borders",
       "item_type": "uint64",
@@ -1770,6 +1792,203 @@
           "type": "string",
           "required": true,
           "description": "Bdev name"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_mem_create",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the in-memory kvdev to create"
+        },
+        {
+          "name": "uuid",
+          "type": "uuid",
+          "description": "UUID of the new kvdev"
+        },
+        {
+          "name": "max_value_len",
+          "type": "uint32",
+          "description": "Maximum value length in bytes (0 for default)"
+        },
+        {
+          "name": "max_num_keys",
+          "type": "uint32",
+          "description": "Maximum number of keys (0 for unlimited)"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_mem_delete",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the in-memory kvdev to delete"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_mem_get_entry",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the in-memory kvdev"
+        },
+        {
+          "name": "key",
+          "type": "string",
+          "required": true,
+          "description": "Key (1-16 byte ASCII string) of the entry to inspect"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_rados_register_cluster",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Registered Rados cluster object name"
+        },
+        {
+          "name": "user_id",
+          "type": "string",
+          "description": "Ceph client id (e.g. admin, not client.admin)"
+        },
+        {
+          "name": "config_param",
+          "type": "object",
+          "description": "Explicit librados configuration key/value object"
+        },
+        {
+          "name": "config_file",
+          "type": "string",
+          "description": "Path of the librados configuration (ceph.conf) file"
+        },
+        {
+          "name": "key_file",
+          "type": "string",
+          "description": "Path of the librados keyring file"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_rados_unregister_cluster",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Rados cluster object name"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_rados_get_clusters",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "description": "Rados cluster object name (omit for all)"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_rados_create",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the rados kvdev to create"
+        },
+        {
+          "name": "cluster_name",
+          "type": "string",
+          "required": true,
+          "description": "Name of a registered rados cluster"
+        },
+        {
+          "name": "pool_name",
+          "type": "string",
+          "required": true,
+          "description": "Rados pool (operator pre-provisioned; maps to the subsystem)"
+        },
+        {
+          "name": "namespace",
+          "type": "string",
+          "description": "Rados namespace (maps to the KV namespace)"
+        },
+        {
+          "name": "uuid",
+          "type": "uuid",
+          "description": "UUID of the new kvdev"
+        },
+        {
+          "name": "max_value_len",
+          "type": "uint32",
+          "description": "Maximum value length in bytes (0 for the 64 MB default)"
+        }
+      ]
+    },
+    {
+      "name": "kvdev_rados_delete",
+      "params": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the rados kvdev to delete"
+        }
+      ]
+    },
+    {
+      "name": "nvmf_subsystem_add_kv_ns",
+      "params": [
+        {
+          "name": "nqn",
+          "type": "string",
+          "required": true,
+          "description": "Subsystem NQN"
+        },
+        {
+          "name": "kvdev_name",
+          "type": "string",
+          "required": true,
+          "description": "Name of the kvdev to bind as a Key-Value namespace"
+        },
+        {
+          "name": "nsid",
+          "type": "uint32",
+          "description": "Namespace ID (0 to auto-assign)"
+        },
+        {
+          "name": "anagrpid",
+          "type": "uint32",
+          "description": "ANA group ID"
+        },
+        {
+          "name": "uuid",
+          "type": "uuid",
+          "description": "Namespace UUID"
+        },
+        {
+          "name": "tgt_name",
+          "type": "string",
+          "description": "Parent NVMe-oF target name"
+        },
+        {
+          "name": "read_only",
+          "type": "boolean",
+          "description": "Mark the KV namespace read-only: accept Retrieve/Exist/List, reject Store/Delete/KV-Exec (ADR-0008)"
         }
       ]
     },
@@ -4554,6 +4773,57 @@
           "type": "string",
           "required": true,
           "description": "Host NQN"
+        },
+        {
+          "name": "tgt_name",
+          "type": "string",
+          "description": "The name of the parent NVMe-oF target (optional)"
+        }
+      ]
+    },
+    {
+      "name": "nvmf_ns_set_kv_exec_allowlist",
+      "params": [
+        {
+          "name": "nqn",
+          "type": "string",
+          "required": true,
+          "description": "Subsystem NQN"
+        },
+        {
+          "name": "nsid",
+          "type": "uint32",
+          "required": true,
+          "description": "Namespace ID"
+        },
+        {
+          "name": "allowlist",
+          "type": "array",
+          "class": "nvmf_kv_exec_allowlist",
+          "required": true,
+          "description": "Replacement KV Exec allowlist (array of {op_id, binding}); empty clears it"
+        },
+        {
+          "name": "tgt_name",
+          "type": "string",
+          "description": "The name of the parent NVMe-oF target (optional)"
+        }
+      ]
+    },
+    {
+      "name": "nvmf_ns_get_kv_exec_allowlist",
+      "params": [
+        {
+          "name": "nqn",
+          "type": "string",
+          "required": true,
+          "description": "Subsystem NQN"
+        },
+        {
+          "name": "nsid",
+          "type": "uint32",
+          "required": true,
+          "description": "Namespace ID"
         },
         {
           "name": "tgt_name",

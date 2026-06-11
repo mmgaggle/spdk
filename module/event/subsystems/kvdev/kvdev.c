@@ -1,0 +1,60 @@
+/*   SPDX-License-Identifier: BSD-3-Clause
+ *   Copyright (C) 2026 IBM Corporation. All rights reserved.
+ */
+
+#include "spdk/stdinc.h"
+#include "spdk/kvdev.h"
+#include "spdk/log.h"
+#include "spdk/init.h"
+
+#include "kvdev_mem.h"
+#ifdef SPDK_CONFIG_KVDEV_RADOS
+#include "kvdev_rados.h"
+#endif
+
+static void
+kvdev_subsystem_initialize(void)
+{
+	int rc;
+
+	rc = spdk_kvdev_initialize();
+	if (rc != 0) {
+		SPDK_ERRLOG("Failed to initialize kvdev subsystem\n");
+	}
+
+	spdk_subsystem_init_next(rc);
+}
+
+static void
+kvdev_subsystem_finish(void)
+{
+	spdk_kvdev_finish();
+	spdk_subsystem_fini_next();
+}
+
+static void
+kvdev_write_config_json(struct spdk_json_write_ctx *w)
+{
+	spdk_json_write_array_begin(w);
+
+	/* Emit one kvdev_mem_create per in-memory kvdev so a saved config can be
+	 * reloaded. KV namespaces (nvmf_subsystem_add_kv_ns) reference these by
+	 * name, and the nvmf subsystem depends on kvdev so this section is
+	 * emitted/replayed first. */
+	kvdev_mem_write_config_json(w);
+#ifdef SPDK_CONFIG_KVDEV_RADOS
+	/* librados-backed kvdevs (and their cluster registrations). */
+	kvdev_rados_write_config_json(w);
+#endif
+
+	spdk_json_write_array_end(w);
+}
+
+static struct spdk_subsystem g_spdk_subsystem_kvdev = {
+	.name = "kvdev",
+	.init = kvdev_subsystem_initialize,
+	.fini = kvdev_subsystem_finish,
+	.write_config_json = kvdev_write_config_json,
+};
+
+SPDK_SUBSYSTEM_REGISTER(g_spdk_subsystem_kvdev);

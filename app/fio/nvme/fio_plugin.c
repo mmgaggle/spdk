@@ -7,6 +7,7 @@
 
 #include "spdk/nvme.h"
 #include "spdk/nvme_zns.h"
+#include "spdk/nvme_kv.h"
 #include "spdk/vmd.h"
 #include "spdk/env.h"
 #include "spdk/string.h"
@@ -128,6 +129,18 @@ struct spdk_fio_qpair {
 	 * this is valid only if nvme_pi_enabled is true.
 	 */
 	bool				md_start;
+	/*
+	 * Key-Value (CSI_KV) namespace support. When kv_enabled is true the
+	 * fio block/offset workload is mapped onto KV ops: the io_u offset is
+	 * encoded into a fixed-length key (see fio_kv_encode_key()), the io_u
+	 * blocksize is the KV value length, and read/write/trim map to KV
+	 * Retrieve/Store/Delete. kv_block_size is the synthetic "sector" size
+	 * (the fio blocksize captured at attach time) used to derive the key
+	 * index from an offset; it makes a write-then-read at the same offset
+	 * hit the same key so fio verify works.
+	 */
+	bool				kv_enabled;
+	uint32_t			kv_block_size;
 	TAILQ_ENTRY(spdk_fio_qpair)	link;
 	struct spdk_fio_ctrlr		*fio_ctrlr;
 };
@@ -255,6 +268,33 @@ get_fio_qpair(struct spdk_fio_thread *fio_thread, struct fio_file *f)
 	}
 
 	return NULL;
+}
+
+/*
+ * Length of the key produced by fio_kv_encode_key(). A KV key is 1..16 bytes;
+ * we always emit a fixed 8-byte big-endian key so the value is deterministic
+ * and a write-then-read at the same offset always derives the same key (which
+ * is what fio verify relies on).
+ */
+#define FIO_KV_KEY_LEN 8
+
+/*
+ * Deterministically encode an io_u offset into a fixed-length KV key.
+ *
+ * The fio workload addresses a linear byte range; we treat each block_size
+ * chunk as one KV object. The key is the block index (offset / block_size)
+ * written big-endian into a fixed FIO_KV_KEY_LEN-byte buffer. Big-endian keeps
+ * the mapping injective within the bounded keyspace (size / block_size keys)
+ * and independent of host endianness, so the same offset always maps to the
+ * same key -- required for read-after-write verify.
+ */
+static inline uint8_t
+fio_kv_encode_key(uint64_t offset, uint32_t block_size, uint8_t *key)
+{
+	uint64_t index = offset / block_size;
+
+	to_be64(key, index);
+	return FIO_KV_KEY_LEN;
 }
 
 #if FIO_HAS_ZBD
@@ -402,6 +442,103 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	fio_qpair->f = f;
 	fio_qpair->fio_ctrlr = fio_ctrlr;
 	TAILQ_INSERT_TAIL(&fio_thread->fio_qpair, fio_qpair, link);
+
+	/*
+	 * Key-Value namespaces have no LBA/sector geometry, so the NVM/ZNS
+	 * sector-size and size discovery below does not apply. Map the fio
+	 * block/offset workload onto the KV keyspace instead: each fio block
+	 * is one KV object whose key is derived from its offset, and the value
+	 * length is the fio blocksize. This is purely additive -- the NVM/ZNS
+	 * paths below are unchanged.
+	 */
+	if (spdk_nvme_ns_get_csi(ns) == SPDK_NVME_CSI_KV) {
+		const struct spdk_nvme_kv_ns_data *kv_data = spdk_nvme_kv_ns_get_data(ns);
+		const struct spdk_nvme_kv_format *kvf;
+		uint8_t kvfi;
+		uint32_t kv_bs;
+		uint64_t num_keys;
+
+		if (kv_data == NULL) {
+			SPDK_ERRLOG("file_name: '%s', KV namespace data unavailable\n", f->file_name);
+			g_error = true;
+			return;
+		}
+
+		/* Select the namespace's ACTIVE KV format, not a hardcoded index.
+		 * The active format index is reported in kvfc.kvfi (KV Format
+		 * Capabilities, per the KV Command Set spec). All format-derived
+		 * limits (kvkml/kvvml/mnks) must be read from that entry.
+		 */
+		kvfi = kv_data->kvfc.kvfi;
+		if (kvfi >= SPDK_COUNTOF(kv_data->kvf)) {
+			SPDK_ERRLOG("KV namespace active format index %u out of range\n", kvfi);
+			g_error = true;
+			return;
+		}
+		kvf = &kv_data->kvf[kvfi];
+
+		/* The engine always emits a fixed FIO_KV_KEY_LEN-byte key. If the
+		 * active format's advertised max key length (kvkml) is smaller, the
+		 * device would reject every I/O (100% IO errors). Fail clearly here.
+		 * kvkml == 0 means "not advertised", so it is not treated as a limit.
+		 */
+		if (kvf->kvkml != 0 && kvf->kvkml < FIO_KV_KEY_LEN) {
+			SPDK_ERRLOG("KV namespace active format %u max key length %u < required %u bytes\n",
+				    kvfi, kvf->kvkml, FIO_KV_KEY_LEN);
+			g_error = true;
+			return;
+		}
+
+		/* The fio blocksize is the KV value length. Require a single fixed
+		 * blocksize so the offset->key mapping (offset / block_size) is
+		 * well defined and write-then-read at the same offset hits the
+		 * same key (needed for verify).
+		 */
+		kv_bs = td->o.min_bs[DDIR_WRITE];
+		for_each_rw_ddir(ddir) {
+			if (td->o.min_bs[ddir] != kv_bs || td->o.max_bs[ddir] != kv_bs) {
+				SPDK_ERRLOG("KV namespace requires a single fixed blocksize "
+					    "(set bs=<value>, no bsrange/bs split)\n");
+				g_error = true;
+				return;
+			}
+		}
+		if (kv_bs == 0) {
+			SPDK_ERRLOG("KV namespace requires a non-zero blocksize\n");
+			g_error = true;
+			return;
+		}
+		if (kvf->kvvml != 0 && kv_bs > kvf->kvvml) {
+			SPDK_ERRLOG("blocksize %u exceeds KV max value length %u\n",
+				    kv_bs, kvf->kvvml);
+			g_error = true;
+			return;
+		}
+
+		fio_qpair->kv_enabled = true;
+		fio_qpair->kv_block_size = kv_bs;
+
+		/* Bound the keyspace using the active format's advertised max key
+		 * count (mnks).
+		 *
+		 * When mnks == 0 the device advertises "no maximum indicated". We
+		 * deliberately do NOT derive a key count from nsze/blocksize: nsze
+		 * is a byte capacity, not a key count, and a single key may hold a
+		 * value far larger than one blocksize, so nsze/blocksize would let
+		 * fio address keys beyond real capacity. Instead fall back to a
+		 * fixed, modest keyspace so the workload stays bounded.
+		 */
+		num_keys = kvf->mnks;
+		if (num_keys == 0) {
+			/* No advertised maximum: use a fixed, modest keyspace. */
+			num_keys = 65536;
+		}
+
+		f->real_file_size = num_keys * (uint64_t)kv_bs;
+		f->filetype = FIO_TYPE_BLOCK;
+		fio_file_set_size_known(f);
+		return;
+	}
 
 	if (spdk_nvme_ns_get_flags(ns) & SPDK_NVME_NS_DPS_PI_SUPPORTED) {
 		assert(spdk_nvme_ns_get_pi_type(ns) != SPDK_NVME_FMT_NVM_PROTECTION_DISABLE);
@@ -1069,6 +1206,18 @@ spdk_fio_completion_cb(void *ctx, const struct spdk_nvme_cpl *cpl)
 
 	if (spdk_nvme_cpl_is_error(cpl)) {
 		fio_req->io->error = EIO;
+	} else if (fio_qpair->kv_enabled && fio_req->io->ddir == DDIR_READ) {
+		/* On a successful KV Retrieve the device returns the actual stored
+		 * value length in completion DW0. If the value is shorter than the
+		 * requested blocksize, report the residual (bytes not transferred)
+		 * so fio accounting and verify see the true transferred length
+		 * instead of a full-blocksize success.
+		 */
+		uint64_t value_len = cpl->cdw0;
+
+		if (value_len < fio_req->io->xfer_buflen) {
+			fio_req->io->resid = fio_req->io->xfer_buflen - value_len;
+		}
 	}
 
 	assert(fio_thread->iocq_count < fio_thread->iocq_size);
@@ -1126,6 +1275,58 @@ typedef enum fio_q_status fio_q_status_t;
 typedef int fio_q_status_t;
 #endif
 
+/*
+ * Submit an io_u against a Key-Value namespace. The io_u offset is encoded
+ * into a deterministic key and the data direction selects the KV verb:
+ *   read  -> Retrieve, write -> Store, trim -> Delete.
+ * The value length is the io_u transfer length (the fio blocksize). Returns a
+ * fio_q_status_t exactly like the NVM path in spdk_fio_queue().
+ */
+static fio_q_status_t
+spdk_fio_kv_queue(struct spdk_fio_qpair *fio_qpair, struct spdk_fio_request *fio_req,
+		  struct io_u *io_u)
+{
+	struct spdk_nvme_ns *ns = fio_qpair->ns;
+	uint8_t key[FIO_KV_KEY_LEN];
+	uint8_t key_len;
+	int rc;
+
+	key_len = fio_kv_encode_key(io_u->offset, fio_qpair->kv_block_size, key);
+
+	switch (io_u->ddir) {
+	case DDIR_READ:
+		rc = spdk_nvme_kv_retrieve(ns, fio_qpair->qpair, key, key_len,
+					   io_u->buf, io_u->xfer_buflen,
+					   spdk_fio_completion_cb, fio_req, 0);
+		break;
+	case DDIR_WRITE:
+		rc = spdk_nvme_kv_store(ns, fio_qpair->qpair, key, key_len,
+					io_u->buf, io_u->xfer_buflen,
+					spdk_fio_completion_cb, fio_req, 0);
+		break;
+	case DDIR_TRIM:
+		rc = spdk_nvme_kv_delete(ns, fio_qpair->qpair, key, key_len,
+					 spdk_fio_completion_cb, fio_req);
+		break;
+	default:
+		log_err("spdk/nvme: KV namespace: unsupported ddir %d\n", io_u->ddir);
+		io_u->error = EINVAL;
+		return FIO_Q_COMPLETED;
+	}
+
+	/* KV submit functions return -ENOMEM if there are no free requests. */
+	if (rc == -ENOMEM) {
+		return FIO_Q_BUSY;
+	}
+
+	if (rc != 0) {
+		io_u->error = abs(rc);
+		return FIO_Q_COMPLETED;
+	}
+
+	return FIO_Q_QUEUED;
+}
+
 static fio_q_status_t
 spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 {
@@ -1150,6 +1351,12 @@ spdk_fio_queue(struct thread_data *td, struct io_u *io_u)
 		return -ENXIO;
 	}
 	ns = fio_qpair->ns;
+
+	/* KV namespaces map block/offset I/O onto KV verbs (additive path). */
+	if (fio_qpair->kv_enabled) {
+		fio_req->fio_qpair = fio_qpair;
+		return spdk_fio_kv_queue(fio_qpair, fio_req, io_u);
+	}
 
 	if (fio_qpair->nvme_pi_enabled && !fio_qpair->extended_lba) {
 		md_buf = fio_req->md_buf;
@@ -1400,8 +1607,11 @@ spdk_fio_get_zoned_model(struct thread_data *td, struct fio_file *f, enum zbd_zo
 		return 0;
 
 	case SPDK_NVME_CSI_KV:
-		log_err("spdk/nvme: KV namespace is currently not supported\n");
-		return -ENOSYS;
+		/* KV namespaces are object-shaped, not zoned. Present them as a
+		 * non-zoned (flat) device so fio drives plain read/write/trim,
+		 * which spdk_fio_queue() maps onto KV verbs. */
+		*model = ZBD_NONE;
+		return 0;
 
 	case SPDK_NVME_CSI_ZNS:
 		zns_data = spdk_nvme_zns_ns_get_data(fio_qpair->ns);

@@ -18,6 +18,7 @@
 #include "spdk/nvmf_spec.h"
 #include "spdk/assert.h"
 #include "spdk/bdev.h"
+#include "spdk/kvdev.h"
 #include "spdk/queue.h"
 #include "spdk/util.h"
 #include "spdk/thread.h"
@@ -228,6 +229,10 @@ struct spdk_nvmf_ns {
 	struct spdk_nvmf_subsystem *subsystem;
 	struct spdk_bdev *bdev;
 	struct spdk_bdev_desc *desc;
+	/* For Key-Value namespaces (csi == SPDK_NVME_CSI_KV), the namespace is
+	 * backed by a kvdev instead of a bdev; bdev/desc are NULL in that case. */
+	struct spdk_kvdev *kvdev;
+	struct spdk_kvdev_desc *kvdev_desc;
 	struct spdk_nvmf_ns_opts opts;
 	/* reservation notification mask */
 	uint32_t mask;
@@ -258,6 +263,36 @@ struct spdk_nvmf_ns {
 	bool always_visible;
 	/* Namespace id of the underlying device, used for passthrough commands */
 	uint32_t passthru_nsid;
+	/*
+	 * KV Exec allowlist (vendor extension, ADR-0005). Per-namespace set of
+	 * permitted op-IDs for the vendor KV Exec command. Default-deny: an op-ID
+	 * not present here is rejected before the kvdev exec op runs. Each entry
+	 * carries an optional opaque binding descriptor that backends interpret
+	 * (for the in-memory module the op-ID alone selects the built-in; the
+	 * (class,method) resolution is KVX-3/rados). Only meaningful for KV
+	 * namespaces (kvdev != NULL).
+	 */
+	struct spdk_nvmf_kv_exec_allow_entry *kv_exec_allowlist;
+	uint32_t kv_exec_allowlist_count;
+	/*
+	 * Read-only KV namespace flag (ADR-0008 trust split). When set, the KV
+	 * command dispatch (lib/nvmf/ctrlr_kvdev.c) ACCEPTS the read/lookup ops
+	 * (Retrieve, Exist, List) and REJECTS the write/compute ops (Store,
+	 * Delete, KV Exec) with SPDK_NVME_SC_ATTEMPTED_WRITE_TO_RO_RANGE before
+	 * the backend runs. Settable at attach time via the
+	 * nvmf_subsystem_add_kv_ns --read-only option. Only meaningful for KV
+	 * namespaces (kvdev != NULL).
+	 */
+	bool kv_read_only;
+};
+
+/* One entry in a namespace's KV Exec allowlist (ADR-0005). */
+struct spdk_nvmf_kv_exec_allow_entry {
+	/* Permitted KV Exec operation ID (data-plane selector). */
+	uint32_t op_id;
+	/* Optional opaque binding descriptor the backend interprets (e.g. a
+	 * future cls/method hint). NULL when unset. Owned by the namespace. */
+	char *binding;
 };
 
 /*
@@ -499,6 +534,14 @@ bool nvmf_bdev_ctrlr_get_dif_ctx(struct spdk_bdev_desc *desc, struct spdk_nvme_c
 				 struct spdk_dif_ctx *dif_ctx);
 bool nvmf_bdev_zcopy_enabled(struct spdk_bdev *bdev);
 
+/* Key-Value (KV) command set support (ctrlr_kvdev.c). */
+void nvmf_kvdev_ctrlr_identify_ns(struct spdk_nvmf_ns *ns,
+				  struct spdk_nvme_kv_ns_data *nsdata);
+void nvmf_kvdev_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr,
+				     struct spdk_nvme_kv_ctrlr_data *cdata);
+int nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel *ch,
+				    struct spdk_nvmf_request *req);
+
 int nvmf_subsystem_add_ctrlr(struct spdk_nvmf_subsystem *subsystem,
 			     struct spdk_nvmf_ctrlr *ctrlr);
 void nvmf_subsystem_remove_ctrlr(struct spdk_nvmf_subsystem *subsystem,
@@ -538,6 +581,18 @@ void nvmf_ctrlr_reservation_notice_log(struct spdk_nvmf_ctrlr *ctrlr,
 bool nvmf_ns_is_ptpl_capable(const struct spdk_nvmf_ns *ns);
 struct spdk_nvme_rescap nvmf_ns_get_rescap(struct spdk_nvmf_ns *ns);
 size_t nvmf_ns_registrants_get_count(const struct spdk_nvmf_ns *ns);
+
+/* Free a namespace's KV Exec allowlist (ADR-0005) and its entries. */
+void nvmf_ns_kv_exec_allowlist_free(struct spdk_nvmf_ns *ns);
+
+/*
+ * Test whether op_id is permitted by the namespace's KV Exec allowlist
+ * (ADR-0005). Default-deny: returns false when op_id is absent (or the
+ * allowlist is empty). When the entry is found and binding_out is non-NULL,
+ * the entry's opaque binding (possibly NULL) is returned via *binding_out.
+ */
+bool nvmf_ns_kv_exec_op_allowed(const struct spdk_nvmf_ns *ns, uint32_t op_id,
+				const char **binding_out);
 
 static inline struct spdk_nvmf_host *
 nvmf_ns_find_host(struct spdk_nvmf_ns *ns, const char *hostnqn)

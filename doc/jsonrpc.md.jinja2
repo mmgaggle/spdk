@@ -8000,6 +8000,117 @@ Example response:
 }
 ~~~
 
+### nvmf_subsystem_add_kv_ns {#rpc_nvmf_subsystem_add_kv_ns}
+
+Add a Key-Value namespace to a subsystem, backed by a previously created kvdev
+(see @ref jsonrpc_components_kvdev). The namespace ID is returned as the result.
+
+#### Parameters
+
+{{ nvmf_subsystem_add_kv_ns_params }}
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_subsystem_add_kv_ns",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "kvdev_name": "KvMem0",
+    "read_only": false
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": 1
+}
+~~~
+
+### nvmf_ns_set_kv_exec_allowlist {#rpc_nvmf_ns_set_kv_exec_allowlist}
+
+Replace the per-namespace KV Exec allowlist for a Key-Value namespace. Each
+entry pairs a vendor KV Exec `op_id` with the storage-backend binding it is
+permitted to invoke. An empty array clears the allowlist (disabling KV Exec).
+
+#### Parameters
+
+{{ nvmf_ns_set_kv_exec_allowlist_params }}
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_ns_set_kv_exec_allowlist",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "nsid": 1,
+    "allowlist": [
+      { "op_id": 1, "binding": "kv.append" }
+    ]
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### nvmf_ns_get_kv_exec_allowlist {#rpc_nvmf_ns_get_kv_exec_allowlist}
+
+Return the current KV Exec allowlist for a Key-Value namespace.
+
+#### Parameters
+
+{{ nvmf_ns_get_kv_exec_allowlist_params }}
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "nvmf_ns_get_kv_exec_allowlist",
+  "params": {
+    "nqn": "nqn.2016-06.io.spdk:cnode1",
+    "nsid": 1
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    { "op_id": 1, "binding": "kv.append" }
+  ]
+}
+~~~
+
 ### nvmf_subsystem_remove_ns {#rpc_nvmf_subsystem_remove_ns}
 
 Remove a namespace from a subsystem.
@@ -8745,6 +8856,322 @@ in units of 100 milliseconds (same as the NVMe specification).
 #### Parameters
 
 {{ nvmf_set_crdt_params }}
+
+## Key-Value Device (kvdev) {#jsonrpc_components_kvdev}
+
+A kvdev is an object-shaped Key-Value device that an NVMe-oF subsystem can bind
+as a Key-Value namespace via @ref rpc_nvmf_subsystem_add_kv_ns. Two backends are
+provided: an in-memory kvdev (`kvdev_mem_*`) and a RADOS-backed kvdev
+(`kvdev_rados_*`) that maps Key-Value pairs onto objects in a Ceph pool.
+
+### kvdev_mem_create {#rpc_kvdev_mem_create}
+
+Create an in-memory kvdev. The name of the new device is returned as the result.
+
+#### Parameters
+
+ Name          | Optional   | Type   | Description
+-------------- | ---------- | ------ | --------------------------------------------------
+ name          | Required   | string | Name of the new in-memory kvdev
+ uuid          | Optional   | string | UUID of the new kvdev (auto-generated if omitted)
+ max_value_len | Optional   | number | Maximum value length in bytes
+ max_num_keys  | Optional   | number | Maximum number of keys the device may hold
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "kvdev_mem_create",
+  "params": {
+    "name": "KvMem0"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "KvMem0"
+}
+~~~
+
+### kvdev_mem_delete {#rpc_kvdev_mem_delete}
+
+Delete an in-memory kvdev.
+
+#### Parameters
+
+ Name   | Optional   | Type   | Description
+------- | ---------- | ------ | ----------------------------
+ name   | Required   | string | Name of the kvdev to delete
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "kvdev_mem_delete",
+  "params": {
+    "name": "KvMem0"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### kvdev_mem_get_entry {#rpc_kvdev_mem_get_entry}
+
+Return metadata for a single Key-Value entry stored in an in-memory kvdev.
+
+#### Parameters
+
+ Name   | Optional   | Type   | Description
+------- | ---------- | ------ | ------------------
+ name   | Required   | string | Name of the kvdev
+ key    | Required   | string | Key to look up
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "kvdev_mem_get_entry",
+  "params": {
+    "name": "KvMem0",
+    "key": "greeting"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "value_len": 64,
+    "ttl_valid": false,
+    "ttl": 0,
+    "deadline": 0
+  }
+}
+~~~
+
+### kvdev_rados_register_cluster {#rpc_kvdev_rados_register_cluster}
+
+Register a librados cluster handle for later use by RADOS-backed kvdevs.
+
+#### Parameters
+
+ Name         | Optional   | Type   | Description
+------------- | ---------- | ------ | ------------------------------------------------------
+ name         | Required   | string | Name to assign to the registered RADOS cluster handle
+ user_id      | Optional   | string | Ceph client user ID (e.g. admin)
+ config_param | Optional   | object | Map of librados config key/value overrides
+ config_file  | Optional   | string | Path to a ceph.conf configuration file
+ key_file     | Optional   | string | Path to a keyring file
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "kvdev_rados_register_cluster",
+  "params": {
+    "name": "ceph0",
+    "user_id": "admin",
+    "config_file": "/etc/ceph/ceph.conf"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "ceph0"
+}
+~~~
+
+### kvdev_rados_unregister_cluster {#rpc_kvdev_rados_unregister_cluster}
+
+Remove a previously registered librados cluster handle.
+
+#### Parameters
+
+ Name   | Optional   | Type   | Description
+------- | ---------- | ------ | ------------------------------------------------------
+ name   | Required   | string | Name of the registered RADOS cluster handle to remove
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "kvdev_rados_unregister_cluster",
+  "params": {
+    "name": "ceph0"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
+
+### kvdev_rados_get_clusters {#rpc_kvdev_rados_get_clusters}
+
+Return the registered librados cluster handles. If `name` is supplied, only that
+handle is returned.
+
+#### Parameters
+
+ Name   | Optional   | Type   | Description
+------- | ---------- | ------ | ---------------------------------------------
+ name   | Optional   | string | If set, return only the named cluster handle
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "kvdev_rados_get_clusters"
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": [
+    {
+      "cluster_name": "ceph0",
+      "user_id": "admin",
+      "config_file": "/etc/ceph/ceph.conf"
+    }
+  ]
+}
+~~~
+
+### kvdev_rados_create {#rpc_kvdev_rados_create}
+
+Create a RADOS-backed kvdev that stores Key-Value pairs as objects in a Ceph
+pool. The name of the new device is returned as the result.
+
+#### Parameters
+
+ Name          | Optional   | Type   | Description
+-------------- | ---------- | ------ | --------------------------------------------------
+ name          | Required   | string | Name of the new RADOS-backed kvdev
+ cluster_name  | Required   | string | Name of a registered RADOS cluster handle
+ pool_name     | Required   | string | RADOS pool that stores the Key-Value objects
+ namespace     | Optional   | string | RADOS namespace within the pool
+ uuid          | Optional   | string | UUID of the new kvdev (auto-generated if omitted)
+ max_value_len | Optional   | number | Maximum value length in bytes
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "kvdev_rados_create",
+  "params": {
+    "name": "KvRados0",
+    "cluster_name": "ceph0",
+    "pool_name": "kv",
+    "namespace": "tenant-a"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": "KvRados0"
+}
+~~~
+
+### kvdev_rados_delete {#rpc_kvdev_rados_delete}
+
+Delete a RADOS-backed kvdev.
+
+#### Parameters
+
+ Name   | Optional   | Type   | Description
+------- | ---------- | ------ | ----------------------------
+ name   | Required   | string | Name of the kvdev to delete
+
+#### Example
+
+Example request:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "kvdev_rados_delete",
+  "params": {
+    "name": "KvRados0"
+  }
+}
+~~~
+
+Example response:
+
+~~~json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": true
+}
+~~~
 
 ## Vfio-user Target {#jsonrpc_components_vfu_tgt}
 

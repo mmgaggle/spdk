@@ -65,6 +65,7 @@ DEPDIRS-notify := log util $(JSON_LIBS)
 DEPDIRS-trace := log util $(JSON_LIBS)
 
 DEPDIRS-bdev := accel log util thread $(JSON_LIBS) notify trace dma
+DEPDIRS-kvdev := log util thread $(JSON_LIBS)
 DEPDIRS-event := log util thread $(JSON_LIBS) trace init
 DEPDIRS-init := jsonrpc json log rpc thread util
 DEPDIRS-ftl := log util thread bdev json jsonrpc
@@ -75,7 +76,7 @@ DEPDIRS-nbd := log util thread $(JSON_LIBS) bdev
 ifeq ($(CONFIG_UBLK),y)
 DEPDIRS-ublk := log util thread $(JSON_LIBS) bdev
 endif
-DEPDIRS-nvmf := accel log sock util nvme thread $(JSON_LIBS) trace bdev keyring
+DEPDIRS-nvmf := accel log sock util nvme thread $(JSON_LIBS) trace bdev kvdev keyring
 ifeq ($(CONFIG_RDMA),y)
 DEPDIRS-nvmf += rdma_provider rdma_utils
 endif
@@ -136,6 +137,9 @@ DEPDIRS-scheduler_dpdk_governor := event json log util
 DEPDIRS-scheduler_gscheduler := event log util
 endif
 
+# module/kvdev
+DEPDIRS-kvdev_mem := log util $(JSON_LIBS) thread kvdev
+
 # module/bdev
 ifeq ($(OS),Linux)
 DEPDIRS-bdev_ftl := $(BDEV_DEPS) ftl
@@ -186,8 +190,9 @@ DEPDIRS-event_nbd := init nbd event_bdev
 ifeq ($(CONFIG_UBLK),y)
 DEPDIRS-event_ublk := init ublk event_bdev event_iobuf
 endif
+DEPDIRS-event_kvdev := init kvdev kvdev_mem json log
 DEPDIRS-event_nvmf := init nvme nvmf event_bdev event_scheduler event_sock event_keyring \
-		      event_accel event_iobuf thread log bdev util $(JSON_LIBS)
+		      event_accel event_iobuf event_kvdev thread log bdev util $(JSON_LIBS)
 DEPDIRS-event_scsi := init scsi event_bdev
 
 DEPDIRS-event_iscsi := init iscsi event_scheduler event_scsi event_sock
