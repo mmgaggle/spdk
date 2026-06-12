@@ -425,14 +425,22 @@ main(int argc, char **argv)
 			size_t k;
 
 			for (k = 0; k < SPDK_COUNTOF(runaways); k++) {
+				int wait_rc;
+
 				memset(exec_buf, 0, buf_len);
 				rc = spdk_nvme_kv_exec(ctx.ns, ctx.qpair, g_key, strlen(g_key),
 						       runaways[k].op_id, exec_buf, 0,
 						       exec_buf, buf_len, io_complete, &ctx);
-				/* Bounded wait: a runaway that escaped its cap would TIME OUT
-				 * here -> hard fail (proves the cap, no hang). */
-				if (rc != 0 ||
-				    wait_for_completion_timeout(&ctx, KV_RADOS_EXEC_TIMEOUT_S) != 0) {
+				/* Bounded wait. A cap kill COMPLETES the command with a
+				 * failure status (wait_rc == -1), which is the SUCCESS path
+				 * for this test: the cap-status assertions below inspect
+				 * ctx.last_sc. Only a real TIMEOUT (wait_rc == -2) means the
+				 * runaway ESCAPED its cap and hung -> hard fail. A submit
+				 * error (rc != 0) is likewise fatal. */
+				wait_rc = (rc == 0)
+					? wait_for_completion_timeout(&ctx, KV_RADOS_EXEC_TIMEOUT_S)
+					: -2;
+				if (rc != 0 || wait_rc == -2) {
 					fprintf(stderr,
 						"FAIL: nkvx %s did not complete (cap escaped / hang)\n",
 						runaways[k].what);
