@@ -12,6 +12,7 @@
 #include "spdk/queue.h"
 
 #include "kvdev_rados_nkvx.h"
+#include "kvdev_rados_nkvx_wasm.h"
 
 /*
  * rados-nkvx executor worker (TB1). See kvdev_rados_nkvx.h for scope.
@@ -84,6 +85,22 @@ static int
 kvdev_rados_nkvx_run_module(const char *module, const void *object, size_t object_len,
 			    void *out, uint32_t out_len, uint32_t *result_len)
 {
+	/*
+	 * Real-wasm path (TB-WIMP / ADR-0013). A module named "wasm:<name>" routes
+	 * to the dlopen-backed wasmtime runtime, which on-demand instantiates
+	 * <name>.wasm and runs it against a PLAIN COPY of the object bytes in linear
+	 * memory. If SPDK was built --without-wasm, or libwasmtime.so is absent, this
+	 * returns NOT_SUPPORTED (distinct "runtime unavailable" — never a crash); the
+	 * C built-ins below remain fully functional regardless.
+	 */
+	if (strncmp(module, KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX,
+		    strlen(KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX)) == 0) {
+		const char *name = module + strlen(KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX);
+
+		return kvdev_rados_nkvx_wasm_run(name, object, object_len, out, out_len,
+						 result_len);
+	}
+
 	if (strcmp(module, KVDEV_RADOS_NKVX_MODULE_BYTECOUNT) == 0) {
 		uint64_t count = (uint64_t)object_len;
 		uint32_t copy = (uint32_t)spdk_min(sizeof(count), (size_t)out_len);

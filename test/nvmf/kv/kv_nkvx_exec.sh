@@ -8,13 +8,17 @@
 # cls/rados_read_op_exec path (that one is kv_rados_exec.sh).
 #
 # Wires the librados-backed kvdev to a KV namespace, allowlists:
-#   op_id 10 -> "nkvx:bytecount"  (result = object length as LE u64)
-#   op_id 11 -> "nkvx:identity"   (result = object bytes copied back)
-# then runs kv_host nkvx-exec, which Stores a value and issues both Execs and a
+#   op_id 10 -> "nkvx:bytecount"       (result = object length as LE u64; built-in)
+#   op_id 11 -> "nkvx:identity"        (result = object bytes copied back; built-in)
+#   op_id 12 -> "nkvx:wasm:bytecount"  (result = object length as LE u64; REAL .wasm)
+# then runs kv_host nkvx-exec, which Stores a value and issues those Execs and a
 # concurrent-Retrieve latency probe proving the reactor is not blocked.
 #
 # The "nkvx:" binding prefix routes KV Exec to the executor; the text after it
-# names the built-in module (statically bound for TB1).
+# names the module. A "wasm:<name>" module runs a REAL precompiled <name>.wasm in
+# the dlopen-backed wasmtime runtime (ADR-0013) instead of a C built-in; it
+# requires an SPDK built --with-wasm, libwasmtime.so installed (see below), and
+# SPDK_NKVX_WASM_DIR pointing at the .wasm directory.
 #
 # Off-reactor proof is DETERMINISTIC (not timing-based): the target logs the
 # reactor OS thread id and the worker OS thread id the module actually ran on for
@@ -22,8 +26,10 @@
 # the target log and asserts those ids differ. No artificial delay is used.
 #
 # Requires: a vstart Ceph cluster UP with pool 'kvpool', and an SPDK build
-# configured --with-rbd --with-vfio-user. No OSD-side object class is needed
-# (that's the whole point of ADR-0009).
+# configured --with-rbd --with-vfio-user (and --with-wasm for the op_id 12 real-
+# wasm Exec). No OSD-side object class is needed (that's the whole point of
+# ADR-0009). libwasmtime.so must be dlopen'able by the target: install it to
+# /usr/local/lib (the executor probes that path) or put it on LD_LIBRARY_PATH.
 
 testdir=$(readlink -f $(dirname $0))
 rootdir=$(readlink -f $testdir/../../..)
@@ -66,8 +72,14 @@ trap cleanup EXIT
 # Build the host app if needed.
 make -C "$testdir" > /dev/null
 
+# Directory holding precompiled <name>.wasm modules for the real-wasm Exec path
+# (op_id 12). The executor reads SPDK_NKVX_WASM_DIR to locate "bytecount.wasm".
+export SPDK_NKVX_WASM_DIR="$testdir/wasm"
+
 # Start the target. Capture its log so we can grep the deterministic off-reactor
-# proof (reactor_tid vs worker run_tid) the executor emits for each Exec.
+# proof (reactor_tid vs worker run_tid) the executor emits for each Exec. The
+# target inherits SPDK_NKVX_WASM_DIR so the dlopen-backed wasmtime runtime can
+# find bytecount.wasm.
 tgt_log="$sock_dir/nvmf_tgt.log"
 $rootdir/build/bin/nvmf_tgt -r "$rpc_sock" -m 0x3 > "$tgt_log" 2>&1 &
 nvmfpid=$!
@@ -83,8 +95,9 @@ $rpc_py nvmf_subsystem_add_listener "$nqn" -t VFIOUSER -a "$muser_dir" -s 0
 
 # Allowlist the nkvx op-IDs. Binding format is "nkvx:<module>"; the CLI splits
 # each token on the FIRST ':' into op_id and binding, so "10:nkvx:bytecount"
-# yields op_id=10 binding="nkvx:bytecount".
-$rpc_py nvmf_ns_set_kv_exec_allowlist "$nqn" "$nsid" "10:nkvx:bytecount 11:nkvx:identity"
+# yields op_id=10 binding="nkvx:bytecount", and "12:nkvx:wasm:bytecount" yields
+# op_id=12 binding="nkvx:wasm:bytecount" (module "wasm:bytecount" -> real .wasm).
+$rpc_py nvmf_ns_set_kv_exec_allowlist "$nqn" "$nsid" "10:nkvx:bytecount 11:nkvx:identity 12:nkvx:wasm:bytecount"
 get_json=$($rpc_py nvmf_ns_get_kv_exec_allowlist "$nqn" "$nsid")
 echo "nvmf_ns_get_kv_exec_allowlist => $get_json"
 
