@@ -36,18 +36,75 @@
 #define WASM_RES_OFF 8u
 
 /*
- * Minimal dlsym table — ONLY the symbols a trivial off-reactor run needs
- * (ADR-0013: keep the symbol set minimal). Version-gated by symbol-presence
- * probing (no wasmtime version function exists); a missing symbol => the table
- * fails to load and we fall back to "runtime unavailable".
+ * Per-invocation resource caps (TB2: the Phase-1 safety exit). A runaway or
+ * over-allocating module must be CONTAINED, never crash/hang the target.
+ *
+ *   - fuel_ceiling: units of wasmtime "fuel" the module may consume before it
+ *     traps (compute-runaway kill). 0 => fuel disabled for this run.
+ *   - epoch_deadline_ticks: how many epoch ticks beyond the current epoch the
+ *     module may run before it is interrupted (wall-clock-runaway kill — catches
+ *     what fuel under-counts). 0 => epoch deadline disabled for this run.
+ *   - max_memory_bytes: linear-memory ceiling enforced by the store limiter, so
+ *     a memory.grow past the cap fails (contained, not an OOM of the target).
+ *     0 => memory unlimited for this run.
+ *
+ * SOURCE OF CAPS (this slice): provisional defaults below, each overridable per
+ * invocation by an environment variable (read once on every run, so they ARE
+ * configurable per invocation). Wiring caps to the per-op allowlist binding is
+ * TB3 (the binding-encoding freeze is in progress) — NOT this slice. The plumbing
+ * in nkvx_wasm_caps_load() is exactly where the TB3 allowlist source will replace
+ * the env/default source.
+ */
+struct nkvx_wasm_caps {
+	uint64_t	fuel_ceiling;
+	uint64_t	epoch_deadline_ticks;
+	uint64_t	max_memory_bytes;
+};
+
+/* Provisional defaults (TB2). Tuned so the checked-in test modules behave as the
+ * acceptance matrix requires: bytecount completes well under these; the runaway
+ * modules blow past them. */
+#define NKVX_WASM_DEFAULT_FUEL		(100ull * 1000ull * 1000ull)	/* 100M fuel units */
+#define NKVX_WASM_DEFAULT_EPOCH_TICKS	(10ull)				/* 10 ticks @ tick interval */
+#define NKVX_WASM_DEFAULT_MAX_MEMORY	(8ull * 1024ull * 1024ull)	/* 8 MiB linear memory */
+
+/* Env overrides (per-invocation; TB3 replaces these with the allowlist source). */
+#define NKVX_WASM_ENV_FUEL		"SPDK_NKVX_WASM_FUEL"
+#define NKVX_WASM_ENV_EPOCH_TICKS	"SPDK_NKVX_WASM_EPOCH_TICKS"
+#define NKVX_WASM_ENV_MAX_MEMORY	"SPDK_NKVX_WASM_MAX_MEMORY"
+
+/* Epoch ticker interval. The background timer thread bumps the engine epoch at
+ * this cadence; epoch_deadline_ticks * this interval is the effective wall-clock
+ * budget. 10ms * 10 ticks => ~100ms wall-clock ceiling by default. */
+#define NKVX_WASM_EPOCH_TICK_NS		(10ull * 1000ull * 1000ull)	/* 10 ms */
+
+/*
+ * dlsym table — the symbols a capped off-reactor run needs (ADR-0013: keep the
+ * set minimal, but TB2 adds the config/fuel/epoch/limiter symbols). Version-gated
+ * by symbol-presence probing (no wasmtime version function exists); a missing
+ * symbol => the table fails to load and we fall back to "runtime unavailable".
  */
 struct nkvx_wasm_api {
-	wasm_engine_t *(*engine_new)(void);
+	/* Config + engine: a config carries the fuel/epoch feature toggles, so the
+	 * engine is created via wasm_engine_new_with_config (NOT wasm_engine_new). */
+	wasm_config_t *(*config_new)(void);
+	void (*config_consume_fuel_set)(wasm_config_t *, bool);
+	void (*config_epoch_interruption_set)(wasm_config_t *, bool);
+	wasm_engine_t *(*engine_new_with_config)(wasm_config_t *);
 	void (*engine_delete)(wasm_engine_t *);
+	/* Wall-clock interrupt source: the timer thread calls this. */
+	void (*engine_increment_epoch)(wasm_engine_t *);
 
 	wasmtime_store_t *(*store_new)(wasm_engine_t *, void *, void *);
 	wasmtime_context_t *(*store_context)(wasmtime_store_t *);
 	void (*store_delete)(wasmtime_store_t *);
+	/* Linear-memory (and friends) ceiling. */
+	void (*store_limiter)(wasmtime_store_t *, int64_t, int64_t, int64_t,
+			      int64_t, int64_t);
+
+	/* Per-invocation caps applied to the store's context. */
+	wasmtime_error_t *(*context_set_fuel)(wasmtime_context_t *, uint64_t);
+	void (*context_set_epoch_deadline)(wasmtime_context_t *, uint64_t);
 
 	wasmtime_error_t *(*module_new)(wasm_engine_t *, const uint8_t *, size_t,
 					wasmtime_module_t **);
@@ -68,6 +125,7 @@ struct nkvx_wasm_api {
 
 	void (*error_message)(const wasmtime_error_t *, wasm_byte_vec_t *);
 	void (*error_delete)(wasmtime_error_t *);
+	void (*trap_message)(const wasm_trap_t *, wasm_byte_vec_t *);
 	void (*trap_delete)(wasm_trap_t *);
 	void (*byte_vec_delete)(wasm_byte_vec_t *);
 };
@@ -105,11 +163,18 @@ nkvx_wasm_resolve(void *h)
 		} \
 	} while (0)
 
-	SYM(engine_new, "wasm_engine_new");
+	SYM(config_new, "wasm_config_new");
+	SYM(config_consume_fuel_set, "wasmtime_config_consume_fuel_set");
+	SYM(config_epoch_interruption_set, "wasmtime_config_epoch_interruption_set");
+	SYM(engine_new_with_config, "wasm_engine_new_with_config");
 	SYM(engine_delete, "wasm_engine_delete");
+	SYM(engine_increment_epoch, "wasmtime_engine_increment_epoch");
 	SYM(store_new, "wasmtime_store_new");
 	SYM(store_context, "wasmtime_store_context");
 	SYM(store_delete, "wasmtime_store_delete");
+	SYM(store_limiter, "wasmtime_store_limiter");
+	SYM(context_set_fuel, "wasmtime_context_set_fuel");
+	SYM(context_set_epoch_deadline, "wasmtime_context_set_epoch_deadline");
 	SYM(module_new, "wasmtime_module_new");
 	SYM(module_delete, "wasmtime_module_delete");
 	SYM(instance_new, "wasmtime_instance_new");
@@ -119,6 +184,7 @@ nkvx_wasm_resolve(void *h)
 	SYM(func_call, "wasmtime_func_call");
 	SYM(error_message, "wasmtime_error_message");
 	SYM(error_delete, "wasmtime_error_delete");
+	SYM(trap_message, "wasm_trap_message");
 	SYM(trap_delete, "wasm_trap_delete");
 	SYM(byte_vec_delete, "wasm_byte_vec_delete");
 #undef SYM
@@ -161,6 +227,171 @@ nkvx_wasm_api(void)
 {
 	pthread_once(&g_api_once, nkvx_wasm_load_once);
 	return g_api_ready;
+}
+
+/*
+ * EPOCH TICKER THREAD (the wall-clock interrupt source).
+ *
+ * Fuel under-counts wall-clock (a tight loop of cheap ops, or a host trap loop,
+ * can burn real time without burning much fuel). Epoch interruption catches that:
+ * a background thread bumps the engine-local epoch at a fixed cadence, and any
+ * run whose store has set an epoch deadline traps once enough ticks elapse.
+ *
+ * On-demand (ADR-0013) means at most one engine is live at a time on the single
+ * executor worker, so the ticker tracks a single "current engine" pointer under a
+ * mutex. nkvx_wasm_epoch_register()/_unregister() bracket each run; the thread is
+ * started once (lazily) and runs for process lifetime (it is a cheap sleeper and
+ * there is no teardown hook on this path). If a second engine ever overlapped,
+ * the register call would simply replace the pointer — acceptable because each
+ * run also has its own fuel ceiling as a second, independent guard.
+ */
+static struct {
+	pthread_mutex_t		mutex;
+	pthread_cond_t		cond;
+	pthread_t		tid;
+	bool			started;
+	wasm_engine_t		*engine;	/* engine to tick, or NULL when idle */
+	const struct nkvx_wasm_api *api;
+} g_epoch = {
+	.mutex = PTHREAD_MUTEX_INITIALIZER,
+	.cond = PTHREAD_COND_INITIALIZER,
+};
+
+static void *
+nkvx_wasm_epoch_thread(void *arg)
+{
+	(void)arg;
+
+	for (;;) {
+		struct timespec ts;
+
+		/* Sleep one tick interval (NKVX_WASM_EPOCH_TICK_NS). nanosleep is
+		 * fine here; this thread does nothing else. */
+		ts.tv_sec = (time_t)(NKVX_WASM_EPOCH_TICK_NS / 1000000000ull);
+		ts.tv_nsec = (long)(NKVX_WASM_EPOCH_TICK_NS % 1000000000ull);
+		nanosleep(&ts, NULL);
+
+		pthread_mutex_lock(&g_epoch.mutex);
+		if (g_epoch.engine != NULL && g_epoch.api != NULL) {
+			/* Bump the epoch of the in-flight run's engine. A run that has
+			 * set an epoch deadline traps once its tick budget elapses. */
+			g_epoch.api->engine_increment_epoch(g_epoch.engine);
+		}
+		pthread_mutex_unlock(&g_epoch.mutex);
+	}
+	return NULL;
+}
+
+/* Start the ticker thread once; arm it for this run's engine. */
+static void
+nkvx_wasm_epoch_register(const struct nkvx_wasm_api *api, wasm_engine_t *engine)
+{
+	pthread_mutex_lock(&g_epoch.mutex);
+	if (!g_epoch.started) {
+		if (pthread_create(&g_epoch.tid, NULL, nkvx_wasm_epoch_thread, NULL) == 0) {
+			g_epoch.started = true;
+		} else {
+			SPDK_ERRLOG("nkvx/wasm: epoch ticker thread create failed; "
+				    "wall-clock cap inactive (fuel cap still applies)\n");
+		}
+	}
+	g_epoch.api = api;
+	g_epoch.engine = engine;
+	pthread_mutex_unlock(&g_epoch.mutex);
+}
+
+/* Disarm the ticker (the engine is about to be torn down). */
+static void
+nkvx_wasm_epoch_unregister(wasm_engine_t *engine)
+{
+	pthread_mutex_lock(&g_epoch.mutex);
+	if (g_epoch.engine == engine) {
+		g_epoch.engine = NULL;
+	}
+	pthread_mutex_unlock(&g_epoch.mutex);
+}
+
+/* Parse a uint64 env override; returns def when unset/empty/unparseable. */
+static uint64_t
+nkvx_wasm_env_u64(const char *name, uint64_t def)
+{
+	const char *v = getenv(name);
+	char *end = NULL;
+	unsigned long long parsed;
+
+	if (v == NULL || v[0] == '\0') {
+		return def;
+	}
+	errno = 0;
+	parsed = strtoull(v, &end, 0);
+	if (errno != 0 || end == v || (end != NULL && *end != '\0')) {
+		SPDK_WARNLOG("nkvx/wasm: bad value '%s' for %s; using default %" PRIu64 "\n",
+			     v, name, def);
+		return def;
+	}
+	return (uint64_t)parsed;
+}
+
+/*
+ * Load the per-invocation caps for THIS run. TB2 source: provisional compile-time
+ * defaults, each overridable by an environment variable (read on every run, so
+ * caps are genuinely per-invocation configurable). TB3 will replace the body here
+ * with the per-op allowlist binding once the binding-encoding freeze lands.
+ */
+static void
+nkvx_wasm_caps_load(struct nkvx_wasm_caps *caps)
+{
+	caps->fuel_ceiling = nkvx_wasm_env_u64(NKVX_WASM_ENV_FUEL,
+					       NKVX_WASM_DEFAULT_FUEL);
+	caps->epoch_deadline_ticks = nkvx_wasm_env_u64(NKVX_WASM_ENV_EPOCH_TICKS,
+				     NKVX_WASM_DEFAULT_EPOCH_TICKS);
+	caps->max_memory_bytes = nkvx_wasm_env_u64(NKVX_WASM_ENV_MAX_MEMORY,
+				 NKVX_WASM_DEFAULT_MAX_MEMORY);
+}
+
+/*
+ * Classify a wasmtime trap as a resource-cap kill (fuel/epoch) versus an ordinary
+ * module trap. The wasmtime C API exposes the trap message; cap-induced traps
+ * carry a recognisable message ("all fuel consumed", "epoch deadline" / "interrupt").
+ * On match we surface ABORTED; otherwise FAILED. Either way the worker returns
+ * cleanly — the target never crashes.
+ */
+static bool
+nkvx_wasm_trap_is_cap(const struct nkvx_wasm_api *api, wasm_trap_t *trap)
+{
+	wasm_byte_vec_t msg;
+	bool is_cap = false;
+
+	api->trap_message(trap, &msg);
+	if (msg.data != NULL && msg.size > 0) {
+		/* Case-insensitive substring search for the known cap messages. */
+		static const char *needles[] = {
+			"fuel", "epoch", "interrupt",
+		};
+		size_t i;
+
+		for (i = 0; i < SPDK_COUNTOF(needles); i++) {
+			size_t nlen = strlen(needles[i]);
+
+			if (msg.size >= nlen) {
+				size_t j;
+
+				for (j = 0; j + nlen <= msg.size; j++) {
+					if (strncasecmp(msg.data + j, needles[i], nlen) == 0) {
+						is_cap = true;
+						break;
+					}
+				}
+			}
+			if (is_cap) {
+				break;
+			}
+		}
+		SPDK_NOTICELOG("nkvx/wasm: trap message: %.*s (cap=%s)\n",
+			       (int)msg.size, msg.data, is_cap ? "YES" : "no");
+	}
+	api->byte_vec_delete(&msg);
+	return is_cap;
 }
 
 /* Log and free a wasmtime error. */
@@ -239,7 +470,9 @@ kvdev_rados_nkvx_wasm_run(const char *name,
 	size_t wasm_len = 0;
 	int status = SPDK_KVDEV_IO_STATUS_FAILED;
 
+	wasm_config_t *config = NULL;
 	wasm_engine_t *engine = NULL;
+	bool epoch_armed = false;
 	wasmtime_store_t *store = NULL;
 	wasmtime_context_t *ctx = NULL;
 	wasmtime_module_t *module = NULL;
@@ -250,6 +483,7 @@ kvdev_rados_nkvx_wasm_run(const char *name,
 	uint8_t *mem_base;
 	size_t mem_size;
 	wasmtime_val_t args[2], results[1];
+	struct nkvx_wasm_caps caps;
 
 	*result_len = 0;
 
@@ -267,21 +501,58 @@ kvdev_rados_nkvx_wasm_run(const char *name,
 		return SPDK_KVDEV_IO_STATUS_FAILED;
 	}
 
+	/* Per-invocation caps (TB2). See nkvx_wasm_caps_load() for the source. */
+	nkvx_wasm_caps_load(&caps);
+	SPDK_NOTICELOG("nkvx/wasm: module '%s' caps fuel=%" PRIu64 " epoch_ticks=%" PRIu64
+		       " max_mem=%" PRIu64 "B\n", name,
+		       caps.fuel_ceiling, caps.epoch_deadline_ticks, caps.max_memory_bytes);
+
 	/*
-	 * On-demand instance strategy (ADR-0013 for THIS slice): a fresh
-	 * engine/store/module/instance per run. No warm reuse, no pooling, no caps.
+	 * On-demand instance strategy (ADR-0013): a fresh engine/store/module/
+	 * instance per run, NO warm reuse/pooling. TB2 adds per-invocation caps:
+	 * the engine carries fuel + epoch-interruption feature toggles (set on the
+	 * config BEFORE the engine is created); the store carries the fuel ceiling,
+	 * epoch deadline, and linear-memory limiter.
 	 */
-	engine = api->engine_new();
-	if (engine == NULL) {
-		SPDK_ERRLOG("nkvx/wasm: wasm_engine_new failed\n");
+	config = api->config_new();
+	if (config == NULL) {
+		SPDK_ERRLOG("nkvx/wasm: wasm_config_new failed\n");
 		goto out;
 	}
+	/* Enable the features the caps need. Fuel and epoch are independent guards
+	 * (fuel = deterministic compute budget; epoch = wall-clock backstop). */
+	api->config_consume_fuel_set(config, caps.fuel_ceiling > 0);
+	api->config_epoch_interruption_set(config, caps.epoch_deadline_ticks > 0);
+
+	/* engine_new_with_config CONSUMES the config. */
+	engine = api->engine_new_with_config(config);
+	config = NULL;
+	if (engine == NULL) {
+		SPDK_ERRLOG("nkvx/wasm: wasm_engine_new_with_config failed\n");
+		goto out;
+	}
+
+	/* Arm the wall-clock ticker for this engine BEFORE the module runs, so an
+	 * epoch deadline can actually fire. Disarmed before engine teardown. */
+	if (caps.epoch_deadline_ticks > 0) {
+		nkvx_wasm_epoch_register(api, engine);
+		epoch_armed = true;
+	}
+
 	store = api->store_new(engine, NULL, NULL);
 	if (store == NULL) {
 		SPDK_ERRLOG("nkvx/wasm: wasmtime_store_new failed\n");
 		goto out;
 	}
 	ctx = api->store_context(store);
+
+	/* MEMORY CAP: bound linear memory so a memory.grow past the cap fails and
+	 * the module is contained, never OOMing the target. Other limits left at
+	 * wasmtime defaults (negative => keep default). */
+	if (caps.max_memory_bytes > 0) {
+		api->store_limiter(store, (int64_t)caps.max_memory_bytes,
+				   -1, -1, -1, -1);
+	}
 
 	err = api->module_new(engine, wasm, wasm_len, &module);
 	if (err != NULL) {
@@ -329,6 +600,24 @@ kvdev_rados_nkvx_wasm_run(const char *name,
 		memcpy(mem_base + WASM_OBJ_OFF, object, object_len);
 	}
 
+	/*
+	 * Apply the per-invocation FUEL + EPOCH caps to the store context, right
+	 * before the call (fuel must be (re)set per invocation; the store starts
+	 * with 0 fuel => an immediate trap if we forgot). A fuel-runaway exhausts
+	 * its budget and traps; an epoch-runaway (which fuel may under-count) trips
+	 * the wall-clock deadline the ticker thread advances.
+	 */
+	if (caps.fuel_ceiling > 0) {
+		err = api->context_set_fuel(ctx, caps.fuel_ceiling);
+		if (err != NULL) {
+			nkvx_wasm_log_error(api, "context_set_fuel", err);
+			goto out;
+		}
+	}
+	if (caps.epoch_deadline_ticks > 0) {
+		api->context_set_epoch_deadline(ctx, caps.epoch_deadline_ticks);
+	}
+
 	/* Call <name>(obj_off, obj_len) -> result_len. */
 	args[0].kind = WASMTIME_I32;
 	args[0].of.i32 = (int32_t)WASM_OBJ_OFF;
@@ -340,9 +629,17 @@ kvdev_rados_nkvx_wasm_run(const char *name,
 		goto out;
 	}
 	if (trap != NULL) {
-		SPDK_ERRLOG("nkvx/wasm: module '%s' trapped during execution\n", name);
+		/* A trap here is either a per-invocation cap kill (fuel/epoch) or an
+		 * ordinary module fault. Classify it so a cap kill surfaces the
+		 * distinct ABORTED ("resource exhausted") status; either way the
+		 * worker returns cleanly and the SPDK-thread completion still fires. */
+		bool cap = nkvx_wasm_trap_is_cap(api, trap);
+
+		SPDK_ERRLOG("nkvx/wasm: module '%s' trapped during execution (%s)\n",
+			    name, cap ? "RESOURCE CAP — aborted" : "fault");
 		api->trap_delete(trap);
 		trap = NULL;
+		status = cap ? SPDK_KVDEV_IO_STATUS_ABORTED : SPDK_KVDEV_IO_STATUS_FAILED;
 		goto out;
 	}
 	if (results[0].kind != WASMTIME_I32) {
@@ -380,9 +677,17 @@ out:
 	if (store != NULL) {
 		api->store_delete(store);
 	}
+	/* Disarm the ticker BEFORE deleting the engine it points at (avoids the
+	 * ticker thread touching a freed engine). */
+	if (epoch_armed) {
+		nkvx_wasm_epoch_unregister(engine);
+	}
 	if (engine != NULL) {
 		api->engine_delete(engine);
 	}
+	/* config is always NULL here: engine_new_with_config consumes it (even on
+	 * failure) and we NULL it immediately, and no goto jumps in between. */
+	(void)config;
 	free(wasm);
 	return status;
 }

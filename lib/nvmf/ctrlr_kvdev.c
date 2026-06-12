@@ -143,6 +143,12 @@ nvmf_kvdev_complete(struct nvmf_kvdev_request *kv_req, int kvstatus, uint32_t va
 		 * report NVMe command-not-supported (Invalid Command Opcode). */
 		rsp->status.sc = SPDK_NVME_SC_INVALID_OPCODE;
 		break;
+	case SPDK_KVDEV_IO_STATUS_ABORTED:
+		/* A KV Exec module hit a per-invocation resource cap (fuel/epoch/
+		 * memory) and was contained (TB2). Report NVMe "command aborted";
+		 * the target stays up and other traffic is unaffected. */
+		rsp->status.sc = SPDK_NVME_SC_ABORTED_BY_REQUEST;
+		break;
 	case SPDK_KVDEV_IO_STATUS_FAILED:
 	default:
 		rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;

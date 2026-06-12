@@ -401,6 +401,97 @@ main(int argc, char **argv)
 			"off-reactor in wasmtime, returned LE u64\n", expect_len);
 
 		/*
+		 * --- TB2 per-invocation caps: a runaway/over-alloc .wasm must be
+		 * CONTAINED (the command is aborted), never crash/hang the target.
+		 * op_id 13 -> nkvx:wasm:fuel_runaway     (compute-runaway; fuel kill)
+		 * op_id 14 -> nkvx:wasm:walltime_runaway (wall-clock-runaway; epoch kill)
+		 * op_id 15 -> nkvx:wasm:overalloc        (memory.grow past cap; contained)
+		 *
+		 * Each Exec must (a) complete (no hang) within the bounded budget and
+		 * (b) report a failure status (NVMe ABORTED_BY_REQUEST for a cap kill;
+		 * any non-SUCCESS for the contained over-alloc). A normal bytecount Exec
+		 * issued AFTER each runaway proves the target is still alive.
+		 */
+		{
+			struct {
+				uint16_t op_id;
+				const char *what;
+				bool expect_aborted;	/* true => require ABORTED sc */
+			} runaways[] = {
+				{ 13, "fuel_runaway (fuel cap)",      true  },
+				{ 14, "walltime_runaway (epoch cap)", true  },
+				{ 15, "overalloc (memory cap)",       false },
+			};
+			size_t k;
+
+			for (k = 0; k < SPDK_COUNTOF(runaways); k++) {
+				int wait_rc;
+
+				memset(exec_buf, 0, buf_len);
+				rc = spdk_nvme_kv_exec(ctx.ns, ctx.qpair, g_key, strlen(g_key),
+						       runaways[k].op_id, exec_buf, 0,
+						       exec_buf, buf_len, io_complete, &ctx);
+				/* Bounded wait. A cap kill COMPLETES the command with a
+				 * failure status (wait_rc == -1), which is the SUCCESS path
+				 * for this test: the cap-status assertions below inspect
+				 * ctx.last_sc. Only a real TIMEOUT (wait_rc == -2) means the
+				 * runaway ESCAPED its cap and hung -> hard fail. A submit
+				 * error (rc != 0) is likewise fatal. */
+				wait_rc = (rc == 0)
+					? wait_for_completion_timeout(&ctx, KV_RADOS_EXEC_TIMEOUT_S)
+					: -2;
+				if (rc != 0 || wait_rc == -2) {
+					fprintf(stderr,
+						"FAIL: nkvx %s did not complete (cap escaped / hang)\n",
+						runaways[k].what);
+					spdk_dma_free(exec_buf);
+					rc = 1;
+					goto free_qpair;
+				}
+				if (ctx.last_sc == SPDK_NVME_SC_SUCCESS) {
+					fprintf(stderr,
+						"FAIL: nkvx %s reported SUCCESS (cap did NOT contain it)\n",
+						runaways[k].what);
+					spdk_dma_free(exec_buf);
+					rc = 1;
+					goto free_qpair;
+				}
+				if (runaways[k].expect_aborted &&
+				    ctx.last_sc != SPDK_NVME_SC_ABORTED_BY_REQUEST) {
+					fprintf(stderr,
+						"FAIL: nkvx %s sc=0x%02x (expected ABORTED_BY_REQUEST 0x07)\n",
+						runaways[k].what, ctx.last_sc);
+					spdk_dma_free(exec_buf);
+					rc = 1;
+					goto free_qpair;
+				}
+				fprintf(stderr,
+					"KV Exec nkvx CAP OK: %s contained -> sc=0x%02x (target alive)\n",
+					runaways[k].what, ctx.last_sc);
+
+				/* Liveness re-probe: a normal bytecount Exec must STILL work
+				 * right after the runaway, proving the target did not crash. */
+				memset(exec_buf, 0, buf_len);
+				rc = spdk_nvme_kv_exec(ctx.ns, ctx.qpair, g_key, strlen(g_key),
+						       12 /* nkvx:wasm:bytecount */, exec_buf, 0,
+						       exec_buf, buf_len, io_complete, &ctx);
+				if (rc != 0 ||
+				    wait_for_completion_timeout(&ctx, KV_RADOS_EXEC_TIMEOUT_S) != 0 ||
+				    ctx.last_sc != SPDK_NVME_SC_SUCCESS) {
+					fprintf(stderr,
+						"FAIL: target not healthy after %s (sc=0x%02x)\n",
+						runaways[k].what, ctx.last_sc);
+					spdk_dma_free(exec_buf);
+					rc = 1;
+					goto free_qpair;
+				}
+			}
+			fprintf(stderr,
+				"KV Exec nkvx CAPS OK: fuel/epoch/memory runaways all contained, "
+				"target still serving normal Execs\n");
+		}
+
+		/*
 		 * --- Criterion 2: off-reactor proof (deterministic, not timing-based).
 		 * Both Execs above ran the module body on the executor's dedicated worker
 		 * thread, NOT the polled SPDK reactor. The target emits a NOTICELOG line
