@@ -37,8 +37,17 @@
 
 #define NVMF_VFIO_USER_DEFAULT_MAX_QUEUE_DEPTH 256
 #define NVMF_VFIO_USER_DEFAULT_AQ_DEPTH 32
-#define NVMF_VFIO_USER_DEFAULT_MAX_IO_SIZE ((NVMF_REQ_MAX_BUFFERS - 1) << SHIFT_4KB)
-#define NVMF_VFIO_USER_DEFAULT_IO_UNIT_SIZE NVMF_VFIO_USER_DEFAULT_MAX_IO_SIZE
+/*
+ * Max single IO size. Decoupled from NVMF_REQ_MAX_BUFFERS: a large value is
+ * described by a (possibly chained) PRP list and mapped via nvme_cmd_map_prps,
+ * which coalesces physically-contiguous pages into a small number of iovs (one
+ * per contiguous run). So the iov budget bounds the number of *runs*, not the
+ * transfer size. 64 MiB supports GPU-initiated KV values up to 64 MiB.
+ */
+#define NVMF_VFIO_USER_DEFAULT_MAX_IO_SIZE (64ULL * 1024 * 1024)
+/* IO unit size is independent of max IO size for vfio-user (data is mapped
+ * directly from guest memory, not pulled from the iobuf pool). */
+#define NVMF_VFIO_USER_DEFAULT_IO_UNIT_SIZE (128 * 1024)
 
 #define NVME_DOORBELLS_OFFSET	0x1000
 #define NVMF_VFIO_USER_SHADOW_DOORBELLS_BUFFER_COUNT 2
@@ -98,8 +107,19 @@ struct nvmf_vfio_user_req;
 
 typedef int (*nvmf_vfio_user_req_cb_fn)(struct nvmf_vfio_user_req *req, void *cb_arg);
 
-/* 1 more for PRP2 list itself */
-#define NVMF_VFIO_USER_MAX_IOVECS	(NVMF_REQ_MAX_BUFFERS + 1)
+/*
+ * Per-request iovec / scatter-gather capacity for vfio-user.
+ *
+ * This bounds every gpa_to_vva mapping a single command makes: the data iovs
+ * (coalesced, returned in req->iov and capped by NVMF_REQ_MAX_BUFFERS) PLUS the
+ * transient MAP_R mappings of the PRP list pages themselves, which accumulate
+ * here while nvme_cmd_map_prps walks a (chained) PRP list and are released when
+ * the request completes. A 64 MiB transfer needs ~32 chained PRP-list-page
+ * mappings; 128 leaves comfortable headroom. Decoupled from NVMF_REQ_MAX_BUFFERS
+ * (which is ABI-size-checked via struct spdk_nvmf_ctrlr) so it can grow freely;
+ * it only sizes nvmf_vfio_user_req's own iov[] and sg[] flexible array.
+ */
+#define NVMF_VFIO_USER_MAX_IOVECS	128
 
 enum nvmf_vfio_user_req_state {
 	VFIO_USER_REQUEST_STATE_FREE = 0,
@@ -667,7 +687,7 @@ nvme_cmd_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
 	uint64_t prp1, prp2;
 	void *vva;
 	uint32_t i;
-	uint32_t residue_len, nents;
+	uint32_t residue_len;
 	uint64_t *prp_list;
 	uint32_t iovcnt;
 
@@ -711,35 +731,92 @@ nvme_cmd_map_prps(void *prv, struct spdk_nvme_cmd *cmd, struct iovec *iovs,
 			iovs[1].iov_base = vva;
 			iovs[1].iov_len = len;
 		} else {
-			/* PRP list used */
-			nents = (len + mps - 1) / mps;
-			if (spdk_unlikely(nents + 1 > max_iovcnt)) {
-				SPDK_ERRLOG("Too many page entries\n");
-				return -ERANGE;
-			}
+			/*
+			 * PRP list used. Walk the (possibly chained) PRP list and
+			 * coalesce physically-contiguous data pages into as few iovs as
+			 * possible. A contiguous buffer (e.g. a GPU VRAM P2P region)
+			 * collapses to a single iov regardless of transfer size, keeping
+			 * iovcnt within NVMF_REQ_MAX_BUFFERS (and the uint8_t iovcnt
+			 * field) for transfers far larger than the raw page count would
+			 * otherwise allow.
+			 *
+			 * Each PRP list page holds (mps / 8) entries; when the list spans
+			 * multiple pages, the last entry of every non-final page points to
+			 * the next list page (NVMe base spec PRP chaining). List pages are
+			 * mapped MAP_R; they accumulate in the request iov array and are
+			 * released when the request completes.
+			 */
+			uint32_t ents_per_page = mps / sizeof(*prp_list);
+			uint64_t cur_list_gpa = prp2;
+			uint64_t run_base = 0, run_len = 0;
+			bool have_run = false;
 
-			vva = gpa_to_vva(prv, prp2, nents * sizeof(*prp_list), MAP_R);
-			if (spdk_unlikely(vva == NULL)) {
-				SPDK_ERRLOG("no VVA for %#" PRIx64 ", nents=%#x\n",
-					    prp2, nents);
-				return -EINVAL;
-			}
-			prp_list = vva;
-			i = 0;
+			iovcnt = 1; /* iovs[0] holds PRP1 */
+
 			while (len != 0) {
-				residue_len = spdk_min(len, mps);
-				vva = gpa_to_vva(prv, prp_list[i], residue_len, MAP_RW);
-				if (spdk_unlikely(vva == NULL)) {
-					SPDK_ERRLOG("no VVA for %#" PRIx64 ", residue_len=%#x\n",
-						    prp_list[i], residue_len);
+				uint32_t list_pages = (len + mps - 1) / mps;
+				bool chained = list_pages > ents_per_page;
+				uint32_t this_data = chained ? (ents_per_page - 1) : list_pages;
+				uint32_t map_ents = this_data + (chained ? 1 : 0);
+
+				prp_list = gpa_to_vva(prv, cur_list_gpa,
+						      map_ents * sizeof(*prp_list), MAP_R);
+				if (spdk_unlikely(prp_list == NULL)) {
+					SPDK_ERRLOG("no VVA for PRP list %#" PRIx64 ", ents=%#x\n",
+						    cur_list_gpa, map_ents);
 					return -EINVAL;
 				}
-				iovs[i + 1].iov_base = vva;
-				iovs[i + 1].iov_len = residue_len;
-				len -= residue_len;
-				i++;
+
+				for (i = 0; i < this_data; i++) {
+					residue_len = spdk_min(len, mps);
+					if (have_run && prp_list[i] == run_base + run_len) {
+						/* contiguous: extend the current run */
+						run_len += residue_len;
+					} else {
+						/* flush the previous run as a single iov */
+						if (have_run) {
+							if (spdk_unlikely(iovcnt >= max_iovcnt)) {
+								SPDK_ERRLOG("Too many page entries (uncoalesced runs)\n");
+								return -ERANGE;
+							}
+							vva = gpa_to_vva(prv, run_base, run_len, MAP_RW);
+							if (spdk_unlikely(vva == NULL)) {
+								SPDK_ERRLOG("no VVA for run %#" PRIx64 ", len %#" PRIx64 "\n",
+									    run_base, run_len);
+								return -EINVAL;
+							}
+							iovs[iovcnt].iov_base = vva;
+							iovs[iovcnt].iov_len = run_len;
+							iovcnt++;
+						}
+						run_base = prp_list[i];
+						run_len = residue_len;
+						have_run = true;
+					}
+					len -= residue_len;
+				}
+
+				if (chained) {
+					cur_list_gpa = prp_list[ents_per_page - 1];
+				}
 			}
-			iovcnt = i + 1;
+
+			/* flush the final run */
+			if (have_run) {
+				if (spdk_unlikely(iovcnt >= max_iovcnt)) {
+					SPDK_ERRLOG("Too many page entries (uncoalesced runs)\n");
+					return -ERANGE;
+				}
+				vva = gpa_to_vva(prv, run_base, run_len, MAP_RW);
+				if (spdk_unlikely(vva == NULL)) {
+					SPDK_ERRLOG("no VVA for run %#" PRIx64 ", len %#" PRIx64 "\n",
+						    run_base, run_len);
+					return -EINVAL;
+				}
+				iovs[iovcnt].iov_base = vva;
+				iovs[iovcnt].iov_len = run_len;
+				iovcnt++;
+			}
 		}
 	} else {
 		/* 1 PRP used */

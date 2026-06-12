@@ -58,66 +58,100 @@ test_nvme_cmd_map_prps(void)
 {
 	struct spdk_nvme_cmd cmd = {};
 	struct iovec iovs[33];
-	uint64_t phy_addr, *prp;
+	uint64_t phy_addr, *prp, *prp_page1;
 	uint32_t len;
-	void *buf, *prps;
+	void *prps;
 	int i, ret;
 	size_t mps = 4096;
+	/*
+	 * gpa_to_vva() is the identity here, so the *data* pages need not be backed
+	 * by real memory; we use a fake page-aligned contiguous device base. Only
+	 * the PRP-list pages (prps) are actually dereferenced, so those are real.
+	 */
+	uint64_t base = 0x100000000ULL;
 
-	buf = spdk_zmalloc(132 * 1024, 4096, &phy_addr, 0, 0);
-	CU_ASSERT(buf != NULL);
-	prps = spdk_zmalloc(4096, 4096, &phy_addr, 0, 0);
+	/* Two pages so we can build a *chained* PRP list (case 5). */
+	prps = spdk_zmalloc(2 * 4096, 4096, &phy_addr, 0, 0);
 	CU_ASSERT(prps != NULL);
 
-	/* test case 1: 4KiB with PRP1 only */
-	cmd.dptr.prp.prp1 = (uint64_t)(uintptr_t)buf;
+	/* case 1: 4KiB, PRP1 only */
+	cmd.dptr.prp.prp1 = base;
 	len = 4096;
 	ret = nvme_cmd_map_prps(NULL, &cmd, iovs, 33, len, mps, gpa_to_vva);
 	CU_ASSERT(ret == 1);
-	CU_ASSERT(iovs[0].iov_base == (void *)(uintptr_t)cmd.dptr.prp.prp1);
-	CU_ASSERT(iovs[0].iov_len == len);
+	CU_ASSERT(iovs[0].iov_base == (void *)(uintptr_t)base);
+	CU_ASSERT(iovs[0].iov_len == 4096);
 
-	/* test case 2: 4KiB with PRP1 and PRP2, 1KiB in first iov, and 3KiB in second iov */
-	cmd.dptr.prp.prp1 = (uint64_t)(uintptr_t)buf + 1024 * 3;
-	cmd.dptr.prp.prp2 = (uint64_t)(uintptr_t)buf + 4096;
+	/* case 2: 4KiB split across PRP1 (1KiB) + a direct PRP2 (3KiB); also too
+	 * few iovs returns -ERANGE. (PRP2-direct path; no coalescing.) */
+	cmd.dptr.prp.prp1 = base + 1024 * 3;
+	cmd.dptr.prp.prp2 = base + 4096;
 	len = 4096;
 	ret = nvme_cmd_map_prps(NULL, &cmd, iovs, 1, len, mps, gpa_to_vva);
 	CU_ASSERT(ret == -ERANGE);
 	ret = nvme_cmd_map_prps(NULL, &cmd, iovs, 33, len, mps, gpa_to_vva);
 	CU_ASSERT(ret == 2);
-	CU_ASSERT(iovs[0].iov_base == (void *)(uintptr_t)cmd.dptr.prp.prp1);
 	CU_ASSERT(iovs[0].iov_len == 1024);
-	CU_ASSERT(iovs[1].iov_base == (void *)(uintptr_t)cmd.dptr.prp.prp2);
 	CU_ASSERT(iovs[1].iov_len == 1024 * 3);
 
-	/* test case 3: 128KiB with PRP list, 1KiB in first iov, 3KiB in last iov */
-	cmd.dptr.prp.prp1 = (uint64_t)(uintptr_t)buf + 1024 * 3;
+	/* case 3: 128KiB via a single PRP-list page, fully contiguous. Coalesces to
+	 * the PRP1 partial-page iov + one big data iov. */
+	cmd.dptr.prp.prp1 = base + 1024 * 3;
 	cmd.dptr.prp.prp2 = (uint64_t)(uintptr_t)prps;
 	len = 128 * 1024;
 	prp = prps;
 	for (i = 1; i < 33; i++) {
-		*prp = (uint64_t)(uintptr_t)buf + i * 4096;
-		prp++;
+		prp[i - 1] = base + (uint64_t)i * 4096;
+	}
+	ret = nvme_cmd_map_prps(NULL, &cmd, iovs, 33, len, mps, gpa_to_vva);
+	CU_ASSERT(ret == 2);
+	CU_ASSERT(iovs[0].iov_base == (void *)(uintptr_t)(base + 1024 * 3));
+	CU_ASSERT(iovs[0].iov_len == 1024);
+	CU_ASSERT(iovs[1].iov_base == (void *)(uintptr_t)(base + 4096));
+	CU_ASSERT(iovs[1].iov_len == 128 * 1024 - 1024);
+
+	/* case 4: non-contiguous PRP list => one iov per discontiguity. 32 distinct,
+	 * non-adjacent data pages + PRP1 == 33 iovs (exactly max_iovcnt). */
+	cmd.dptr.prp.prp1 = base; /* aligned: full first page */
+	cmd.dptr.prp.prp2 = (uint64_t)(uintptr_t)prps;
+	len = 33 * 4096; /* PRP1 + 32 list-described pages */
+	prp = prps;
+	for (i = 0; i < 32; i++) {
+		prp[i] = base + (uint64_t)(100 - i) * 0x10000ULL; /* descending, gapped */
 	}
 	ret = nvme_cmd_map_prps(NULL, &cmd, iovs, 33, len, mps, gpa_to_vva);
 	CU_ASSERT(ret == 33);
-	CU_ASSERT(iovs[0].iov_base == (void *)(uintptr_t)cmd.dptr.prp.prp1);
-	CU_ASSERT(iovs[0].iov_len == 1024);
-	for (i = 1; i < 32; i++) {
-		CU_ASSERT(iovs[i].iov_base == (void *)((uintptr_t)buf + i * 4096));
-		CU_ASSERT(iovs[i].iov_len == 4096);
-	}
-	CU_ASSERT(iovs[32].iov_base == (void *)((uintptr_t)buf + 32 * 4096));
-	CU_ASSERT(iovs[32].iov_len == 1024 * 3);
-
-	/* test case 4: 256KiB with PRP list, not enough iovs */
-	cmd.dptr.prp.prp1 = (uint64_t)(uintptr_t)buf + 1024 * 3;
-	cmd.dptr.prp.prp2 = (uint64_t)(uintptr_t)prps;
-	len = 256 * 1024;
+	CU_ASSERT(iovs[0].iov_base == (void *)(uintptr_t)base);
+	CU_ASSERT(iovs[1].iov_base == (void *)(uintptr_t)(base + 100 * 0x10000ULL));
+	CU_ASSERT(iovs[32].iov_len == 4096);
+	/* one more discontiguous page would need a 34th iov => -ERANGE */
+	len = 34 * 4096;
 	ret = nvme_cmd_map_prps(NULL, &cmd, iovs, 33, len, mps, gpa_to_vva);
 	CU_ASSERT(ret == -ERANGE);
 
-	spdk_free(buf);
+	/* case 5: CHAINED PRP list, fully contiguous, 4 MiB (1024 pages). List page
+	 * 0 holds 511 data entries + a chain pointer to list page 1 (512 entries).
+	 * Contiguous => coalesces to PRP1 + a single 4 MiB-4 KiB data iov. Exercises
+	 * the chain-following path. */
+	cmd.dptr.prp.prp1 = base;
+	cmd.dptr.prp.prp2 = (uint64_t)(uintptr_t)prps;
+	len = 4 * 1024 * 1024; /* 1024 pages */
+	prp = prps;                                        /* list page 0 */
+	prp_page1 = (uint64_t *)((uintptr_t)prps + 4096);  /* list page 1 */
+	for (i = 0; i < 511; i++) {
+		prp[i] = base + (uint64_t)(i + 1) * 4096;  /* data pages 1..511 */
+	}
+	prp[511] = (uint64_t)(uintptr_t)prp_page1;         /* chain pointer */
+	for (i = 0; i < 512; i++) {
+		prp_page1[i] = base + (uint64_t)(512 + i) * 4096; /* data pages 512..1023 */
+	}
+	ret = nvme_cmd_map_prps(NULL, &cmd, iovs, 33, len, mps, gpa_to_vva);
+	CU_ASSERT(ret == 2);
+	CU_ASSERT(iovs[0].iov_base == (void *)(uintptr_t)base);
+	CU_ASSERT(iovs[0].iov_len == 4096);
+	CU_ASSERT(iovs[1].iov_base == (void *)(uintptr_t)(base + 4096));
+	CU_ASSERT(iovs[1].iov_len == (size_t)(4 * 1024 * 1024 - 4096));
+
 	spdk_free(prps);
 }
 
