@@ -87,3 +87,24 @@ payload.**
 - **What this buys.** No remaining open ABI question forces a later tenant-visible
   change. TB3 and downstream slices build against a fixed contract; the executor can
   move hosts (two-tier, GPU-initiated) with no host re-spin.
+
+## Refinement — the read-only invariant is ENFORCED, not assumed (spdk-5hk)
+
+The original freeze permits `KV_EXEC` on a read-only namespace on the premise that
+"Exec never mutates." Adversarial review found that premise was an *unchecked
+assumption*: the read-only opcode gate (`ctrlr_kvdev.c`) only decides *whether* Exec
+is dispatched, and the per-namespace op allow-list checks *membership* only — neither
+verifies an op is non-mutating. A shipped built-in contradicted it (the in-memory
+`APPEND`, op_id 2, writes the stored value), so a mutating op could be allow-listed and
+run on a read-only namespace.
+
+The invariant is now **enforced at the mutation point** rather than assumed at the gate.
+The namespace read-only state is threaded through `spdk_kvdev_exec()` into every backend
+`exec` op (`bool read_only`). A backend MUST reject any path that could write —
+returning `SPDK_KVDEV_IO_STATUS_READ_ONLY` (mapped to Command-Specific *Attempted Write
+to Read Only Range*) — when `read_only` is set: the in-memory `APPEND` is rejected, the
+legacy Ceph object-class (`cls`) path is rejected (a cls method can write arbitrarily and
+non-mutation cannot be proven from the binding), while non-mutating paths (echo, the
+read-only nkvx wasm executor) still run. This generalizes to any future mutating built-in
+or write-capable module, which must guard at its own mutation point. The opcode gate is
+unchanged (it still permits `KV_EXEC`); the enforcement is additive and below it.

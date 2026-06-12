@@ -51,6 +51,7 @@ static struct {
 	uint8_t		key[SPDK_KVDEV_EXEC_KEY_MAX_LEN];
 	uint8_t		key_len;
 	uint32_t	op_id;
+	bool		read_only;
 	bool		binding_present;
 	enum spdk_kv_exec_runtime runtime;
 	uint32_t	input_len;
@@ -59,7 +60,7 @@ static struct {
 
 int
 spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
-		const void *key, uint8_t key_len, uint32_t op_id,
+		const void *key, uint8_t key_len, uint32_t op_id, bool read_only,
 		const struct spdk_kv_exec_binding *binding,
 		const void *input, uint32_t input_len,
 		void *output_buf, uint32_t output_buf_len,
@@ -71,6 +72,7 @@ spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 		memcpy(g_exec.key, key, key_len);
 	}
 	g_exec.op_id = op_id;
+	g_exec.read_only = read_only;
 	g_exec.binding_present = binding != NULL;
 	g_exec.runtime = binding ? binding->runtime : SPDK_KV_EXEC_RUNTIME_NONE;
 	g_exec.input_len = input_len;
@@ -225,6 +227,11 @@ test_kvdev_read_only_permits_exec(void)
 	CU_ASSERT(rsp.status.sc != SPDK_NVME_SC_ATTEMPTED_WRITE_TO_RO_RANGE);
 	CU_ASSERT(status == SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS);
 	CU_ASSERT(g_exec.called == true);
+	/* The opcode gate no longer ASSUMES Exec is non-mutating: it forwards the
+	 * namespace read-only state to the backend so the invariant is enforced at
+	 * the mutation point. (That the backend actually REJECTS a mutating op is
+	 * proven against the real kvdev_mem backend in kvdev_mem_ut.) */
+	CU_ASSERT(g_exec.read_only == true);
 }
 
 /* Key length must be 1..16 bytes for non-Exec ops; otherwise INVALID_KEY_SIZE. */

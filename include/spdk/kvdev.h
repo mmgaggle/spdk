@@ -129,6 +129,16 @@ enum spdk_kvdev_io_status {
 	 * layer maps it to the NVMe "command aborted" status.
 	 */
 	SPDK_KVDEV_IO_STATUS_ABORTED		= -8,
+	/**
+	 * A mutating operation was attempted on a read-only namespace. KV Exec is
+	 * permitted on a read-only namespace because the executor is read-only by
+	 * contract (ADR-0014), but that invariant is ENFORCED at the mutation
+	 * point: a backend that would write (e.g. a mutating built-in or a write
+	 * runtime/module) rejects the op with this status when \c read_only is set,
+	 * rather than the gate ASSUMING no Exec mutates. The NVMf layer maps it to
+	 * Command-Specific "Attempted Write to Read Only Range".
+	 */
+	SPDK_KVDEV_IO_STATUS_READ_ONLY		= -9,
 };
 
 /**
@@ -360,13 +370,21 @@ struct spdk_kvdev_fn_table {
 	 *                \c op_id (ADR-0010/0012/0014). NULL when the entry has none.
 	 *                The in-memory module ignores it; the librados module routes
 	 *                on \c runtime (wasm -> nkvx, cls -> object-class method).
+	 * \param read_only The namespace is read-only. The backend MUST reject any
+	 *                  Exec path that could mutate stored state (a mutating
+	 *                  built-in op, or a write-capable runtime/module) with
+	 *                  SPDK_KVDEV_IO_STATUS_READ_ONLY. Non-mutating Exec (echo,
+	 *                  the read-only nkvx executor) still runs. This enforces
+	 *                  the "Exec never mutates" invariant at the mutation point
+	 *                  (ADR-0014) instead of assuming it at the opcode gate.
 	 * \param input Input blob bytes (may be NULL when input_len is 0).
 	 * \param input_len Length of \c input in bytes.
 	 * \param output_buf Buffer that receives the output blob.
 	 * \param output_buf_len Capacity of \c output_buf in bytes.
 	 */
 	int (*exec)(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
-		    uint32_t op_id, const struct spdk_kv_exec_binding *binding,
+		    uint32_t op_id, bool read_only,
+		    const struct spdk_kv_exec_binding *binding,
 		    const void *input, uint32_t input_len,
 		    void *output_buf, uint32_t output_buf_len,
 		    spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
@@ -579,13 +597,17 @@ int spdk_kvdev_list(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
  * \param binding Structured binding the NVMf layer resolved from the allowlist
  *                entry for \c op_id (ADR-0010/0012/0014); passed through to the
  *                backend exec op. May be NULL.
+ * \param read_only The namespace is read-only; forwarded to the backend so it
+ *                  rejects any mutating Exec path with
+ *                  SPDK_KVDEV_IO_STATUS_READ_ONLY (ADR-0014 invariant enforced
+ *                  at the mutation point).
  *
  * \return 0 if the request was accepted (a completion will fire), -ENOTSUP if
  *         the backend has no exec op (no completion fires), or another negative
  *         errno if it could not be submitted.
  */
 int spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
-		    const void *key, uint8_t key_len, uint32_t op_id,
+		    const void *key, uint8_t key_len, uint32_t op_id, bool read_only,
 		    const struct spdk_kv_exec_binding *binding,
 		    const void *input, uint32_t input_len,
 		    void *output_buf, uint32_t output_buf_len,

@@ -737,7 +737,7 @@ test_kvdev_mem_exec_echo(void)
 
 	memset(out, 0, sizeof(out));
 	g_completed = false;
-	rc = spdk_kvdev_exec(desc, ch, "k", 1, KVDEV_MEM_EXEC_OP_ECHO, NULL,
+	rc = spdk_kvdev_exec(desc, ch, "k", 1, KVDEV_MEM_EXEC_OP_ECHO, false, NULL,
 			     input, sizeof(input), out, sizeof(out), kv_op_cb, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_completed);
@@ -775,7 +775,7 @@ test_kvdev_mem_exec_append(void)
 	/* APPEND on an absent key must fail KEY_NOT_EXIST. */
 	memset(out, 0, sizeof(out));
 	g_completed = false;
-	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, NULL,
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, false, NULL,
 			     "X", 1, out, sizeof(out), kv_op_cb, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_KEY_NOT_EXIST);
@@ -787,7 +787,7 @@ test_kvdev_mem_exec_append(void)
 
 	memset(out, 0, sizeof(out));
 	g_completed = false;
-	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, NULL,
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, false, NULL,
 			     "BB", 2, out, sizeof(out), kv_op_cb, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_SUCCESS);
@@ -805,7 +805,7 @@ test_kvdev_mem_exec_append(void)
 
 	/* An unknown op-ID must be rejected INVALID (no allowlist yet). */
 	g_completed = false;
-	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), 999, NULL,
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), 999, false, NULL,
 			     "Z", 1, out, sizeof(out), kv_op_cb, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_INVALID);
@@ -843,7 +843,7 @@ test_kvdev_mem_exec_append_overflow(void)
 	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_SUCCESS);
 
 	g_completed = false;
-	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, NULL,
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, false, NULL,
 			     big, 90, out, sizeof(out), kv_op_cb, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_SUCCESS);
@@ -851,7 +851,7 @@ test_kvdev_mem_exec_append_overflow(void)
 
 	/* One more byte exceeds the cap: rejected INVALID. */
 	g_completed = false;
-	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, NULL,
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, false, NULL,
 			     big, 1, out, sizeof(out), kv_op_cb, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_INVALID);
@@ -865,7 +865,7 @@ test_kvdev_mem_exec_append_overflow(void)
 	 * read. (Pre-fix, this call corrupted the heap / crashed.)
 	 */
 	g_completed = false;
-	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, NULL,
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, false, NULL,
 			     "X", (uint32_t)0xFFFFFFFFu, out, sizeof(out), kv_op_cb, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_INVALID);
@@ -901,7 +901,7 @@ test_kvdev_mem_exec_truncate(void)
 	/* ECHO a 10-byte input into a 4-byte buffer: truncated, true len 10. */
 	memset(out, 0, sizeof(out));
 	g_completed = false;
-	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_ECHO, NULL,
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_ECHO, false, NULL,
 			     input, 10, out, sizeof(out), kv_op_cb, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL);
@@ -916,7 +916,7 @@ test_kvdev_mem_exec_truncate(void)
 
 	memset(out, 0, sizeof(out));
 	g_completed = false;
-	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, NULL,
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, false, NULL,
 			     "012345", 6, out, sizeof(out), kv_op_cb, NULL);
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL);
@@ -927,6 +927,70 @@ test_kvdev_mem_exec_truncate(void)
 	spdk_kvdev_close(desc);
 	poll_threads();
 	rc = kvdev_mem_delete("kvx2");
+	CU_ASSERT(rc == 0);
+}
+
+/*
+ * Read-only enforcement at the mutation point (ADR-0014, spdk-5hk B1 fix). The
+ * opcode gate PERMITS KV Exec on a read-only namespace, so the "Exec never
+ * mutates" invariant must be enforced by the backend itself: a mutating built-in
+ * (APPEND) called with read_only=true must be REJECTED with
+ * SPDK_KVDEV_IO_STATUS_READ_ONLY and leave the stored value UNCHANGED, while a
+ * non-mutating built-in (ECHO) still runs. This exercises the real kvdev_mem
+ * backend end-to-end (no stub) -- the gap the stubbed ctrlr_kvdev_ut never closed.
+ */
+static void
+test_kvdev_mem_exec_read_only(void)
+{
+	struct spdk_kvdev_desc *desc;
+	struct spdk_io_channel *ch;
+	const char key[] = "rokey";
+	char out[64];
+	int rc;
+
+	create_test_kvdev("kvro", 0, 0);
+	rc = spdk_kvdev_open("kvro", true, &desc);
+	CU_ASSERT(rc == 0);
+	ch = spdk_kvdev_get_io_channel(desc);
+	SPDK_CU_ASSERT_FATAL(ch != NULL);
+
+	/* Seed a known value. */
+	g_completed = false;
+	rc = spdk_kvdev_store(desc, ch, key, sizeof(key), "AAAA", 4, NULL, kv_op_cb, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_SUCCESS);
+
+	/* APPEND (mutating) with read_only=true MUST be rejected, before any write. */
+	memset(out, 0, sizeof(out));
+	g_completed = false;
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_APPEND, true, NULL,
+			     "BB", 2, out, sizeof(out), kv_op_cb, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_READ_ONLY);
+
+	/* The stored value must be UNCHANGED ("AAAA", len 4) -- no mutation happened. */
+	memset(out, 0, sizeof(out));
+	g_completed = false;
+	rc = spdk_kvdev_retrieve(desc, ch, key, sizeof(key), out, sizeof(out), kv_op_cb, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(g_value_len == 4);
+	CU_ASSERT(memcmp(out, "AAAA", 4) == 0);
+
+	/* ECHO (non-mutating) with read_only=true is still permitted. */
+	memset(out, 0, sizeof(out));
+	g_completed = false;
+	rc = spdk_kvdev_exec(desc, ch, key, sizeof(key), KVDEV_MEM_EXEC_OP_ECHO, true, NULL,
+			     "hi", 2, out, sizeof(out), kv_op_cb, NULL);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_status == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(g_value_len == 2);
+	CU_ASSERT(memcmp(out, "hi", 2) == 0);
+
+	spdk_put_io_channel(ch);
+	spdk_kvdev_close(desc);
+	poll_threads();
+	rc = kvdev_mem_delete("kvro");
 	CU_ASSERT(rc == 0);
 }
 
@@ -956,6 +1020,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_kvdev_mem_exec_append);
 	CU_ADD_TEST(suite, test_kvdev_mem_exec_append_overflow);
 	CU_ADD_TEST(suite, test_kvdev_mem_exec_truncate);
+	CU_ADD_TEST(suite, test_kvdev_mem_exec_read_only);
 
 	allocate_threads(1);
 	set_thread(0);

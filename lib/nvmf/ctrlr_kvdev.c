@@ -149,6 +149,14 @@ nvmf_kvdev_complete(struct nvmf_kvdev_request *kv_req, int kvstatus, uint32_t va
 		 * the target stays up and other traffic is unaffected. */
 		rsp->status.sc = SPDK_NVME_SC_ABORTED_BY_REQUEST;
 		break;
+	case SPDK_KVDEV_IO_STATUS_READ_ONLY:
+		/* A mutating Exec path was rejected because the namespace is
+		 * read-only (the invariant is enforced at the mutation point,
+		 * ADR-0014). Report the same Command-Specific "Attempted Write to
+		 * Read Only Range" status the opcode gate uses for write ops. */
+		rsp->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		rsp->status.sc = SPDK_NVME_SC_ATTEMPTED_WRITE_TO_RO_RANGE;
+		break;
 	case SPDK_KVDEV_IO_STATUS_FAILED:
 	default:
 		rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
@@ -520,8 +528,8 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		input_len = xfer_len - sizeof(uint16_t) - exec_key_len;
 
 		rc = spdk_kvdev_exec(ns->kvdev_desc, ch, exec_key, exec_key_len, op_id,
-				     binding_arg, input, input_len, data, output_len,
-				     nvmf_kvdev_exec_done, kv_req);
+				     ns->kv_read_only, binding_arg, input, input_len,
+				     data, output_len, nvmf_kvdev_exec_done, kv_req);
 		if (rc == -ENOTSUP) {
 			/* Backend has no exec op (e.g. librados until KVX-3): report
 			 * an NVMe not-supported status. No completion will fire. */

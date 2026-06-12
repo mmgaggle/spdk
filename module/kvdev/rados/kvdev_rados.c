@@ -191,9 +191,13 @@ kvdev_rados_dup_config(const char *const *config)
 /* ---- key -> oid hex encoding --------------------------------------------- */
 
 /*
- * Encode a binary key (1-16 bytes) into a NUL-terminated lowercase-hex oid.
- * librados oids are C strings, so a binary key cannot be used verbatim; hex is
- * collision-free and reversible. oid must hold KVDEV_RADOS_OID_MAX bytes.
+ * Encode a binary key into a NUL-terminated lowercase-hex oid. librados oids are
+ * C strings, so a binary key cannot be used verbatim; hex is collision-free and
+ * reversible. Writes exactly key_len*2 + 1 bytes, so the CALLER must size oid to
+ * the key it passes: KVDEV_RADOS_OID_MAX for the spec's <=16-byte Store/Retrieve
+ * keys, but KVDEV_RADOS_EXEC_OID_MAX for KV Exec keys (up to
+ * SPDK_KVDEV_EXEC_KEY_MAX_LEN = 255 bytes, ADR-0014). Passing the smaller buffer
+ * for a long Exec key overflows it.
  */
 static void
 kvdev_rados_key_to_oid(const void *key, uint8_t key_len, char *oid)
@@ -1086,7 +1090,8 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
  */
 static int
 kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
-		 uint32_t op_id, const struct spdk_kv_exec_binding *binding,
+		 uint32_t op_id, bool read_only,
+		 const struct spdk_kv_exec_binding *binding,
 		 const void *input, uint32_t input_len,
 		 void *output_buf, uint32_t output_buf_len,
 		 spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
@@ -1122,6 +1127,10 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
 			return 0;
 		}
+		/* The nkvx wasm executor is read-only by contract (ADR-0014): it
+		 * computes over the cold-fetched value and never writes it back, so
+		 * it is permitted on a read-only namespace. (A future write-capable
+		 * module class must consult read_only at its own mutation point.) */
 		return kvdev_rados_nkvx_exec(ch, key, key_len, module,
 					     output_buf, output_buf_len, cb_fn, cb_arg);
 	}
@@ -1130,6 +1139,15 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 	if (binding->runtime != SPDK_KV_EXEC_RUNTIME_CLS) {
 		SPDK_ERRLOG("KV Exec: unsupported binding runtime %d\n", binding->runtime);
 		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+		return 0;
+	}
+	/* A Ceph object-class method can perform arbitrary server-side writes and
+	 * we cannot prove non-mutation from the binding, so the cls path is treated
+	 * as mutating: reject it on a read-only namespace. The invariant is enforced
+	 * here, at the mutation point (ADR-0014), not assumed by the opcode gate. */
+	if (read_only) {
+		SPDK_DEBUGLOG(kvdev_rados, "KV Exec cls path rejected on read-only namespace\n");
+		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_READ_ONLY, 0);
 		return 0;
 	}
 	cls = binding->module_namespace;

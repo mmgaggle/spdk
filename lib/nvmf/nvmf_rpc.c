@@ -1446,11 +1446,16 @@ SPDK_RPC_REGISTER("nvmf_subsystem_add_kv_ns", rpc_nvmf_subsystem_add_kv_ns, SPDK
  * free_rpc_nvmf_ns_set_kv_exec_allowlist() (and the allowlist array decoder)
  * are generated from schema/schema.json into spdk_internal/rpc_autogen.h. */
 
-/* Map a runtime name to the enum. Defaults to wasm (the v1 runtime, ADR-0012). */
+/* Map a runtime name to the enum; SPDK_KV_EXEC_RUNTIME_NONE for NULL or unknown.
+ * A structured binding must name its runtime explicitly (no implicit wasm default)
+ * so a missing field is a clear error rather than a surprising silent wasm bind. */
 static enum spdk_kv_exec_runtime
 nvmf_rpc_parse_kv_exec_runtime(const char *name)
 {
-	if (name == NULL || strcmp(name, "wasm") == 0) {
+	if (name == NULL) {
+		return SPDK_KV_EXEC_RUNTIME_NONE;
+	}
+	if (strcmp(name, "wasm") == 0) {
 		return SPDK_KV_EXEC_RUNTIME_WASM;
 	}
 	if (strcmp(name, "cls") == 0) {
@@ -1517,7 +1522,11 @@ nvmf_rpc_item_to_kv_exec_binding(const struct rpc_nvmf_kv_exec_allow *item,
 		return 0;
 	}
 
-	/* Structured path. */
+	/* Structured path. The runtime field is required here (no implicit default). */
+	if (item->runtime == NULL) {
+		SPDK_ERRLOG("KV Exec allowlist: structured binding requires an explicit 'runtime'\n");
+		return -EINVAL;
+	}
 	b->runtime = nvmf_rpc_parse_kv_exec_runtime(item->runtime);
 	if (b->runtime == SPDK_KV_EXEC_RUNTIME_NONE) {
 		SPDK_ERRLOG("KV Exec allowlist: unknown runtime '%s'\n", item->runtime);

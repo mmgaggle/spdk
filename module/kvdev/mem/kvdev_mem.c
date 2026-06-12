@@ -447,7 +447,7 @@ kvdev_mem_exec_append(struct kvdev_mem *mdev, const void *key, uint8_t key_len,
 
 static int
 kvdev_mem_exec(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
-	       uint32_t op_id, const struct spdk_kv_exec_binding *binding,
+	       uint32_t op_id, bool read_only, const struct spdk_kv_exec_binding *binding,
 	       const void *input, uint32_t input_len,
 	       void *output_buf, uint32_t output_buf_len,
 	       spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
@@ -461,10 +461,19 @@ kvdev_mem_exec(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
 
 	switch (op_id) {
 	case KVDEV_MEM_EXEC_OP_ECHO:
-		/* Echo the input blob straight back as the output. */
+		/* Echo the input blob straight back as the output. Non-mutating, so
+		 * it is permitted on a read-only namespace. */
 		kvdev_mem_exec_emit(output_buf, output_buf_len, input, input_len, cb_fn, cb_arg);
 		return 0;
 	case KVDEV_MEM_EXEC_OP_APPEND:
+		/* APPEND mutates the stored value. The "Exec never mutates" invariant
+		 * (ADR-0014) is enforced HERE, at the mutation point: reject it on a
+		 * read-only namespace rather than letting the opcode gate assume no
+		 * Exec writes. Any future mutating built-in must guard the same way. */
+		if (read_only) {
+			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_READ_ONLY, 0);
+			return 0;
+		}
 		return kvdev_mem_exec_append(mdev, key, key_len, input, input_len,
 					     output_buf, output_buf_len, cb_fn, cb_arg);
 	default:
@@ -609,7 +618,8 @@ kvdev_mem_list_locked(struct spdk_io_channel *ch, const void *start_key, uint8_t
 
 static int
 kvdev_mem_exec_locked(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
-		      uint32_t op_id, const struct spdk_kv_exec_binding *binding,
+		      uint32_t op_id, bool read_only,
+		      const struct spdk_kv_exec_binding *binding,
 		      const void *input, uint32_t input_len,
 		      void *output_buf, uint32_t output_buf_len,
 		      spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
@@ -618,7 +628,7 @@ kvdev_mem_exec_locked(struct spdk_io_channel *ch, const void *key, uint8_t key_l
 	int rc;
 
 	pthread_mutex_lock(&mdev->lock);
-	rc = kvdev_mem_exec(ch, key, key_len, op_id, binding, input, input_len,
+	rc = kvdev_mem_exec(ch, key, key_len, op_id, read_only, binding, input, input_len,
 			    output_buf, output_buf_len, cb_fn, cb_arg);
 	pthread_mutex_unlock(&mdev->lock);
 	return rc;
