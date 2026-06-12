@@ -631,6 +631,56 @@ test_nkvx_tb4_distinct_object_is_miss(void)
 }
 
 /*
+ * SANDBOX ESCAPE regression (spdk-ii0 B1, ADR-0013): oob.wasm writes one byte
+ * PAST its declared single-page linear memory. The zero-copy host buffer has no
+ * guard region, so this is only caught because the engine config forces DYNAMIC
+ * bounds checks (memory_reservation=0 / memory_guard_size=0). The access MUST
+ * trap -> the run is CONTAINED (FAILED/ABORTED), never a SUCCESS that silently
+ * clobbered host memory. Pre-fix (static elision, no guard) this returned SUCCESS
+ * with the host heap corrupted.
+ */
+static void
+test_nkvx_tb4_oob_traps(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB4 oob-trap test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	/* A small object keeps the cold-filled backing at exactly one 64 KiB page,
+	 * so the module's offset-65536 store is exactly one byte past the memory. */
+	static const uint8_t obj[] = "x";
+	struct fake_fill fill = { .bytes = obj, .len = sizeof(obj), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0xdead;
+	int rc;
+
+	memset(out, 0xAB, sizeof(out));
+	rc = kvdev_rados_nkvx_wasm_run_cached("oob", "oobK", sizeof(obj),
+					      fake_cold_fill, &fill,
+					      out, sizeof(out), &rlen);
+	/* The OOB store MUST be caught: a contained failure, never SUCCESS. */
+	CU_ASSERT(rc != SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_FAILED ||
+		  rc == SPDK_KVDEV_IO_STATUS_ABORTED);
+	printf("\n    TB4 oob.wasm OOB store at 65536: status=%d (trapped/contained, no host clobber)\n",
+	       rc);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: TB4 oob-trap test is a no-op\n");
+#endif
+}
+
+/*
  * Fail-soft: --without-wasm or libwasmtime.so absent -> run_cached returns
  * NOT_SUPPORTED and NEVER invokes the fill callback (the executor cannot run the
  * module, so it must not cold-fill). Deterministic in both build modes.
@@ -778,6 +828,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_wasm_normal_within_caps);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cache_zerocopy_warm);
 	CU_ADD_TEST(suite, test_nkvx_tb4_distinct_object_is_miss);
+	CU_ADD_TEST(suite, test_nkvx_tb4_oob_traps);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cached_failsoft);
 	CU_ADD_TEST(suite, test_nkvx_tb4_dispatch_wires_cache);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);

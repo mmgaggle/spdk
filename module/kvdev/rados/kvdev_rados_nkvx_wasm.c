@@ -120,6 +120,24 @@ struct nkvx_wasm_api {
 	void (*config_host_memory_creator_set)(wasm_config_t *,
 					       wasmtime_memory_creator_t *);
 
+	/*
+	 * Bounds-check codegen control (ADR-0013 sandbox escape fix, spdk-ii0 B1).
+	 * A custom (host) linear memory backed by our exact-sized zero-copy buffer
+	 * has NO guard region, so wasmtime's default STATIC bounds-check elision
+	 * (which relies on a large guarded reservation) would leave out-of-bounds
+	 * guest accesses uncaught. Setting reservation=0 and guard=0 forces DYNAMIC
+	 * (explicit) bounds checks, so every access is checked against the memory's
+	 * current length and OOB always traps. may_move=false keeps the backing
+	 * fixed (we refuse grow on an immutable zero-copy object anyway).
+	 */
+	void (*config_memory_reservation_set)(wasm_config_t *, uint64_t);
+	void (*config_memory_guard_size_set)(wasm_config_t *, uint64_t);
+	void (*config_memory_may_move_set)(wasm_config_t *, bool);
+
+	/* Construct a real wasmtime_error_t for host-callback failures (e.g. a
+	 * refused memory.grow) instead of a fabricated sentinel pointer. */
+	wasmtime_error_t *(*error_new)(const char *);
+
 	wasmtime_store_t *(*store_new)(wasm_engine_t *, void *, void *);
 	wasmtime_context_t *(*store_context)(wasmtime_store_t *);
 	void (*store_delete)(wasmtime_store_t *);
@@ -195,6 +213,10 @@ nkvx_wasm_resolve(void *h)
 	SYM(engine_delete, "wasm_engine_delete");
 	SYM(engine_increment_epoch, "wasmtime_engine_increment_epoch");
 	SYM(config_host_memory_creator_set, "wasmtime_config_host_memory_creator_set");
+	SYM(config_memory_reservation_set, "wasmtime_config_memory_reservation_set");
+	SYM(config_memory_guard_size_set, "wasmtime_config_memory_guard_size_set");
+	SYM(config_memory_may_move_set, "wasmtime_config_memory_may_move_set");
+	SYM(error_new, "wasmtime_error_new");
 	SYM(store_new, "wasmtime_store_new");
 	SYM(store_context, "wasmtime_store_context");
 	SYM(store_delete, "wasmtime_store_delete");
@@ -621,11 +643,10 @@ nkvx_zc_grow(void *env, size_t new_size)
 		m->size = new_size;
 		return NULL;
 	}
-	/* Cannot grow a zero-copy DMA backing past its reservation: signal a clean
-	 * error. wasmtime turns this into a trap, contained by the run. We have no
-	 * error constructor in the dlsym table, so return a non-NULL sentinel —
-	 * wasmtime only checks this pointer for NULL vs non-NULL. */
-	return (wasmtime_error_t *)(uintptr_t)0x1;
+	/* Cannot grow a zero-copy DMA backing past its reservation: return a real
+	 * wasmtime error so wasmtime can format/free it normally. wasmtime turns
+	 * this into a trap, contained by the run. */
+	return g_api.error_new("nkvx: cannot grow zero-copy linear memory past its backing");
 }
 
 static void
@@ -638,10 +659,13 @@ nkvx_zc_finalize(void *env)
 
 /*
  * new_memory: wasmtime asks for a fresh linear memory for the on-demand instance.
- * We return the cached object's buffer as the backing (zero-copy). The reserved/
- * guard sizes are advisory here — we hand back exactly our buffer; growth beyond
- * it is refused by nkvx_zc_grow (ADR-0013 flags this contract for empirical
- * validation, which this slice does: the checked-in modules never grow).
+ * We return the cached object's buffer as the backing (zero-copy). Safety does
+ * NOT depend on the reserved/guard sizes here: the engine config forces dynamic
+ * bounds checks (reservation=0, guard=0), so every guest access is checked
+ * against the memory length and an out-of-bounds access traps even though our
+ * buffer has no guard page. Growth beyond the backing is refused by nkvx_zc_grow.
+ * (This is the empirical validation ADR-0013 flagged: see the oob.wasm
+ * regression test, which traps on an access past the declared memory.)
  */
 struct nkvx_zc_ctx {
 	uint8_t		*base;
@@ -669,7 +693,7 @@ nkvx_zc_new_memory(void *env, const wasm_memorytype_t *ty, size_t minimum,
 	if (minimum > cctx->cap) {
 		SPDK_ERRLOG("nkvx/wasm: module min %zuB exceeds zero-copy backing %zuB\n",
 			    minimum, cctx->cap);
-		return (wasmtime_error_t *)(uintptr_t)0x1;
+		return g_api.error_new("nkvx: module minimum memory exceeds zero-copy backing");
 	}
 	/* Present at least the module's declared minimum as the committed size. */
 	if (cctx->size < minimum) {
@@ -678,7 +702,7 @@ nkvx_zc_new_memory(void *env, const wasm_memorytype_t *ty, size_t minimum,
 
 	m = calloc(1, sizeof(*m));
 	if (m == NULL) {
-		return (wasmtime_error_t *)(uintptr_t)0x1;
+		return g_api.error_new("nkvx: out of memory allocating linear-memory wrapper");
 	}
 	m->base = cctx->base;
 	m->size = cctx->size;
@@ -750,6 +774,18 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	 * a follow-up if the warm path ever needs it.
 	 */
 	api->config_consume_fuel_set(config, true);
+	/*
+	 * Force DYNAMIC bounds-checks for the zero-copy host memory (spdk-ii0 B1).
+	 * Our MemoryCreator hands wasmtime an exact-sized buffer with NO guard
+	 * region; with the default static elision an out-of-bounds guest access
+	 * would not be caught. reservation=0 + guard=0 makes wasmtime emit an
+	 * explicit check against the memory length on every access, so OOB always
+	 * traps (contained, not a host-heap clobber). may_move=false keeps the
+	 * backing pinned (grow on the immutable object is refused regardless).
+	 */
+	api->config_memory_reservation_set(config, 0);
+	api->config_memory_guard_size_set(config, 0);
+	api->config_memory_may_move_set(config, false);
 	creator.env = zc;
 	creator.new_memory = nkvx_zc_new_memory;
 	creator.finalizer = free;		/* frees the zc ctx when engine drops */
@@ -1038,6 +1074,23 @@ kvdev_rados_nkvx_wasm_cache_reset(void)
 	pthread_mutex_unlock(&g_cache.mutex);
 }
 
+bool
+kvdev_rados_nkvx_wasm_cache_has(const char *obj_key)
+{
+	struct nkvx_obj_entry *obj;
+	bool present;
+
+	if (obj_key == NULL || obj_key[0] == '\0') {
+		return false;
+	}
+	pthread_mutex_lock(&g_cache.mutex);
+	nkvx_cache_init_once();
+	obj = nkvx_obj_lookup(obj_key);
+	present = (obj != NULL && obj->filled);
+	pthread_mutex_unlock(&g_cache.mutex);
+	return present;
+}
+
 int
 kvdev_rados_nkvx_wasm_run(const char *name,
 			  const void *object, size_t object_len,
@@ -1314,6 +1367,14 @@ void
 kvdev_rados_nkvx_wasm_cache_reset(void)
 {
 	/* No cache exists in the stub build. */
+}
+
+bool
+kvdev_rados_nkvx_wasm_cache_has(const char *obj_key)
+{
+	(void)obj_key;
+	/* No cache in the stub build: always a miss (callers take the cold path). */
+	return false;
 }
 
 #endif /* SPDK_CONFIG_WASM */

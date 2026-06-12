@@ -17,6 +17,7 @@
 
 #include "kvdev_rados.h"
 #include "kvdev_rados_nkvx.h"
+#include "kvdev_rados_nkvx_wasm.h"
 
 /*
  * librados-backed kvdev. See kvdev_rados.h / ADR-0002 / ADR-0004 for the model.
@@ -1022,6 +1023,33 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
 	/* The oid (hex of the key) is the stable content/identity key for the
 	 * executor's TB4 content-addressed object + warm-instance cache. */
 	snprintf(io->nkvx_oid, sizeof(io->nkvx_oid), "%s", oid);
+
+	/*
+	 * B2 (spdk-ii0): if the executor already holds this object in its
+	 * content-addressed cache, skip the librados read ENTIRELY and dispatch
+	 * straight to the executor. This makes the cold-fill the ONLY librados touch:
+	 * the 1st Exec of an object reads it once; subsequent Execs of the same
+	 * object do ZERO librados reads (previously the read fired every time and the
+	 * cache only avoided a re-copy). The aio completion that io_alloc created is
+	 * unused on this path, so release it here; on success the off-reactor worker
+	 * owns io and completes via kvdev_rados_nkvx_io_done.
+	 */
+	if (kvdev_rados_nkvx_wasm_cache_has(io->nkvx_oid)) {
+		rados_aio_release(io->comp);
+		io->comp = NULL;
+		io->nkvx_obj = NULL;
+		io->nkvx_obj_cap = 0;
+		rc = kvdev_rados_nkvx_dispatch(io->nkvx_module, io->nkvx_oid, NULL, 0,
+					       io->host_out, io->buf_len,
+					       kvdev_rados_nkvx_io_done, io);
+		if (rc != 0) {
+			SPDK_ERRLOG("nkvx: cache-hit dispatch failed: %s\n", spdk_strerror(-rc));
+			free(io);
+			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+			return 0;
+		}
+		return 0;
+	}
 
 	io->nkvx_obj_cap = KVDEV_RADOS_NKVX_COLDFILL_CAP;
 	io->nkvx_obj = malloc(io->nkvx_obj_cap);

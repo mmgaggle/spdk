@@ -111,6 +111,17 @@ int kvdev_rados_nkvx_wasm_run_cached(const char *name,
 void kvdev_rados_nkvx_wasm_cache_reset(void);
 
 /*
+ * Probe whether \c obj_key is already present (filled) in the content-addressed
+ * object cache. The caller (kvdev_rados) uses this BEFORE issuing a librados read
+ * so a cache hit skips the read entirely and dispatches straight to the executor
+ * (the cold-fill callback stays the ONLY librados touch -- spdk-ii0 B2). Returns
+ * false in the stub build (no cache). NOTE: only race-free while the cache does
+ * not evict (TB4 cache is currently unbounded); an evicting cache must re-probe
+ * or carry the bytes through the dispatch on a probe-hit-then-evicted race.
+ */
+bool kvdev_rados_nkvx_wasm_cache_has(const char *obj_key);
+
+/*
  * Test-only introspection counters (TB4 acceptance proof). Defined unconditionally
  * so the unit test links them in both --with-wasm and --without-wasm builds.
  *   - cold_fills:        number of times a fill callback actually ran (cold fill).

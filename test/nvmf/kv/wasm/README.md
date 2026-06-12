@@ -61,6 +61,26 @@ by that buffer via the custom `MemoryCreator` (on-demand strategy, ADR-0013), an
 the instantiated instance is reused (warm-instance cache keyed by `(module,
 object)`). See `module/kvdev/rados/kvdev_rados_nkvx_wasm.c`.
 
+## oob.wasm (sandbox-escape regression, spdk-ii0 B1)
+
+Adversarial module: declares a single 64 KiB page and writes one byte at offset
+`65536` — exactly one byte PAST its own linear memory. A sound sandbox MUST trap
+this; the dispatch is then contained (FAILED/ABORTED), never a host-memory clobber.
+Before the B1 fix the zero-copy host memory had no guard region and used static
+bounds-check elision, so this write silently succeeded (escape). The fix forces
+dynamic bounds checks (`memory_reservation=0`, `memory_guard_size=0`) so the access
+is caught. Exercised by `test_nkvx_tb4_oob_traps` in `kvdev_rados_nkvx_ut`. Source:
+`oob.c`.
+
+Rebuild (requires clang with the wasm32 target):
+
+```sh
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=oob \
+  -Wl,--initial-memory=65536 -Wl,--export-memory \
+  -o oob.wasm oob.c
+```
+
 ## libwasmtime.so (runtime dependency)
 
 wasmtime is loaded at runtime via `dlopen` (NOT linked into SPDK). The executor
