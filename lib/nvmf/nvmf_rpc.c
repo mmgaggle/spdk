@@ -1445,6 +1445,166 @@ SPDK_RPC_REGISTER("nvmf_subsystem_add_kv_ns", rpc_nvmf_subsystem_add_kv_ns, SPDK
  * data-path enforcement. struct rpc_nvmf_ns_set_kv_exec_allowlist_ctx /
  * free_rpc_nvmf_ns_set_kv_exec_allowlist() (and the allowlist array decoder)
  * are generated from schema/schema.json into spdk_internal/rpc_autogen.h. */
+
+/* Map a runtime name to the enum; SPDK_KV_EXEC_RUNTIME_NONE for NULL or unknown.
+ * A structured binding must name its runtime explicitly (no implicit wasm default)
+ * so a missing field is a clear error rather than a surprising silent wasm bind. */
+static enum spdk_kv_exec_runtime
+nvmf_rpc_parse_kv_exec_runtime(const char *name)
+{
+	if (name == NULL) {
+		return SPDK_KV_EXEC_RUNTIME_NONE;
+	}
+	if (strcmp(name, "wasm") == 0) {
+		return SPDK_KV_EXEC_RUNTIME_WASM;
+	}
+	if (strcmp(name, "cls") == 0) {
+		return SPDK_KV_EXEC_RUNTIME_CLS;
+	}
+	return SPDK_KV_EXEC_RUNTIME_NONE;
+}
+
+/*
+ * Translate one decoded RPC allowlist item into the public structured binding
+ * (ADR-0010/0012/0014). Returns 0 on success; *has_binding reports whether the
+ * item carried any binding at all. Two encodings are accepted:
+ *   - Structured: explicit runtime/module_namespace/module_key/sha256/caps.
+ *   - Legacy migration: a bare "class:method" string in the deprecated `binding`
+ *     field maps to runtime='cls', (module_namespace, module_key)=(class, method),
+ *     no sha256. Specifying both the legacy string and structured fields is an error.
+ * The binding's locator strings ALIAS the decoded RPC item (caller-owned); the
+ * subsystem set call deep-copies them, so they need not outlive that call.
+ */
+static int
+nvmf_rpc_item_to_kv_exec_binding(const struct rpc_nvmf_kv_exec_allow *item,
+				 struct spdk_kv_exec_binding *b, bool *has_binding,
+				 uint8_t sha_buf[SPDK_KV_EXEC_SHA256_LEN],
+				 char *cls_buf, size_t cls_buf_len)
+{
+	bool has_structured = item->runtime || item->module_namespace ||
+			      item->module_key || item->sha256 || item->caps;
+
+	memset(b, 0, sizeof(*b));
+
+	if (item->binding == NULL && !has_structured) {
+		*has_binding = false;
+		return 0;
+	}
+	*has_binding = true;
+
+	/* Legacy "class:method" migration path. */
+	if (item->binding != NULL) {
+		const char *colon, *method;
+		size_t cls_len;
+
+		if (has_structured) {
+			SPDK_ERRLOG("KV Exec allowlist: legacy 'binding' and structured fields are mutually exclusive\n");
+			return -EINVAL;
+		}
+		colon = strchr(item->binding, ':');
+		if (colon == NULL || colon == item->binding || colon[1] == '\0') {
+			SPDK_ERRLOG("KV Exec allowlist: legacy binding '%s' is not 'class:method'\n",
+				    item->binding);
+			return -EINVAL;
+		}
+		cls_len = (size_t)(colon - item->binding);
+		method = colon + 1;
+		if (cls_len >= cls_buf_len) {
+			SPDK_ERRLOG("KV Exec allowlist: legacy binding class too long\n");
+			return -EINVAL;
+		}
+		memcpy(cls_buf, item->binding, cls_len);
+		cls_buf[cls_len] = '\0';
+		b->runtime = SPDK_KV_EXEC_RUNTIME_CLS;
+		b->module_namespace = cls_buf;
+		b->module_key = method;
+		b->sha256_valid = false;
+		return 0;
+	}
+
+	/* Structured path. The runtime field is required here (no implicit default). */
+	if (item->runtime == NULL) {
+		SPDK_ERRLOG("KV Exec allowlist: structured binding requires an explicit 'runtime'\n");
+		return -EINVAL;
+	}
+	b->runtime = nvmf_rpc_parse_kv_exec_runtime(item->runtime);
+	if (b->runtime == SPDK_KV_EXEC_RUNTIME_NONE) {
+		SPDK_ERRLOG("KV Exec allowlist: unknown runtime '%s'\n", item->runtime);
+		return -EINVAL;
+	}
+	b->module_namespace = item->module_namespace;
+	b->module_key = item->module_key;
+	b->caps = item->caps;
+
+	if (item->sha256 != NULL) {
+		char *bin;
+
+		if (strlen(item->sha256) != SPDK_KV_EXEC_SHA256_LEN * 2) {
+			SPDK_ERRLOG("KV Exec allowlist: sha256 must be %d hex chars\n",
+				    SPDK_KV_EXEC_SHA256_LEN * 2);
+			return -EINVAL;
+		}
+		bin = spdk_unhexlify(item->sha256);
+		if (bin == NULL) {
+			SPDK_ERRLOG("KV Exec allowlist: sha256 is not valid hex\n");
+			return -EINVAL;
+		}
+		memcpy(sha_buf, bin, SPDK_KV_EXEC_SHA256_LEN);
+		free(bin);
+		memcpy(b->sha256, sha_buf, SPDK_KV_EXEC_SHA256_LEN);
+		b->sha256_valid = true;
+	} else if (b->runtime == SPDK_KV_EXEC_RUNTIME_WASM) {
+		/* The wasm runtime authenticates the artifact solely by content hash
+		 * (ADR-0010); a binding without one cannot be admitted. */
+		SPDK_ERRLOG("KV Exec allowlist: wasm runtime requires a sha256 anchor\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* Emit a structured binding (or nothing when NULL) into a get-allowlist result. */
+static void
+nvmf_rpc_dump_kv_exec_binding(struct spdk_json_write_ctx *w,
+			      const struct spdk_kv_exec_binding *b)
+{
+	const char *runtime;
+
+	if (b == NULL) {
+		return;
+	}
+
+	switch (b->runtime) {
+	case SPDK_KV_EXEC_RUNTIME_WASM:
+		runtime = "wasm";
+		break;
+	case SPDK_KV_EXEC_RUNTIME_CLS:
+		runtime = "cls";
+		break;
+	default:
+		runtime = "none";
+		break;
+	}
+	spdk_json_write_named_string(w, "runtime", runtime);
+	if (b->module_namespace != NULL) {
+		spdk_json_write_named_string(w, "module_namespace", b->module_namespace);
+	}
+	if (b->module_key != NULL) {
+		spdk_json_write_named_string(w, "module_key", b->module_key);
+	}
+	if (b->sha256_valid) {
+		char *hex = spdk_hexlify((const char *)b->sha256, SPDK_KV_EXEC_SHA256_LEN);
+
+		if (hex != NULL) {
+			spdk_json_write_named_string(w, "sha256", hex);
+			free(hex);
+		}
+	}
+	if (b->caps != 0) {
+		spdk_json_write_named_uint64(w, "caps", b->caps);
+	}
+}
+
 struct rpc_nvmf_ns_set_kv_exec_allowlist_ext {
 	struct rpc_nvmf_ns_set_kv_exec_allowlist_ctx	req;
 	bool						response_sent;
@@ -1477,26 +1637,44 @@ rpc_nvmf_ns_set_kv_exec_allowlist_paused(struct spdk_nvmf_subsystem *subsystem,
 	struct rpc_nvmf_ns_set_kv_exec_allowlist_ext *ereq = cb_arg;
 	struct rpc_nvmf_ns_set_kv_exec_allowlist_ctx *req = &ereq->req;
 	struct spdk_nvmf_kv_exec_allow *entries = NULL;
+	struct spdk_kv_exec_binding *bindings = NULL;
+	uint8_t (*sha_bufs)[SPDK_KV_EXEC_SHA256_LEN] = NULL;
+	char (*cls_bufs)[256] = NULL;
 	uint32_t count = req->allowlist.count;
 	int ret;
 	uint32_t i;
 
 	if (count > 0) {
 		entries = calloc(count, sizeof(*entries));
-		if (entries == NULL) {
+		bindings = calloc(count, sizeof(*bindings));
+		sha_bufs = calloc(count, sizeof(*sha_bufs));
+		cls_bufs = calloc(count, sizeof(*cls_bufs));
+		if (entries == NULL || bindings == NULL || sha_bufs == NULL || cls_bufs == NULL) {
 			spdk_jsonrpc_send_error_response(req->request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
 							 "Out of memory");
 			ereq->response_sent = true;
 			goto resume;
 		}
 		for (i = 0; i < count; i++) {
+			bool has_binding = false;
+
 			entries[i].op_id = req->allowlist.items[i].op_id;
-			entries[i].binding = req->allowlist.items[i].binding;
+			ret = nvmf_rpc_item_to_kv_exec_binding(&req->allowlist.items[i],
+							       &bindings[i], &has_binding,
+							       sha_bufs[i],
+							       cls_bufs[i], sizeof(cls_bufs[i]));
+			if (ret != 0) {
+				spdk_jsonrpc_send_error_response(req->request,
+								 SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+								 "Invalid KV Exec binding");
+				ereq->response_sent = true;
+				goto resume;
+			}
+			entries[i].binding = has_binding ? &bindings[i] : NULL;
 		}
 	}
 
 	ret = spdk_nvmf_ns_set_kv_exec_allowlist(subsystem, req->nsid, entries, count);
-	free(entries);
 	if (ret != 0) {
 		SPDK_ERRLOG("Unable to set KV Exec allowlist on nsid %u: %d\n", req->nsid, ret);
 		spdk_jsonrpc_send_error_response(req->request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
@@ -1505,6 +1683,10 @@ rpc_nvmf_ns_set_kv_exec_allowlist_paused(struct spdk_nvmf_subsystem *subsystem,
 	}
 
 resume:
+	free(entries);
+	free(bindings);
+	free(sha_bufs);
+	free(cls_bufs);
 	if (spdk_nvmf_subsystem_resume(subsystem, rpc_nvmf_ns_set_kv_exec_allowlist_resumed, ereq)) {
 		if (!ereq->response_sent) {
 			spdk_jsonrpc_send_error_response(req->request, SPDK_JSONRPC_ERROR_INTERNAL_ERROR,
@@ -1598,14 +1780,14 @@ rpc_nvmf_ns_get_kv_exec_allowlist(struct spdk_jsonrpc_request *request,
 	for (i = 0; i < count; i++) {
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_uint32(w, "op_id", entries[i].op_id);
-		if (entries[i].binding != NULL) {
-			spdk_json_write_named_string(w, "binding", entries[i].binding);
-		}
+		nvmf_rpc_dump_kv_exec_binding(w, entries[i].binding);
 		spdk_json_write_object_end(w);
 	}
 	spdk_json_write_array_end(w);
 	spdk_jsonrpc_end_result(request, w);
 
+	/* entries is a single caller-owned block (see spdk_nvmf_ns_get_kv_exec_allowlist). */
+	free((void *)entries);
 	free_rpc_nvmf_ns_get_kv_exec_allowlist(&req);
 }
 SPDK_RPC_REGISTER("nvmf_ns_get_kv_exec_allowlist", rpc_nvmf_ns_get_kv_exec_allowlist,

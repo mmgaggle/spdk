@@ -286,13 +286,29 @@ struct spdk_nvmf_ns {
 	bool kv_read_only;
 };
 
-/* One entry in a namespace's KV Exec allowlist (ADR-0005). */
+/*
+ * One entry in a namespace's KV Exec allowlist (ADR-0005, structured binding per
+ * ADR-0010/0012/0014). op_id is the data-plane selector; the remaining fields are
+ * the typed binding the control plane resolved (replacing the prototype's opaque
+ * "class:method" string). module_namespace/module_key are owned by the namespace
+ * (strdup'd); sha256 is the auth/integrity anchor. binding_present is false for an
+ * op-ID allowed with no binding (the in-memory backend selects on op_id alone).
+ */
 struct spdk_nvmf_kv_exec_allow_entry {
 	/* Permitted KV Exec operation ID (data-plane selector). */
 	uint32_t op_id;
-	/* Optional opaque binding descriptor the backend interprets (e.g. a
-	 * future cls/method hint). NULL when unset. Owned by the namespace. */
-	char *binding;
+	/* True when this entry carries a resolved structured binding. */
+	bool binding_present;
+	/* Runtime backend selector (enum spdk_kv_exec_runtime). */
+	uint32_t runtime;
+	/* Cold-fetch locator (owned; NULL when unset). */
+	char *module_namespace;
+	char *module_key;
+	/* Artifact content hash; the auth/integrity anchor (ADR-0010). */
+	uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN];
+	bool sha256_valid;
+	/* Per-invocation capability bitmask (reserved). */
+	uint64_t caps;
 };
 
 /*
@@ -588,11 +604,14 @@ void nvmf_ns_kv_exec_allowlist_free(struct spdk_nvmf_ns *ns);
 /*
  * Test whether op_id is permitted by the namespace's KV Exec allowlist
  * (ADR-0005). Default-deny: returns false when op_id is absent (or the
- * allowlist is empty). When the entry is found and binding_out is non-NULL,
- * the entry's opaque binding (possibly NULL) is returned via *binding_out.
+ * allowlist is empty). When the entry is found and binding_out is non-NULL, the
+ * entry's structured binding is materialised into *binding_out (ADR-0014):
+ * *has_binding reports whether the entry carried a binding at all (an op-ID may
+ * be allowlisted with no binding, in which case *binding_out is left zeroed and
+ * the backend selects on op_id alone).
  */
 bool nvmf_ns_kv_exec_op_allowed(const struct spdk_nvmf_ns *ns, uint32_t op_id,
-				const char **binding_out);
+				struct spdk_kv_exec_binding *binding_out, bool *has_binding);
 
 static inline struct spdk_nvmf_host *
 nvmf_ns_find_host(struct spdk_nvmf_ns *ns, const char *hostnqn)

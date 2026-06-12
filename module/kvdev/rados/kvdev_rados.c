@@ -47,6 +47,10 @@
  * hex-encoded: 16 bytes -> 32 hex chars + NUL. */
 #define KVDEV_RADOS_OID_MAX (SPDK_KVDEV_KEY_MAX_LEN * 2 + 1)
 
+/* KV Exec keys ride in the request payload and may be up to 255 bytes (ADR-0014),
+ * so their hex oid needs a larger buffer: 255 bytes -> 510 hex chars + NUL. */
+#define KVDEV_RADOS_EXEC_OID_MAX (SPDK_KVDEV_EXEC_KEY_MAX_LEN * 2 + 1)
+
 /* ---- shared, named cluster registry (mirrors bdev_rbd) ------------------- */
 
 struct kvdev_rados_cluster {
@@ -187,9 +191,13 @@ kvdev_rados_dup_config(const char *const *config)
 /* ---- key -> oid hex encoding --------------------------------------------- */
 
 /*
- * Encode a binary key (1-16 bytes) into a NUL-terminated lowercase-hex oid.
- * librados oids are C strings, so a binary key cannot be used verbatim; hex is
- * collision-free and reversible. oid must hold KVDEV_RADOS_OID_MAX bytes.
+ * Encode a binary key into a NUL-terminated lowercase-hex oid. librados oids are
+ * C strings, so a binary key cannot be used verbatim; hex is collision-free and
+ * reversible. Writes exactly key_len*2 + 1 bytes, so the CALLER must size oid to
+ * the key it passes: KVDEV_RADOS_OID_MAX for the spec's <=16-byte Store/Retrieve
+ * keys, but KVDEV_RADOS_EXEC_OID_MAX for KV Exec keys (up to
+ * SPDK_KVDEV_EXEC_KEY_MAX_LEN = 255 bytes, ADR-0014). Passing the smaller buffer
+ * for a long Exec key overflows it.
  */
 static void
 kvdev_rados_key_to_oid(const void *key, uint8_t key_len, char *oid)
@@ -999,7 +1007,7 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
 {
 	struct kvdev_rados *rdev = ch->rdev;
 	struct kvdev_rados_io *io;
-	char oid[KVDEV_RADOS_OID_MAX];
+	char oid[KVDEV_RADOS_EXEC_OID_MAX];
 	int rc;
 
 	if (module[0] == '\0') {
@@ -1058,16 +1066,17 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
 }
 
 /*
- * KV Exec (ADR-0005): map an allowlisted op to a rados object-class method.
- *
- * The (class, method) is NOT on the data path: the NVMf layer resolves the
- * data-plane op_id against the per-namespace allowlist (KVX-2) and passes the
- * matching entry's opaque binding through to us. We parse the binding as
- * "class:method" (the format this backend defines): everything before the first
- * ':' is the rados object-class name, everything after is the method. A binding
- * that is NULL, empty, missing the ':', or with an empty class/method is
- * rejected INVALID before any rados call. op_id itself is not interpreted here
- * (it only selected the binding upstream).
+ * KV Exec (ADR-0005, structured binding per ADR-0010/0012/0014): the NVMf layer
+ * resolves the data-plane op_id against the per-namespace allowlist and passes
+ * the matching entry's STRUCTURED binding through to us. We route on
+ * binding->runtime, never on a parsed string:
+ *   - SPDK_KV_EXEC_RUNTIME_WASM: the new in-process sandboxed executor
+ *     (rados-nkvx, ADR-0009). module_key names the built-in/wasm module
+ *     ("bytecount", "identity", or "wasm:<name>").
+ *   - SPDK_KV_EXEC_RUNTIME_CLS: the legacy Ceph object-class path below;
+ *     module_namespace is the cls name, module_key is the method.
+ * A NULL binding, an unknown runtime, or empty locator fields are rejected
+ * INVALID before any rados call. op_id itself is not interpreted here.
  *
  * The cls runs server-side on the OSD owning oid = hex(key) via a rados read_op
  * carrying rados_read_op_exec, dispatched async with rados_aio_read_op_operate
@@ -1081,7 +1090,8 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
  */
 static int
 kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
-		 uint32_t op_id, const char *binding,
+		 uint32_t op_id, bool read_only,
+		 const struct spdk_kv_exec_binding *binding,
 		 const void *input, uint32_t input_len,
 		 void *output_buf, uint32_t output_buf_len,
 		 spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
@@ -1089,47 +1099,64 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 	struct kvdev_rados_io_channel *ch = spdk_io_channel_get_ctx(_ch);
 	struct kvdev_rados *rdev = ch->rdev;
 	struct kvdev_rados_io *io;
-	char oid[KVDEV_RADOS_OID_MAX];
-	char cls[256];
-	const char *colon, *method;
-	size_t cls_len;
+	char oid[KVDEV_RADOS_EXEC_OID_MAX];
+	const char *cls, *method;
 	int rc;
 
 	(void)op_id;
 	(void)input;
 	(void)input_len;
 
-	/*
-	 * rados-nkvx routing (ADR-0009): a binding prefixed "nkvx:" goes to the new
-	 * in-process executor, not the legacy cls path below. The remainder names a
-	 * built-in module. Everything else falls through to the cls path unchanged.
-	 */
-	if (binding != NULL &&
-	    strncmp(binding, KVDEV_RADOS_NKVX_BINDING_PREFIX,
-		    strlen(KVDEV_RADOS_NKVX_BINDING_PREFIX)) == 0) {
-		const char *module = binding + strlen(KVDEV_RADOS_NKVX_BINDING_PREFIX);
+	if (binding == NULL) {
+		SPDK_ERRLOG("KV Exec: missing structured binding\n");
+		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+		return 0;
+	}
 
+	/*
+	 * rados-nkvx routing (ADR-0009): a wasm-runtime binding goes to the new
+	 * in-process executor, not the legacy cls path below. module_key names the
+	 * built-in/wasm module. The (module_namespace) cold-fetch pool locator and
+	 * the sha256 anchor are consumed by the executor in later tracer bullets.
+	 */
+	if (binding->runtime == SPDK_KV_EXEC_RUNTIME_WASM) {
+		const char *module = binding->module_key;
+
+		if (module == NULL) {
+			SPDK_ERRLOG("nkvx: wasm binding has no module_key\n");
+			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+			return 0;
+		}
+		/* The nkvx wasm executor is read-only by contract (ADR-0014): it
+		 * computes over the cold-fetched value and never writes it back, so
+		 * it is permitted on a read-only namespace. (A future write-capable
+		 * module class must consult read_only at its own mutation point.) */
 		return kvdev_rados_nkvx_exec(ch, key, key_len, module,
 					     output_buf, output_buf_len, cb_fn, cb_arg);
 	}
 
-	/* Parse the binding "class:method". Reject anything malformed. */
-	if (binding == NULL || (colon = strchr(binding, ':')) == NULL) {
-		SPDK_ERRLOG("KV Exec: binding '%s' is not 'class:method'\n",
-			    binding ? binding : "(null)");
+	/* Legacy Ceph object-class path: (module_namespace, module_key) = (class, method). */
+	if (binding->runtime != SPDK_KV_EXEC_RUNTIME_CLS) {
+		SPDK_ERRLOG("KV Exec: unsupported binding runtime %d\n", binding->runtime);
 		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
 		return 0;
 	}
-	cls_len = (size_t)(colon - binding);
-	method = colon + 1;
-	if (cls_len == 0 || cls_len >= sizeof(cls) || method[0] == '\0') {
-		SPDK_ERRLOG("KV Exec: binding '%s' has empty/oversized class or method\n",
-			    binding);
+	/* A Ceph object-class method can perform arbitrary server-side writes and
+	 * we cannot prove non-mutation from the binding, so the cls path is treated
+	 * as mutating: reject it on a read-only namespace. The invariant is enforced
+	 * here, at the mutation point (ADR-0014), not assumed by the opcode gate. */
+	if (read_only) {
+		SPDK_DEBUGLOG(kvdev_rados, "KV Exec cls path rejected on read-only namespace\n");
+		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_READ_ONLY, 0);
+		return 0;
+	}
+	cls = binding->module_namespace;
+	method = binding->module_key;
+	if (cls == NULL || cls[0] == '\0' || method == NULL || method[0] == '\0') {
+		SPDK_ERRLOG("KV Exec: cls binding has empty class or method\n");
 		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
 		return 0;
 	}
-	memcpy(cls, binding, cls_len);
-	cls[cls_len] = '\0';
 
 	kvdev_rados_key_to_oid(key, key_len, oid);
 
