@@ -32,6 +32,35 @@ clang --target=wasm32 -nostdlib -O2 \
   -o bytecount.wasm bytecount.c
 ```
 
+## checksum.wasm
+
+Folds the object bytes into a little-endian `u64` (position-weighted byte sum,
+mixed with the length). Source: `checksum.c`. Unlike `bytecount` (which only
+echoes the `obj_len` argument), `checksum` READS the object bytes out of linear
+memory, so its result is wrong unless the bytes are actually present there — this
+makes it the TB4 (spdk-ii0) zero-copy proof: a correct answer requires the
+custom-`MemoryCreator` backing to alias the cached object buffer.
+
+Rebuild (single-page initial memory so small objects fit one page of the
+content-addressed backing):
+
+```sh
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=checksum \
+  -Wl,--initial-memory=65536 -Wl,--export-memory \
+  -o checksum.wasm checksum.c
+```
+
+## TB4 cached / zero-copy path (spdk-ii0)
+
+When an Exec carries an object key (the oid), the executor routes the wasm run
+through `kvdev_rados_nkvx_wasm_run_cached`: the object is cold-filled ONCE into an
+executor-owned, content-addressed buffer; subsequent Execs of the same object are
+served locally (no librados refetch), the wasm linear memory is backed zero-copy
+by that buffer via the custom `MemoryCreator` (on-demand strategy, ADR-0013), and
+the instantiated instance is reused (warm-instance cache keyed by `(module,
+object)`). See `module/kvdev/rados/kvdev_rados_nkvx_wasm.c`.
+
 ## libwasmtime.so (runtime dependency)
 
 wasmtime is loaded at runtime via `dlopen` (NOT linked into SPDK). The executor
