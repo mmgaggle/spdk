@@ -1035,6 +1035,8 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
 	 * owns io and completes via kvdev_rados_nkvx_io_done.
 	 */
 	if (kvdev_rados_nkvx_wasm_cache_has(io->nkvx_oid)) {
+		SPDK_NOTICELOG("nkvx: oid %s served from executor cache (no librados read)\n",
+			       io->nkvx_oid);
 		rados_aio_release(io->comp);
 		io->comp = NULL;
 		io->nkvx_obj = NULL;
@@ -1050,6 +1052,8 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
 		}
 		return 0;
 	}
+
+	SPDK_NOTICELOG("nkvx: oid %s cache miss -> librados cold-fill read\n", io->nkvx_oid);
 
 	io->nkvx_obj_cap = KVDEV_RADOS_NKVX_COLDFILL_CAP;
 	io->nkvx_obj = malloc(io->nkvx_obj_cap);

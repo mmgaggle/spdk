@@ -631,6 +631,59 @@ test_nkvx_tb4_distinct_object_is_miss(void)
 }
 
 /*
+ * BACKING-SIZE regression (spdk-ii0): a module that declares MORE linear memory
+ * than the object-sized zero-copy backing must still run -- served from a private
+ * buffer (object bytes copied in), NOT zero-copy. bytecount.wasm declares 2 pages;
+ * a sub-page object yields a 1-page backing, so this hits the private fallback.
+ * Pre-fix, new_memory rejected this ("module min exceeds zero-copy backing") and
+ * the Exec failed.
+ */
+static void
+test_nkvx_tb4_multipage_module_private(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB4 multipage test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	/* Sub-page object -> 1-page backing; bytecount.wasm wants 2 pages. */
+	static const uint8_t obj[] = "tiny-object";
+	struct fake_fill fill = { .bytes = obj, .len = sizeof(obj), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	uint64_t got = 0;
+	int rc;
+	struct kvdev_rados_nkvx_wasm_stats st;
+
+	rc = kvdev_rados_nkvx_wasm_run_cached("bytecount", "mpK", sizeof(obj),
+					      fake_cold_fill, &fill, out, sizeof(out), &rlen);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);   /* runs despite 2-page need */
+	CU_ASSERT(rlen == sizeof(uint64_t));
+	memcpy(&got, out, sizeof(got));
+	CU_ASSERT(got == sizeof(obj));                   /* bytecount = object length */
+	CU_ASSERT(fill.calls == 1);
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	/* Private-buffer fallback: linear memory is NOT the cache buffer (not aliased). */
+	CU_ASSERT(st.last_mem_base != NULL);
+	CU_ASSERT(st.last_mem_base != st.last_cache_base);
+	printf("\n    TB4 multipage module: ran (len=%llu), private mem_base=%p != cache_base=%p\n",
+	       (unsigned long long)got, st.last_mem_base, st.last_cache_base);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: TB4 multipage test is a no-op\n");
+#endif
+}
+
+/*
  * SANDBOX ESCAPE regression (spdk-ii0 B1, ADR-0013): oob.wasm writes one byte
  * PAST its declared single-page linear memory. The zero-copy host buffer has no
  * guard region, so this is only caught because the engine config forces DYNAMIC
@@ -828,6 +881,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_wasm_normal_within_caps);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cache_zerocopy_warm);
 	CU_ADD_TEST(suite, test_nkvx_tb4_distinct_object_is_miss);
+	CU_ADD_TEST(suite, test_nkvx_tb4_multipage_module_private);
 	CU_ADD_TEST(suite, test_nkvx_tb4_oob_traps);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cached_failsoft);
 	CU_ADD_TEST(suite, test_nkvx_tb4_dispatch_wires_cache);

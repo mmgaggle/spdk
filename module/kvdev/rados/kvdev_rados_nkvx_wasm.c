@@ -618,6 +618,13 @@ struct nkvx_zc_mem {
 	uint8_t		*base;
 	size_t		size;
 	size_t		cap;
+	/* When the module declares MORE linear memory than the object-sized
+	 * zero-copy backing provides, base points at a private, page-aligned buffer
+	 * we own (object bytes copied in, tail zeroed) instead of the cached object
+	 * buffer; finalize must free it. Zero-copy (owned == false) is the common
+	 * path; this fallback preserves correctness for memory-hungry modules on
+	 * small objects (spdk-ii0 backing-size defect). */
+	bool		owned;
 };
 
 static uint8_t *
@@ -652,9 +659,14 @@ nkvx_zc_grow(void *env, size_t new_size)
 static void
 nkvx_zc_finalize(void *env)
 {
-	/* env is the per-run nkvx_zc_mem; the cache owns the underlying buffer, so
-	 * we free only the small env wrapper. */
-	free(env);
+	struct nkvx_zc_mem *m = env;
+
+	/* The cache owns the zero-copy backing (do NOT free it). Only the private
+	 * fallback buffer (owned) is ours to release. Always free the small wrapper. */
+	if (m != NULL && m->owned) {
+		free(m->base);
+	}
+	free(m);
 }
 
 /*
@@ -686,27 +698,47 @@ nkvx_zc_new_memory(void *env, const wasm_memorytype_t *ty, size_t minimum,
 	(void)reserved_size_in_bytes;
 	(void)guard_size_in_bytes;
 
-	/* The module's declared minimum must fit our fixed zero-copy backing; we
-	 * cannot grow it. The object cache buffer is page-rounded to at least the
-	 * single-page modules in this path, so this holds — but fail clean if a
-	 * module ever declares a larger minimum than the cached object provides. */
-	if (minimum > cctx->cap) {
-		SPDK_ERRLOG("nkvx/wasm: module min %zuB exceeds zero-copy backing %zuB\n",
-			    minimum, cctx->cap);
-		return g_api.error_new("nkvx: module minimum memory exceeds zero-copy backing");
-	}
-	/* Present at least the module's declared minimum as the committed size. */
-	if (cctx->size < minimum) {
-		cctx->size = minimum;
-	}
-
 	m = calloc(1, sizeof(*m));
 	if (m == NULL) {
 		return g_api.error_new("nkvx: out of memory allocating linear-memory wrapper");
 	}
-	m->base = cctx->base;
-	m->size = cctx->size;
-	m->cap = cctx->cap;
+
+	if (minimum <= cctx->cap) {
+		/* Common path: the object-sized backing already covers the module's
+		 * declared minimum -> alias it ZERO-COPY (no copy-in). Present at least
+		 * the module's declared minimum as the committed size. */
+		if (cctx->size < minimum) {
+			cctx->size = minimum;
+		}
+		m->base = cctx->base;
+		m->size = cctx->size;
+		m->cap = cctx->cap;
+		m->owned = false;
+	} else {
+		/* The module declares MORE linear memory than the object-sized backing
+		 * provides (e.g. a 2-page module run against a sub-page object). Zero-copy
+		 * is impossible here, so fall back to a private, page-aligned buffer of the
+		 * module's minimum: copy the cold-filled object bytes (preserving their
+		 * WASM_OBJ_OFF layout) and zero the tail. Correctness over zero-copy for
+		 * this case (spdk-ii0 backing-size defect); the common/large-object path
+		 * stays zero-copy. */
+		size_t need = nkvx_round_up(minimum, NKVX_WASM_PAGE);
+		uint8_t *priv = NULL;
+
+		if (posix_memalign((void **)&priv, NKVX_WASM_PAGE, need) != 0) {
+			free(m);
+			return g_api.error_new("nkvx: out of memory growing linear memory for module");
+		}
+		memcpy(priv, cctx->base, cctx->size);
+		memset(priv + cctx->size, 0, need - cctx->size);
+		m->base = priv;
+		m->size = minimum;
+		m->cap = need;
+		m->owned = true;
+		SPDK_NOTICELOG("nkvx/wasm: module min %zuB exceeds object backing %zuB; using a "
+			       "private %zuB linear memory (not zero-copy)\n",
+			       minimum, cctx->cap, need);
+	}
 
 	memory_ret->env = m;
 	memory_ret->get_memory = nkvx_zc_get;
@@ -1012,6 +1044,10 @@ kvdev_rados_nkvx_wasm_run_cached(const char *name,
 		bool cap = nkvx_wasm_trap_is_cap(api, trap);
 
 		api->trap_delete(trap);
+		/* Log parity with the plain run() path so a cap kill on the cached path
+		 * is equally observable (a contained abort, never a crash). */
+		SPDK_ERRLOG("nkvx/wasm: module '%s' trapped during execution (%s)\n",
+			    name, cap ? "RESOURCE CAP — aborted" : "fault");
 		status = cap ? SPDK_KVDEV_IO_STATUS_ABORTED : SPDK_KVDEV_IO_STATUS_FAILED;
 		pthread_mutex_unlock(&g_cache.mutex);
 		return status;
