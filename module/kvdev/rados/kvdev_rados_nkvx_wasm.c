@@ -3,10 +3,12 @@
  */
 
 #include "spdk/stdinc.h"
+#include "spdk/config.h"	/* SPDK_CONFIG_WASM (must precede the #if below) */
 #include "spdk/log.h"
 #include "spdk/kvdev.h"
 #include "spdk/util.h"
 
+#include "kvdev_rados_nkvx.h"		/* KVDEV_RADOS_NKVX_WASM_DIR_ENV */
 #include "kvdev_rados_nkvx_wasm.h"
 
 /*
