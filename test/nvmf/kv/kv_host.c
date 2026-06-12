@@ -365,6 +365,41 @@ main(int argc, char **argv)
 			"KV Exec nkvx IDENTITY OK: built-in (op_id 11) returned the RADOS "
 			"object bytes unchanged (%u bytes)\n", expect_len);
 
+		/* --- Real-wasm bytecount via op_id 12 (nkvx:wasm:bytecount) ---
+		 * Same contract as the bytecount built-in, but the result is computed by
+		 * a REAL precompiled .wasm running OFF the reactor in the dlopen-backed
+		 * wasmtime runtime (ADR-0013). The object bytes are plain-copied into wasm
+		 * linear memory; the module returns the object length as an LE u64. */
+		memset(exec_buf, 0, buf_len);
+		rc = spdk_nvme_kv_exec(ctx.ns, ctx.qpair, g_key, strlen(g_key),
+				       12 /* nkvx:wasm:bytecount */, exec_buf, 0,
+				       exec_buf, buf_len, io_complete, &ctx);
+		if (rc != 0 || wait_for_completion_timeout(&ctx, KV_RADOS_EXEC_TIMEOUT_S) != 0) {
+			fprintf(stderr, "KV Exec nkvx wasm bytecount failed\n");
+			spdk_dma_free(exec_buf);
+			rc = 1;
+			goto free_qpair;
+		}
+		{
+			uint64_t got = 0;
+
+			memcpy(&got, exec_buf, sizeof(got));
+			if (ctx.last_sc != SPDK_NVME_SC_SUCCESS ||
+			    ctx.last_cdw0 != sizeof(uint64_t) || got != expect_len) {
+				fprintf(stderr,
+					"FAIL: nkvx wasm bytecount sc=0x%02x cdw0=%u got=%" PRIu64
+					" (expected sc=0 cdw0=8 count=%u). Is libwasmtime.so installed "
+					"and SPDK_NKVX_WASM_DIR set?\n",
+					ctx.last_sc, ctx.last_cdw0, got, expect_len);
+				spdk_dma_free(exec_buf);
+				rc = 1;
+				goto free_qpair;
+			}
+		}
+		fprintf(stderr,
+			"KV Exec nkvx WASM OK: REAL .wasm (op_id 12) computed object length %u "
+			"off-reactor in wasmtime, returned LE u64\n", expect_len);
+
 		/*
 		 * --- Criterion 2: off-reactor proof (deterministic, not timing-based).
 		 * Both Execs above ran the module body on the executor's dedicated worker
