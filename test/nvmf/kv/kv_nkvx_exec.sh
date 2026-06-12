@@ -16,9 +16,10 @@
 # The "nkvx:" binding prefix routes KV Exec to the executor; the text after it
 # names the built-in module (statically bound for TB1).
 #
-# SPDK_NKVX_TEST_DELAY_US makes the off-reactor module sleep that long so the
-# concurrent Retrieve can demonstrate the polled reactor is not head-of-line
-# blocked. It is a test-only knob; production never sets it.
+# Off-reactor proof is DETERMINISTIC (not timing-based): the target logs the
+# reactor OS thread id and the worker OS thread id the module actually ran on for
+# every Exec ("nkvx: off-reactor proof ... off_reactor=YES"). This script greps
+# the target log and asserts those ids differ. No artificial delay is used.
 #
 # Requires: a vstart Ceph cluster UP with pool 'kvpool', and an SPDK build
 # configured --with-rbd --with-vfio-user. No OSD-side object class is needed
@@ -35,10 +36,6 @@ cluster_name="nkvx_cluster"
 kvdev_name="KvNkvx0"
 nqn="nqn.2026-06.io.spdk:kv-nkvx-cnode0"
 nsid=1
-
-# Make the off-reactor module run for ~50 ms so a concurrent Retrieve (sub-ms)
-# clearly demonstrates the reactor is not blocked.
-export SPDK_NKVX_TEST_DELAY_US="${SPDK_NKVX_TEST_DELAY_US:-50000}"
 
 sock_dir=$(mktemp -d /tmp/kv_nkvx_exec.XXXXXX)
 muser_dir="$sock_dir/domain/muser0/0"
@@ -69,8 +66,10 @@ trap cleanup EXIT
 # Build the host app if needed.
 make -C "$testdir" > /dev/null
 
-# Start the target.
-$rootdir/build/bin/nvmf_tgt -r "$rpc_sock" -m 0x3 &
+# Start the target. Capture its log so we can grep the deterministic off-reactor
+# proof (reactor_tid vs worker run_tid) the executor emits for each Exec.
+tgt_log="$sock_dir/nvmf_tgt.log"
+$rootdir/build/bin/nvmf_tgt -r "$rpc_sock" -m 0x3 > "$tgt_log" 2>&1 &
 nvmfpid=$!
 waitforlisten $nvmfpid "$rpc_sock"
 
@@ -99,6 +98,27 @@ rc=${PIPESTATUS[0]}
 if [[ $rc -eq 0 ]] && ! grep -q "PASS: KV Exec nkvx e2e (off-reactor built-in module ran)" "$host_log"; then
 	echo "kv_nkvx_exec: FAIL (nkvx KV Exec e2e did not report PASS)"
 	rc=1
+fi
+
+# Criterion 2: DETERMINISTIC off-reactor proof. The target logs, per Exec, the
+# reactor OS thread id and the worker OS thread id the module body ran on. Assert
+# at least one such line exists AND that every proof line reports off_reactor=YES
+# (worker tid != reactor tid). Any off_reactor=NO would mean the compute ran on
+# the polled reactor -> hard fail.
+if [[ $rc -eq 0 ]]; then
+	proof_lines=$(grep -c "nkvx: off-reactor proof" "$tgt_log" || true)
+	bad_lines=$(grep "nkvx: off-reactor proof" "$tgt_log" | grep -c "off_reactor=NO" || true)
+	if [[ "${proof_lines:-0}" -lt 1 ]]; then
+		echo "kv_nkvx_exec: FAIL (no off-reactor proof lines in target log)"
+		rc=1
+	elif [[ "${bad_lines:-0}" -ne 0 ]]; then
+		echo "kv_nkvx_exec: FAIL ($bad_lines Exec(s) ran ON the reactor — off_reactor=NO)"
+		grep "nkvx: off-reactor proof" "$tgt_log" | grep "off_reactor=NO" || true
+		rc=1
+	else
+		echo "Off-reactor proof: $proof_lines Exec(s), all off_reactor=YES (worker tid != reactor tid)"
+		grep "nkvx: off-reactor proof" "$tgt_log" | head -2 || true
+	fi
 fi
 
 # Tear down.

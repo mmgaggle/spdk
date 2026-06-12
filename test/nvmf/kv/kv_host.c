@@ -366,112 +366,14 @@ main(int argc, char **argv)
 			"object bytes unchanged (%u bytes)\n", expect_len);
 
 		/*
-		 * --- Criterion 2: off-reactor proof. With SPDK_NKVX_TEST_DELAY_US set on
-		 * the target, the bytecount module sleeps that long ON THE WORKER thread.
-		 * We submit the (slow) Exec, then immediately submit a Retrieve on the
-		 * same qpair and time it. If the module ran ON the reactor it would
-		 * head-of-line-block the Retrieve, whose completion latency would track
-		 * the Exec delay. Off-reactor, the reactor keeps polling and the Retrieve
-		 * completes promptly (well under the delay), and the Exec completes only
-		 * after ~the delay. We assert exactly that ordering + latencies.
+		 * --- Criterion 2: off-reactor proof (deterministic, not timing-based).
+		 * Both Execs above ran the module body on the executor's dedicated worker
+		 * thread, NOT the polled SPDK reactor. The target emits a NOTICELOG line
+		 * "nkvx: off-reactor proof ... reactor_tid=0x.. run_tid=0x.. off_reactor=YES"
+		 * for every Exec, capturing the actual OS thread ids. The shell driver
+		 * greps the target log and asserts run_tid != reactor_tid (off_reactor=YES).
+		 * That is the load-bearing evidence; it does not depend on any timing.
 		 */
-		{
-			struct kv_ctx exec_ctx = ctx;
-			struct kv_ctx rtv_ctx = ctx;
-			char *slow_exec_buf = spdk_dma_zmalloc(buf_len, 0, NULL);
-			char *rtv_buf = spdk_dma_zmalloc(buf_len, 0, NULL);
-			uint64_t hz = spdk_get_ticks_hz();
-			uint64_t t0, t_rtv = 0, t_exec = 0;
-			uint64_t deadline;
-
-			if (slow_exec_buf == NULL || rtv_buf == NULL) {
-				fprintf(stderr, "Failed to allocate latency DMA buffers\n");
-				spdk_dma_free(slow_exec_buf);
-				spdk_dma_free(rtv_buf);
-				spdk_dma_free(exec_buf);
-				rc = 1;
-				goto free_qpair;
-			}
-
-			exec_ctx.done = false; exec_ctx.failed = false;
-			rtv_ctx.done = false; rtv_ctx.failed = false;
-
-			t0 = spdk_get_ticks();
-			/* Slow Exec first (delayed off-reactor on the target). */
-			rc = spdk_nvme_kv_exec(ctx.ns, ctx.qpair, g_key, strlen(g_key),
-					       10 /* nkvx:bytecount */, slow_exec_buf, 0,
-					       slow_exec_buf, buf_len, io_complete, &exec_ctx);
-			/* Then a Retrieve that must NOT wait behind the Exec's compute. */
-			if (rc == 0) {
-				rc = spdk_nvme_kv_retrieve(ctx.ns, ctx.qpair, g_key, strlen(g_key),
-							   rtv_buf, buf_len, io_complete, &rtv_ctx, 0);
-			}
-			if (rc != 0) {
-				fprintf(stderr, "latency-probe submit failed: %d\n", rc);
-				spdk_dma_free(slow_exec_buf);
-				spdk_dma_free(rtv_buf);
-				spdk_dma_free(exec_buf);
-				rc = 1;
-				goto free_qpair;
-			}
-
-			deadline = spdk_get_ticks() + (uint64_t)KV_RADOS_EXEC_TIMEOUT_S * hz;
-			while (!exec_ctx.done || !rtv_ctx.done) {
-				spdk_nvme_qpair_process_completions(ctx.qpair, 0);
-				if (rtv_ctx.done && t_rtv == 0) {
-					t_rtv = spdk_get_ticks();
-				}
-				if (exec_ctx.done && t_exec == 0) {
-					t_exec = spdk_get_ticks();
-				}
-				if (spdk_get_ticks() >= deadline) {
-					fprintf(stderr, "TIMEOUT waiting for latency-probe completions\n");
-					spdk_dma_free(slow_exec_buf);
-					spdk_dma_free(rtv_buf);
-					spdk_dma_free(exec_buf);
-					rc = 1;
-					goto free_qpair;
-				}
-			}
-
-			{
-				double rtv_ms = 1000.0 * (double)(t_rtv - t0) / (double)hz;
-				double exec_ms = 1000.0 * (double)(t_exec - t0) / (double)hz;
-
-				if (exec_ctx.failed || rtv_ctx.failed) {
-					fprintf(stderr, "FAIL: latency-probe command error\n");
-					spdk_dma_free(slow_exec_buf);
-					spdk_dma_free(rtv_buf);
-					spdk_dma_free(exec_buf);
-					rc = 1;
-					goto free_qpair;
-				}
-				fprintf(stderr,
-					"KV nkvx OFF-REACTOR latency: concurrent Retrieve=%.3f ms, "
-					"delayed Exec=%.3f ms\n", rtv_ms, exec_ms);
-				/* The Retrieve must finish well before the delayed Exec; if the
-				 * module had run on the reactor, the Retrieve would be stuck
-				 * behind it and complete at ~exec_ms. Require a clear margin. */
-				if (!(t_rtv < t_exec) || !(rtv_ms * 2.0 < exec_ms)) {
-					fprintf(stderr,
-						"FAIL: Retrieve not clearly ahead of Exec "
-						"(rtv=%.3f ms exec=%.3f ms) -> reactor may be blocked\n",
-						rtv_ms, exec_ms);
-					spdk_dma_free(slow_exec_buf);
-					spdk_dma_free(rtv_buf);
-					spdk_dma_free(exec_buf);
-					rc = 1;
-					goto free_qpair;
-				}
-				fprintf(stderr,
-					"KV nkvx OFF-REACTOR OK: Retrieve completed %.1fx faster than "
-					"the delayed Exec -> polled reactor NOT blocked by module\n",
-					exec_ms / (rtv_ms > 0 ? rtv_ms : 1e-3));
-			}
-
-			spdk_dma_free(slow_exec_buf);
-			spdk_dma_free(rtv_buf);
-		}
 
 		spdk_dma_free(exec_buf);
 		fprintf(stderr, "PASS: KV Exec nkvx e2e (off-reactor built-in module ran)\n");

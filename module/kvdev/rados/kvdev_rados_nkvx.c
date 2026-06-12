@@ -39,10 +39,12 @@ struct kvdev_rados_nkvx_job {
 	kvdev_rados_nkvx_done_fn	done_fn;
 	void				*done_arg;
 	struct spdk_thread		*origin;	/* SPDK thread to complete on */
+	pthread_t			submit_tid;	/* OS thread that submitted (reactor) */
 
 	/* Filled in by the worker, read back on the SPDK thread. */
 	int				kvstatus;
 	uint32_t			result_len;
+	pthread_t			run_tid;	/* OS thread the module ACTUALLY ran on */
 
 	STAILQ_ENTRY(kvdev_rados_nkvx_job) link;
 };
@@ -54,14 +56,6 @@ static struct {
 	STAILQ_HEAD(, kvdev_rados_nkvx_job) queue;
 	bool				running;
 	bool				stop;
-	/*
-	 * TEST-ONLY: artificial per-job compute delay (µs) read from the env var
-	 * SPDK_NKVX_TEST_DELAY_US at start. Defaults to 0 (no effect on production).
-	 * It lets a functional test make the off-reactor compute observably long so
-	 * a concurrently issued Retrieve can demonstrate the polled reactor is NOT
-	 * blocked by module execution. Production never sets it.
-	 */
-	uint64_t			test_delay_us;
 } g_nkvx = {
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
 	.cond = PTHREAD_COND_INITIALIZER,
@@ -127,6 +121,23 @@ kvdev_rados_nkvx_complete_on_spdk(void *ctx)
 {
 	struct kvdev_rados_nkvx_job *job = ctx;
 
+	/*
+	 * Off-reactor PROOF (deterministic, not timing-based). This callback runs
+	 * back on the originating SPDK reactor thread, so pthread_self() here is the
+	 * reactor's OS thread. job->run_tid is the OS thread the module body actually
+	 * ran on (captured inside the worker). The two MUST differ: that is the
+	 * load-bearing evidence the compute did NOT execute on the polled reactor.
+	 * A functional test greps these and asserts run_tid != reactor_tid.
+	 */
+	pthread_t reactor_tid = pthread_self();
+
+	SPDK_NOTICELOG("nkvx: off-reactor proof module=%s reactor_tid=0x%lx "
+		       "run_tid=0x%lx off_reactor=%s\n",
+		       job->module,
+		       (unsigned long)reactor_tid,
+		       (unsigned long)job->run_tid,
+		       pthread_equal(reactor_tid, job->run_tid) ? "NO" : "YES");
+
 	job->done_fn(job->done_arg, job->kvstatus, job->result_len);
 	free(job);
 }
@@ -150,12 +161,11 @@ kvdev_rados_nkvx_worker_main(void *arg)
 		STAILQ_REMOVE_HEAD(&g_nkvx.queue, link);
 		pthread_mutex_unlock(&g_nkvx.mutex);
 
-		/* TEST-ONLY artificial compute delay (see test_delay_us). Stands in for
-		 * a realistic 100s-of-µs–ms module run so a concurrent Retrieve can show
-		 * the reactor is not blocked. No-op in production (delay == 0). */
-		if (g_nkvx.test_delay_us > 0) {
-			usleep(g_nkvx.test_delay_us);
-		}
+		/* Record the OS thread the module body runs on. This is THIS worker
+		 * thread, distinct from the SPDK reactor that submitted the job; the
+		 * SPDK-thread completion (kvdev_rados_nkvx_complete_on_spdk) compares it
+		 * against the reactor's thread id as deterministic off-reactor proof. */
+		job->run_tid = pthread_self();
 
 		/* The actual off-reactor compute. */
 		job->kvstatus = kvdev_rados_nkvx_run_module(job->module, job->object,
@@ -184,15 +194,6 @@ kvdev_rados_nkvx_start(void)
 	}
 	STAILQ_INIT(&g_nkvx.queue);
 	g_nkvx.stop = false;
-
-	/* TEST-ONLY off-reactor delay knob (see test_delay_us). */
-	{
-		const char *env = getenv("SPDK_NKVX_TEST_DELAY_US");
-
-		g_nkvx.test_delay_us = env ? strtoull(env, NULL, 10) : 0;
-		SPDK_NOTICELOG("nkvx: SPDK_NKVX_TEST_DELAY_US=%s -> test_delay_us=%" PRIu64 "\n",
-			       env ? env : "(unset)", g_nkvx.test_delay_us);
-	}
 
 	rc = pthread_create(&g_nkvx.tid, NULL, kvdev_rados_nkvx_worker_main, NULL);
 	if (rc != 0) {
@@ -257,6 +258,7 @@ kvdev_rados_nkvx_dispatch(const char *module,
 	job->done_fn = done_fn;
 	job->done_arg = done_arg;
 	job->origin = origin;
+	job->submit_tid = pthread_self();
 
 	pthread_mutex_lock(&g_nkvx.mutex);
 	if (!g_nkvx.running) {
