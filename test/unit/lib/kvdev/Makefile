@@ -5,7 +5,7 @@
 SPDK_ROOT_DIR := $(abspath $(CURDIR)/../../../..)
 include $(SPDK_ROOT_DIR)/mk/spdk.common.mk
 
-DIRS-y = kvdev_mem.c
+DIRS-y = kvdev_mem.c kvdev_rados_nkvx.c
 
 .PHONY: all clean $(DIRS-y)
 

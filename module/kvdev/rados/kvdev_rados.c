@@ -16,6 +16,7 @@
 #include "spdk/queue.h"
 
 #include "kvdev_rados.h"
+#include "kvdev_rados_nkvx.h"
 
 /*
  * librados-backed kvdev. See kvdev_rados.h / ADR-0002 / ADR-0004 for the model.
@@ -30,6 +31,14 @@
 
 /* ADR-0002: cap value size at 64 MB; advertised as kvvml in KV Identify. */
 #define KVDEV_RADOS_MAX_VALUE_LEN (64ull * 1024 * 1024)
+
+/*
+ * rados-nkvx (ADR-0009) TB1 cold-fill cap: the executor reads the object into a
+ * fixed buffer before running the built-in module off-reactor. A larger object
+ * is out of TB1 scope (a later tracer bullet streams into the content-addressed
+ * raw-bdev cache); 1 MiB comfortably covers the tracer-bullet objects.
+ */
+#define KVDEV_RADOS_NKVX_COLDFILL_CAP (1ull * 1024 * 1024)
 
 /* xattr name for the store-only vendor TTL (ADR-0003 spirit; not enforced). */
 #define KVDEV_RADOS_TTL_XATTR "kv_ttl"
@@ -84,6 +93,14 @@ enum kvdev_rados_op {
 	KVDEV_RADOS_OP_DELETE,
 	KVDEV_RADOS_OP_EXIST,
 	KVDEV_RADOS_OP_EXEC,
+	/*
+	 * rados-nkvx local executor (ADR-0009): a KV Exec routed to the new
+	 * in-process sandboxed executor instead of the legacy cls path. The io
+	 * first cold-fills the object via a librados aio read (harvested by the
+	 * same poller as RETRIEVE); io_finish then dispatches the built-in module
+	 * OFF the reactor (see kvdev_rados_nkvx.c) rather than completing inline.
+	 */
+	KVDEV_RADOS_OP_NKVX_EXEC,
 };
 
 /* One in-flight librados aio. Lives on the channel inflight list until the
@@ -103,10 +120,16 @@ struct kvdev_rados_io {
 	 * true output length (exec_out_len) — there is no caller buffer to over-run;
 	 * io_finish copies min(true_len, buf_len) of it into host_out and frees
 	 * exec_out with rados_buffer_free. */
-	void				*host_out;	/* EXEC: caller's output buffer */
+	void				*host_out;	/* EXEC/NKVX_EXEC: caller's output buffer */
 	char				*exec_out;	/* EXEC: librados-allocated output buf */
 	size_t				exec_out_len;	/* EXEC: librados-allocated out length */
 	int				exec_rval;	/* EXEC: read_op_exec sub-op rc */
+	/* NKVX_EXEC only: cold-fill state. nkvx_obj is a malloc'd buffer sized to
+	 * the object (stat); the librados read_op fills it, then io_finish hands it
+	 * to the off-reactor worker, which frees it after the module runs. */
+	char				nkvx_module[32];
+	void				*nkvx_obj;
+	uint32_t			nkvx_obj_cap;	/* allocated size of nkvx_obj */
 	spdk_kvdev_io_completion_cb	cb_fn;
 	void				*cb_arg;
 	TAILQ_ENTRY(kvdev_rados_io)	link;
@@ -532,6 +555,71 @@ kvdev_rados_xlate_status(enum kvdev_rados_op op, int ret)
 	}
 }
 
+/*
+ * rados-nkvx off-reactor completion (ADR-0009). Runs back ON THE SPDK THREAD
+ * (spdk_thread_send_msg from the worker), so it is safe to touch io/cb state and
+ * free the cold-fill buffer here. This fires the kvdev completion the NVMf layer
+ * registered; the worker has already produced the result on its own thread.
+ */
+static void
+kvdev_rados_nkvx_io_done(void *done_arg, int kvstatus, uint32_t out_len)
+{
+	struct kvdev_rados_io *io = done_arg;
+
+	io->cb_fn(io->cb_arg, kvstatus, out_len);
+	free(io->nkvx_obj);
+	free(io);
+}
+
+/*
+ * Cold-fill of the nkvx object completed (harvested by the poller). Translate the
+ * read result; on success hand the bytes to the OFF-REACTOR executor (which will
+ * complete via kvdev_rados_nkvx_io_done). On any read failure complete inline.
+ * librados read state (comp/read_op) is already released by the caller.
+ */
+static void
+kvdev_rados_nkvx_dispatch_or_fail(struct kvdev_rados_io *io, int ret)
+{
+	int status;
+	int rc;
+
+	if (ret >= 0 && io->read_rval >= 0) {
+		if (io->stat_size > io->nkvx_obj_cap) {
+			/*
+			 * TB1 cold-fills into a fixed buffer; an object larger than the
+			 * cap is out of scope for the tracer bullet (TB-later: stream
+			 * into the content-addressed raw-bdev cache). Report FAILED.
+			 */
+			SPDK_ERRLOG("nkvx: object %" PRIu64 " B exceeds TB1 cold-fill cap %u B\n",
+				    (uint64_t)io->stat_size, io->nkvx_obj_cap);
+			io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_FAILED, 0);
+			goto done_free;
+		}
+
+		/* Dispatch the built-in module off the reactor against the true
+		 * object length. The buffer + io live until nkvx_io_done frees them. */
+		rc = kvdev_rados_nkvx_dispatch(io->nkvx_module, io->nkvx_obj,
+					       io->stat_size, io->host_out, io->buf_len,
+					       kvdev_rados_nkvx_io_done, io);
+		if (rc != 0) {
+			SPDK_ERRLOG("nkvx: dispatch failed: %s\n", spdk_strerror(-rc));
+			io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+			goto done_free;
+		}
+		/* On success the worker now owns io; do NOT free here. */
+		return;
+	}
+
+	/* operate() succeeded but the read sub-op failed, or operate() failed. */
+	status = ret >= 0 ? kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, io->read_rval)
+			  : kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, ret);
+	io->cb_fn(io->cb_arg, status, 0);
+
+done_free:
+	free(io->nkvx_obj);
+	free(io);
+}
+
 /* Finish one harvested IO: derive status/value_len, fire the cb, free state. */
 static void
 kvdev_rados_io_finish(struct kvdev_rados_io *io)
@@ -539,6 +627,20 @@ kvdev_rados_io_finish(struct kvdev_rados_io *io)
 	int ret = rados_aio_get_return_value(io->comp);
 	int status = kvdev_rados_xlate_status(io->op, ret);
 	uint32_t value_len = 0;
+
+	/*
+	 * NKVX_EXEC is special: the harvested aio is only the cold-fill read. On
+	 * success we hand off OFF-REACTOR rather than completing inline, so release
+	 * the librados state here and let the dispatch helper own io afterwards.
+	 */
+	if (io->op == KVDEV_RADOS_OP_NKVX_EXEC) {
+		rados_aio_release(io->comp);
+		if (io->read_op) {
+			rados_release_read_op(io->read_op);
+		}
+		kvdev_rados_nkvx_dispatch_or_fail(io, ret);
+		return;
+	}
 
 	if (io->op == KVDEV_RADOS_OP_RETRIEVE) {
 		/* The read_op bundles read + stat in one round-trip. ret is the
@@ -873,6 +975,89 @@ kvdev_rados_exist(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 }
 
 /*
+ * rados-nkvx KV Exec (ADR-0009): the NEW local-execution path. A KV Exec whose
+ * binding begins with "nkvx:" runs in the in-process sandboxed executor instead
+ * of as a Ceph object-class. The text after the prefix names a built-in module
+ * (TB1 statically binds "bytecount"/"identity"); op_id is not interpreted here
+ * (it selected the binding upstream in the NVMf allowlist).
+ *
+ * Flow:
+ *   1. cold-fill: a librados aio read_op (read 0..cap bytes + stat for the true
+ *      size) into a malloc'd buffer, queued on the channel inflight list and
+ *      harvested by the SAME poller as Retrieve — we never touch SPDK state from
+ *      a librados thread.
+ *   2. on read completion (kvdev_rados_io_finish -> nkvx_dispatch_or_fail) the
+ *      object is handed OFF the reactor to the executor worker, which runs the
+ *      module and hands the result back to this SPDK thread. The reactor is
+ *      never blocked by module execution.
+ */
+static int
+kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_t key_len,
+		      const char *module,
+		      void *output_buf, uint32_t output_buf_len,
+		      spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_rados *rdev = ch->rdev;
+	struct kvdev_rados_io *io;
+	char oid[KVDEV_RADOS_OID_MAX];
+	int rc;
+
+	if (module[0] == '\0') {
+		SPDK_ERRLOG("nkvx: empty module name in binding\n");
+		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+		return 0;
+	}
+
+	kvdev_rados_key_to_oid(key, key_len, oid);
+
+	io = kvdev_rados_io_alloc(ch, KVDEV_RADOS_OP_NKVX_EXEC, cb_fn, cb_arg);
+	if (io == NULL) {
+		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		return 0;
+	}
+	io->buf_len = output_buf_len;
+	io->host_out = output_buf;
+	snprintf(io->nkvx_module, sizeof(io->nkvx_module), "%s", module);
+
+	io->nkvx_obj_cap = KVDEV_RADOS_NKVX_COLDFILL_CAP;
+	io->nkvx_obj = malloc(io->nkvx_obj_cap);
+	if (io->nkvx_obj == NULL) {
+		rados_aio_release(io->comp);
+		free(io);
+		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		return 0;
+	}
+
+	/* Bundle read + stat exactly like Retrieve so we learn the true object
+	 * size in the same round-trip and can pass it to the module. */
+	io->read_op = rados_create_read_op();
+	if (io->read_op == NULL) {
+		free(io->nkvx_obj);
+		rados_aio_release(io->comp);
+		free(io);
+		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		return 0;
+	}
+
+	rados_read_op_read(io->read_op, 0, io->nkvx_obj_cap, io->nkvx_obj,
+			   &io->bytes_read, &io->read_rval);
+	rados_read_op_stat(io->read_op, &io->stat_size, &io->stat_mtime, NULL);
+
+	rc = rados_aio_read_op_operate(io->read_op, rdev->io_ctx, io->comp, oid, 0);
+	if (rc < 0) {
+		rados_release_read_op(io->read_op);
+		free(io->nkvx_obj);
+		rados_aio_release(io->comp);
+		free(io);
+		cb_fn(cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, rc), 0);
+		return 0;
+	}
+
+	TAILQ_INSERT_TAIL(&ch->inflight, io, link);
+	return 0;
+}
+
+/*
  * KV Exec (ADR-0005): map an allowlisted op to a rados object-class method.
  *
  * The (class, method) is NOT on the data path: the NVMf layer resolves the
@@ -911,6 +1096,22 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 	int rc;
 
 	(void)op_id;
+	(void)input;
+	(void)input_len;
+
+	/*
+	 * rados-nkvx routing (ADR-0009): a binding prefixed "nkvx:" goes to the new
+	 * in-process executor, not the legacy cls path below. The remainder names a
+	 * built-in module. Everything else falls through to the cls path unchanged.
+	 */
+	if (binding != NULL &&
+	    strncmp(binding, KVDEV_RADOS_NKVX_BINDING_PREFIX,
+		    strlen(KVDEV_RADOS_NKVX_BINDING_PREFIX)) == 0) {
+		const char *module = binding + strlen(KVDEV_RADOS_NKVX_BINDING_PREFIX);
+
+		return kvdev_rados_nkvx_exec(ch, key, key_len, module,
+					     output_buf, output_buf_len, cb_fn, cb_arg);
+	}
 
 	/* Parse the binding "class:method". Reject anything malformed. */
 	if (binding == NULL || (colon = strchr(binding, ':')) == NULL) {
@@ -1209,7 +1410,8 @@ static int
 kvdev_rados_module_init(void)
 {
 	g_shutting_down = false;
-	return 0;
+	/* Start the rados-nkvx off-reactor executor worker (ADR-0009). */
+	return kvdev_rados_nkvx_start();
 }
 
 static void
@@ -1219,6 +1421,10 @@ kvdev_rados_module_fini(void)
 	struct kvdev_rados_cluster *c, *ctmp;
 
 	g_shutting_down = true;
+
+	/* Stop the rados-nkvx executor worker (ADR-0009): joins the worker thread
+	 * so no off-reactor job outlives the module. */
+	kvdev_rados_nkvx_stop();
 
 	/* Deleting a kvdev frees it asynchronously (io_device unregister), and the
 	 * async free releases the cluster ref. With g_shutting_down set, the last
