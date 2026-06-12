@@ -61,6 +61,14 @@ enum spdk_kvdev_io_status {
 	 * "command not supported"/invalid-opcode status.
 	 */
 	SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED	= -7,
+	/**
+	 * The operation was aborted because it exceeded a per-invocation resource
+	 * cap (a KV Exec module that exhausted its fuel budget, blew past its
+	 * wall-clock epoch deadline, or tried to grow linear memory past its cap).
+	 * This is a CONTAINED kill, never a crash/hang of the target. The NVMf
+	 * layer maps it to the NVMe "command aborted" status.
+	 */
+	SPDK_KVDEV_IO_STATUS_ABORTED		= -8,
 };
 
 /**

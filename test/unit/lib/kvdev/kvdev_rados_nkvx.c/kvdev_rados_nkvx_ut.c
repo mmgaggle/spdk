@@ -227,6 +227,179 @@ test_nkvx_wasm_bytecount_offreactor(void)
 	kvdev_rados_nkvx_stop();
 }
 
+/*
+ * TB2 per-invocation caps. These only run a REAL module when the wasm runtime is
+ * available (built --with-wasm AND libwasmtime.so present AND the .wasm dir is
+ * known); otherwise they assert the fail-soft NOT_SUPPORTED path, like the
+ * bytecount wasm test. Caps are sourced per-invocation from env overrides
+ * (SPDK_NKVX_WASM_FUEL / _EPOCH_TICKS / _MAX_MEMORY), exactly the TB2 source.
+ */
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+#define NKVX_WASM_RUNTIME_TESTS 1
+#endif
+
+/* Fuel cap: a tight compute-runaway module is killed by fuel exhaustion and the
+ * dispatch returns the distinct ABORTED status — never a crash/hang. */
+static void
+test_nkvx_wasm_fuel_runaway_aborted(void)
+{
+	struct nkvx_result r;
+	uint8_t out[64];
+
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+
+#ifdef NKVX_WASM_RUNTIME_TESTS
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	/* Small fuel ceiling so the tight loop exhausts it fast; epoch off so this
+	 * test isolates the FUEL path; default memory. */
+	setenv("SPDK_NKVX_WASM_FUEL", "1000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+	unsetenv("SPDK_NKVX_WASM_MAX_MEMORY");
+
+	memset(out, 0, sizeof(out));
+	dispatch_and_wait("wasm:fuel_runaway", "x", 1, out, sizeof(out), &r);
+	CU_ASSERT(r.completed);
+	if (r.kvstatus != SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED) {
+		/* Runtime available: fuel must have killed it -> ABORTED, no crash. */
+		CU_ASSERT(r.kvstatus == SPDK_KVDEV_IO_STATUS_ABORTED);
+		printf("\n    fuel-runaway contained: status=%d (ABORTED expected)\n", r.kvstatus);
+	} else {
+		printf("\n    wasm runtime unavailable -> fail-soft (fuel test skipped)\n");
+	}
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	(void)r;
+	(void)out;
+	printf("\n    built --without-wasm: fuel cap test is a no-op\n");
+#endif
+	kvdev_rados_nkvx_stop();
+}
+
+/* Epoch cap: a wall-clock-runaway module with FUEL DISABLED is stopped only by
+ * the epoch deadline the background ticker advances -> ABORTED, never a hang. */
+static void
+test_nkvx_wasm_walltime_runaway_epoch_aborted(void)
+{
+	struct nkvx_result r;
+	uint8_t out[64];
+
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+
+#ifdef NKVX_WASM_RUNTIME_TESTS
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	/* Fuel OFF: ONLY epoch can stop it. Few ticks so the wall-clock budget is
+	 * short (a few * 10ms). */
+	setenv("SPDK_NKVX_WASM_FUEL", "0", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "3", 1);
+	unsetenv("SPDK_NKVX_WASM_MAX_MEMORY");
+
+	memset(out, 0, sizeof(out));
+	dispatch_and_wait("wasm:walltime_runaway", "x", 1, out, sizeof(out), &r);
+	CU_ASSERT(r.completed);
+	if (r.kvstatus != SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED) {
+		CU_ASSERT(r.kvstatus == SPDK_KVDEV_IO_STATUS_ABORTED);
+		printf("\n    walltime-runaway contained by EPOCH: status=%d (ABORTED expected)\n",
+		       r.kvstatus);
+	} else {
+		printf("\n    wasm runtime unavailable -> fail-soft (epoch test skipped)\n");
+	}
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	(void)r;
+	(void)out;
+	printf("\n    built --without-wasm: epoch cap test is a no-op\n");
+#endif
+	kvdev_rados_nkvx_stop();
+}
+
+/* Memory cap: an over-allocating module (memory.grow past the cap) is CONTAINED
+ * by the store limiter -> the module's grow fails and it traps; the dispatch
+ * returns a contained failure and the target survives (never an OOM). */
+static void
+test_nkvx_wasm_overalloc_contained(void)
+{
+	struct nkvx_result r;
+	uint8_t out[64];
+
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+
+#ifdef NKVX_WASM_RUNTIME_TESTS
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	/* Tight memory cap (1 MiB) so memory.grow fails quickly. Fuel/epoch high
+	 * enough not to interfere — the grow loop is short. */
+	setenv("SPDK_NKVX_WASM_MAX_MEMORY", "1048576", 1);
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+
+	memset(out, 0, sizeof(out));
+	dispatch_and_wait("wasm:overalloc", "x", 1, out, sizeof(out), &r);
+	CU_ASSERT(r.completed);
+	if (r.kvstatus != SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED) {
+		/* Contained: a clean failure status (ABORTED if classified, else
+		 * FAILED), NOT a crash. Either is acceptable containment. */
+		CU_ASSERT(r.kvstatus == SPDK_KVDEV_IO_STATUS_ABORTED ||
+			  r.kvstatus == SPDK_KVDEV_IO_STATUS_FAILED);
+		printf("\n    over-alloc contained by MEMORY cap: status=%d (target survived)\n",
+		       r.kvstatus);
+	} else {
+		printf("\n    wasm runtime unavailable -> fail-soft (memory test skipped)\n");
+	}
+	unsetenv("SPDK_NKVX_WASM_MAX_MEMORY");
+#else
+	(void)r;
+	(void)out;
+	printf("\n    built --without-wasm: memory cap test is a no-op\n");
+#endif
+	kvdev_rados_nkvx_stop();
+}
+
+/* Caps configurable: the normal bytecount module STILL completes within generous
+ * caps (proves caps don't break the happy path and are read per-invocation). */
+static void
+test_nkvx_wasm_normal_within_caps(void)
+{
+	static const char obj[] = "the quick brown fox";
+	const uint32_t obj_len = (uint32_t)sizeof(obj);
+	uint8_t out[64];
+	struct nkvx_result r;
+
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+
+#ifdef NKVX_WASM_RUNTIME_TESTS
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	/* Explicit, modest caps -> bytecount still succeeds. */
+	setenv("SPDK_NKVX_WASM_FUEL", "10000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "100", 1);
+	setenv("SPDK_NKVX_WASM_MAX_MEMORY", "8388608", 1);
+
+	memset(out, 0, sizeof(out));
+	dispatch_and_wait("wasm:bytecount", obj, obj_len, out, sizeof(out), &r);
+	CU_ASSERT(r.completed);
+	if (r.kvstatus != SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED) {
+		uint64_t got = 0;
+
+		CU_ASSERT(r.kvstatus == SPDK_KVDEV_IO_STATUS_SUCCESS);
+		CU_ASSERT(r.out_len == sizeof(uint64_t));
+		memcpy(&got, out, sizeof(got));
+		CU_ASSERT(got == obj_len);
+		printf("\n    normal bytecount within caps: got=%llu (SUCCESS)\n",
+		       (unsigned long long)got);
+	}
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+	unsetenv("SPDK_NKVX_WASM_MAX_MEMORY");
+#else
+	(void)obj;
+	(void)obj_len;
+	(void)out;
+	(void)r;
+	printf("\n    built --without-wasm: caps happy-path test is a no-op\n");
+#endif
+	kvdev_rados_nkvx_stop();
+}
+
 static void
 test_nkvx_dispatch_without_thread_fails(void)
 {
@@ -259,6 +432,10 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_unknown_module);
 	CU_ADD_TEST(suite, test_nkvx_bytecount_buffer_too_small);
 	CU_ADD_TEST(suite, test_nkvx_wasm_bytecount_offreactor);
+	CU_ADD_TEST(suite, test_nkvx_wasm_fuel_runaway_aborted);
+	CU_ADD_TEST(suite, test_nkvx_wasm_walltime_runaway_epoch_aborted);
+	CU_ADD_TEST(suite, test_nkvx_wasm_overalloc_contained);
+	CU_ADD_TEST(suite, test_nkvx_wasm_normal_within_caps);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
 
 	/* One SPDK thread stands in for the reactor; the executor worker is a real
