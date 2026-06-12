@@ -31,6 +31,9 @@
 
 /* Pull the executor in as source: it depends only on spdk/thread + pthreads. */
 #include "kvdev/rados/kvdev_rados_nkvx.c"
+/* And the dlopen-backed wasm runtime, so the real-wasm path is exercised in the
+ * same translation unit. With --without-wasm this is the NOT_SUPPORTED stub. */
+#include "kvdev/rados/kvdev_rados_nkvx_wasm.c"
 
 #include "common/lib/ut_multithread.c"
 
@@ -171,6 +174,59 @@ test_nkvx_bytecount_buffer_too_small(void)
 	kvdev_rados_nkvx_stop();
 }
 
+/*
+ * Real-wasm path (TB-WIMP / ADR-0013). Dispatch "wasm:bytecount" off the reactor;
+ * the dlopen-backed runtime instantiates the checked-in bytecount.wasm and
+ * runs it against a PLAIN COPY of the object bytes in linear memory.
+ *
+ * Graceful-degradation aware: if SPDK was built --without-wasm, or libwasmtime.so
+ * is not installed on this host, the runtime is unavailable and the dispatch must
+ * fail SOFT with NOT_SUPPORTED (never crash). When the runtime IS available the
+ * result must equal the object length (mirroring the bytecount built-in). Either
+ * way the off-reactor dispatch/threading is exercised.
+ */
+static void
+test_nkvx_wasm_bytecount_offreactor(void)
+{
+	static const char obj[] = "the quick brown fox";
+	const uint32_t obj_len = (uint32_t)sizeof(obj);
+	uint8_t out[64];
+	struct nkvx_result r;
+
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+#endif
+
+	memset(out, 0, sizeof(out));
+	dispatch_and_wait(KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX
+			  KVDEV_RADOS_NKVX_MODULE_BYTECOUNT,
+			  obj, obj_len, out, sizeof(out), &r);
+
+	/* The dispatch itself always completes (no crash) on the SPDK thread. */
+	CU_ASSERT(r.completed);
+
+	if (r.kvstatus == SPDK_KVDEV_IO_STATUS_SUCCESS) {
+		uint64_t got = 0;
+
+		/* Runtime available: a REAL .wasm ran off-reactor and returned the
+		 * object length as an LE u64 read back from linear memory. */
+		CU_ASSERT(r.out_len == sizeof(uint64_t));
+		memcpy(&got, out, sizeof(got));
+		CU_ASSERT(got == obj_len);
+		printf("\n    real-wasm bytecount ran off-reactor: got=%llu expected=%u\n",
+		       (unsigned long long)got, obj_len);
+	} else {
+		/* Runtime unavailable (built --without-wasm or libwasmtime.so absent):
+		 * fail-soft with a DISTINCT status, no result bytes, no crash. */
+		CU_ASSERT(r.kvstatus == SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED);
+		printf("\n    wasm runtime unavailable -> fail-soft NOT_SUPPORTED (ok)\n");
+	}
+
+	kvdev_rados_nkvx_stop();
+}
+
 static void
 test_nkvx_dispatch_without_thread_fails(void)
 {
@@ -202,6 +258,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_identity);
 	CU_ADD_TEST(suite, test_nkvx_unknown_module);
 	CU_ADD_TEST(suite, test_nkvx_bytecount_buffer_too_small);
+	CU_ADD_TEST(suite, test_nkvx_wasm_bytecount_offreactor);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
 
 	/* One SPDK thread stands in for the reactor; the executor worker is a real

@@ -111,6 +111,12 @@ CONFIG_FC_PATH=
 # Requires librbd development libraries
 CONFIG_RBD=n
 
+# Build the rados-nkvx wasmtime Exec path (ADR-0013). When y, the librados-backed
+# kvdev compiles the dlopen-backed wasm executor; libwasmtime.so is loaded lazily
+# at runtime. When n, only the built-in Exec modules are compiled. An SPDK build
+# never requires anything wasm at link time either way.
+CONFIG_WASM=n
+
 # Build DAOS support in bdev modules
 # Requires daos development libraries
 CONFIG_DAOS=n

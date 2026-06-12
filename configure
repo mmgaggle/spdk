@@ -83,6 +83,8 @@ function usage() {
 	echo " --without-dpdk-compressdev No path required."
 	echo " --with-rbd                Build Ceph RBD bdev module."
 	echo " --without-rbd             No path required."
+	echo " --with-wasm               Build the rados-nkvx wasmtime Exec path (dlopen libwasmtime.so at runtime)."
+	echo " --without-wasm            No path required. Built-in Exec modules still work without wasmtime."
 	echo " --with-ublk               Build ublk library."
 	echo " --without-ublk            No path required."
 	echo " --with-rdma[=PROVIDER]    Build RDMA transport for NVMf target and initiator."
@@ -471,6 +473,12 @@ for i in "$@"; do
 			;;
 		--without-rbd)
 			CONFIG[RBD]=n
+			;;
+		--with-wasm)
+			CONFIG[WASM]=y
+			;;
+		--without-wasm)
+			CONFIG[WASM]=n
 			;;
 		--with-rdma=*)
 			CONFIG[RDMA]=y
@@ -1051,6 +1059,18 @@ if [[ "${CONFIG[RBD]}" = "y" ]]; then
 		| "${BUILD_CMD[@]}" -lrados -lrbd - 2> /dev/null; then
 		echo "--with-rbd requires librados and librbd."
 		echo "Please install then re-run this script."
+		exit 1
+	fi
+fi
+
+if [[ "${CONFIG[WASM]}" = "y" ]]; then
+	# The rados-nkvx wasmtime Exec path lives inside the librados-backed kvdev,
+	# which is gated on --with-rbd. wasmtime itself is dlopen'd at runtime (no
+	# link/build dependency, per ADR-0013), so there is nothing to probe here
+	# beyond requiring the kvdev that hosts it.
+	if [[ "${CONFIG[RBD]}" != "y" ]]; then
+		echo "--with-wasm requires --with-rbd (the rados-nkvx executor lives in the librados kvdev)."
+		echo "Please re-run with --with-rbd."
 		exit 1
 	fi
 fi

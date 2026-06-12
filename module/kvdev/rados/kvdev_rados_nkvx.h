@@ -43,6 +43,25 @@
 #define KVDEV_RADOS_NKVX_MODULE_BYTECOUNT "bytecount"
 #define KVDEV_RADOS_NKVX_MODULE_IDENTITY  "identity"
 
+/*
+ * Real-wasm module prefix (TB-WIMP / ADR-0013). A module name of the form
+ * "wasm:<name>" routes the Exec to the dlopen-backed wasmtime runtime instead of
+ * a C built-in. The full binding is therefore "nkvx:wasm:<name>"; <name> selects
+ * a precompiled <name>.wasm from the nkvx wasm module directory (see
+ * KVDEV_RADOS_NKVX_WASM_DIR_ENV).
+ *
+ * Graceful degradation (ADR-0013): when SPDK was built --without-wasm, or
+ * libwasmtime.so cannot be dlopen'd at runtime, a wasm module fails with a
+ * DISTINCT "runtime unavailable" status (SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED) —
+ * never a crash. The C built-ins above always work regardless.
+ */
+#define KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX "wasm:"
+
+/* Env var naming the directory that holds precompiled <name>.wasm modules. The
+ * e2e and unit tests set this; if unset the executor falls back to a path
+ * relative to the SPDK build tree. */
+#define KVDEV_RADOS_NKVX_WASM_DIR_ENV "SPDK_NKVX_WASM_DIR"
+
 struct kvdev_rados_nkvx_worker;
 
 /*
