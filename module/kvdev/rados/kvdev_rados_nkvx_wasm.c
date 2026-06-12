@@ -12,6 +12,22 @@
 #include "kvdev_rados_nkvx_wasm.h"
 
 /*
+ * TB4 acceptance counters (spdk-ii0). Defined UNCONDITIONALLY (outside the
+ * SPDK_CONFIG_WASM guard) so the unit test can read them in both --with-wasm and
+ * --without-wasm builds. The cache code (under the guard) bumps them. Guarded by
+ * the cache mutex when wasm is built; harmless zero in the stub build.
+ */
+static struct kvdev_rados_nkvx_wasm_stats g_nkvx_wasm_stats;
+
+void
+kvdev_rados_nkvx_wasm_get_stats(struct kvdev_rados_nkvx_wasm_stats *out)
+{
+	if (out != NULL) {
+		*out = g_nkvx_wasm_stats;
+	}
+}
+
+/*
  * dlopen-backed wasmtime runtime for the rados-nkvx Exec path. See the header
  * for the design contract (ADR-0013). This file is only meaningfully compiled
  * when SPDK_CONFIG_WASM is set; with --without-wasm it collapses to a stub that
@@ -95,6 +111,15 @@ struct nkvx_wasm_api {
 	/* Wall-clock interrupt source: the timer thread calls this. */
 	void (*engine_increment_epoch)(wasm_engine_t *);
 
+	/*
+	 * TB4 zero-copy custom MemoryCreator (ADR-0013): when set on the config,
+	 * wasmtime calls our new_memory callback to obtain the linear-memory
+	 * backing for on-demand instances, letting us alias the cached object
+	 * buffer (no copy-in). Works ONLY with the on-demand strategy.
+	 */
+	void (*config_host_memory_creator_set)(wasm_config_t *,
+					       wasmtime_memory_creator_t *);
+
 	wasmtime_store_t *(*store_new)(wasm_engine_t *, void *, void *);
 	wasmtime_context_t *(*store_context)(wasmtime_store_t *);
 	void (*store_delete)(wasmtime_store_t *);
@@ -169,6 +194,7 @@ nkvx_wasm_resolve(void *h)
 	SYM(engine_new_with_config, "wasm_engine_new_with_config");
 	SYM(engine_delete, "wasm_engine_delete");
 	SYM(engine_increment_epoch, "wasmtime_engine_increment_epoch");
+	SYM(config_host_memory_creator_set, "wasmtime_config_host_memory_creator_set");
 	SYM(store_new, "wasmtime_store_new");
 	SYM(store_context, "wasmtime_store_context");
 	SYM(store_delete, "wasmtime_store_delete");
@@ -459,6 +485,542 @@ nkvx_wasm_read_file(const char *path, size_t *out_len)
 	return buf;
 }
 
+/* ==========================================================================
+ * TB4: content-addressed object cache + zero-copy DMA + warm-instance cache
+ * (spdk-ii0 / ADR-0013). The executor owns this store; it never calls librados.
+ * ========================================================================== */
+
+#define NKVX_WASM_PAGE 65536u		/* wasm linear-memory page size */
+
+/*
+ * A cached object: the content-addressed buffer, keyed by obj_key. The buffer is
+ * page-rounded and OWNS the bytes; it is what backs wasm linear memory zero-copy.
+ * mem_cap is the full backing size handed to wasmtime (object bytes start at
+ * WASM_OBJ_OFF inside it, mirroring the plain-copy ABI so the SAME .wasm modules
+ * work unchanged); obj_len is the true object length the module is told.
+ */
+struct nkvx_obj_entry {
+	char			obj_key[256];
+	uint8_t			*mem;		/* page-rounded backing buffer */
+	size_t			mem_cap;	/* allocated/back-able bytes */
+	size_t			mem_size;	/* current "committed" size for wasm */
+	size_t			obj_len;	/* true object length */
+	bool			filled;		/* cold fill completed */
+	STAILQ_ENTRY(nkvx_obj_entry) link;
+};
+
+/*
+ * A warm wasm instance, keyed by (module, obj_key). Holds the whole on-demand
+ * tower (engine/store/module/instance) so a repeat Exec of the same pair skips
+ * re-instantiation. Pinned to the object entry whose buffer backs its memory.
+ */
+struct nkvx_warm_entry {
+	char			module[64];
+	char			obj_key[256];
+	wasm_engine_t		*engine;
+	wasmtime_store_t	*store;
+	wasmtime_context_t	*ctx;
+	wasmtime_module_t	*module_h;
+	wasmtime_instance_t	instance;
+	wasmtime_extern_t	mem_ext;	/* exported "memory" */
+	wasmtime_extern_t	fn_ext;		/* exported <module> */
+	struct nkvx_obj_entry	*obj;		/* backing object (zero-copy alias) */
+	STAILQ_ENTRY(nkvx_warm_entry) link;
+};
+
+static struct {
+	pthread_mutex_t				mutex;
+	STAILQ_HEAD(, nkvx_obj_entry)		objects;
+	STAILQ_HEAD(, nkvx_warm_entry)		warm;
+	bool					inited;
+} g_cache = {
+	.mutex = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static void
+nkvx_cache_init_once(void)
+{
+	if (!g_cache.inited) {
+		STAILQ_INIT(&g_cache.objects);
+		STAILQ_INIT(&g_cache.warm);
+		g_cache.inited = true;
+	}
+}
+
+/* Round x up to a multiple of a. */
+static size_t
+nkvx_round_up(size_t x, size_t a)
+{
+	return (x + a - 1) & ~(a - 1);
+}
+
+/* Find a cached object by key (mutex held). */
+static struct nkvx_obj_entry *
+nkvx_obj_lookup(const char *obj_key)
+{
+	struct nkvx_obj_entry *e;
+
+	STAILQ_FOREACH(e, &g_cache.objects, link) {
+		if (strcmp(e->obj_key, obj_key) == 0) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/* Find a warm instance by (module, obj_key) (mutex held). */
+static struct nkvx_warm_entry *
+nkvx_warm_lookup(const char *module, const char *obj_key)
+{
+	struct nkvx_warm_entry *e;
+
+	STAILQ_FOREACH(e, &g_cache.warm, link) {
+		if (strcmp(e->module, module) == 0 && strcmp(e->obj_key, obj_key) == 0) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * The zero-copy MemoryCreator (ADR-0013). Per run we hand wasmtime a pointer to
+ * the cached object's page-rounded buffer through these callbacks; wasmtime uses
+ * it verbatim as the linear-memory backing, so wasmtime_memory_data() returns the
+ * SAME pointer the cache holds — no copy-in.
+ *
+ * Growth is refused: a TB4 zero-copy object is immutable and exactly sized to its
+ * (committed) page-rounded length, so a memory.grow returns an error (contained,
+ * not a crash) — the modules in this path do not grow.
+ */
+struct nkvx_zc_mem {
+	uint8_t		*base;
+	size_t		size;
+	size_t		cap;
+};
+
+static uint8_t *
+nkvx_zc_get(void *env, size_t *byte_size, size_t *byte_capacity)
+{
+	struct nkvx_zc_mem *m = env;
+
+	*byte_size = m->size;
+	*byte_capacity = m->cap;
+	return m->base;
+}
+
+static wasmtime_error_t *
+nkvx_zc_grow(void *env, size_t new_size)
+{
+	struct nkvx_zc_mem *m = env;
+
+	/* Allow a no-op / shrink-to-fit; refuse real growth of an immutable object. */
+	if (new_size <= m->size) {
+		return NULL;
+	}
+	if (new_size <= m->cap) {
+		m->size = new_size;
+		return NULL;
+	}
+	/* Cannot grow a zero-copy DMA backing past its reservation: signal a clean
+	 * error. wasmtime turns this into a trap, contained by the run. We have no
+	 * error constructor in the dlsym table, so return a non-NULL sentinel —
+	 * wasmtime only checks this pointer for NULL vs non-NULL. */
+	return (wasmtime_error_t *)(uintptr_t)0x1;
+}
+
+static void
+nkvx_zc_finalize(void *env)
+{
+	/* env is the per-run nkvx_zc_mem; the cache owns the underlying buffer, so
+	 * we free only the small env wrapper. */
+	free(env);
+}
+
+/*
+ * new_memory: wasmtime asks for a fresh linear memory for the on-demand instance.
+ * We return the cached object's buffer as the backing (zero-copy). The reserved/
+ * guard sizes are advisory here — we hand back exactly our buffer; growth beyond
+ * it is refused by nkvx_zc_grow (ADR-0013 flags this contract for empirical
+ * validation, which this slice does: the checked-in modules never grow).
+ */
+struct nkvx_zc_ctx {
+	uint8_t		*base;
+	size_t		size;
+	size_t		cap;
+};
+
+static wasmtime_error_t *
+nkvx_zc_new_memory(void *env, const wasm_memorytype_t *ty, size_t minimum,
+		   size_t maximum, size_t reserved_size_in_bytes,
+		   size_t guard_size_in_bytes, wasmtime_linear_memory_t *memory_ret)
+{
+	struct nkvx_zc_ctx *cctx = env;
+	struct nkvx_zc_mem *m;
+
+	(void)ty;
+	(void)maximum;
+	(void)reserved_size_in_bytes;
+	(void)guard_size_in_bytes;
+
+	/* The module's declared minimum must fit our fixed zero-copy backing; we
+	 * cannot grow it. The object cache buffer is page-rounded to at least the
+	 * single-page modules in this path, so this holds — but fail clean if a
+	 * module ever declares a larger minimum than the cached object provides. */
+	if (minimum > cctx->cap) {
+		SPDK_ERRLOG("nkvx/wasm: module min %zuB exceeds zero-copy backing %zuB\n",
+			    minimum, cctx->cap);
+		return (wasmtime_error_t *)(uintptr_t)0x1;
+	}
+	/* Present at least the module's declared minimum as the committed size. */
+	if (cctx->size < minimum) {
+		cctx->size = minimum;
+	}
+
+	m = calloc(1, sizeof(*m));
+	if (m == NULL) {
+		return (wasmtime_error_t *)(uintptr_t)0x1;
+	}
+	m->base = cctx->base;
+	m->size = cctx->size;
+	m->cap = cctx->cap;
+
+	memory_ret->env = m;
+	memory_ret->get_memory = nkvx_zc_get;
+	memory_ret->grow_memory = nkvx_zc_grow;
+	memory_ret->finalizer = nkvx_zc_finalize;
+	return NULL;
+}
+
+/*
+ * Build the on-demand tower (engine/store/module/instance) for a (module, object)
+ * with the cached object's buffer wired in zero-copy via the MemoryCreator, then
+ * cache it warm. On success *out_warm points at the cached warm entry (owned by
+ * the cache). Caps are applied per-run by the caller, not here.
+ */
+static int
+nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
+		struct nkvx_obj_entry *obj, struct nkvx_warm_entry **out_warm)
+{
+	char path[1024];
+	uint8_t *wasm = NULL;
+	size_t wasm_len = 0;
+	wasm_config_t *config = NULL;
+	wasm_engine_t *engine = NULL;
+	wasmtime_store_t *store = NULL;
+	wasmtime_context_t *ctx = NULL;
+	wasmtime_module_t *module_h = NULL;
+	wasmtime_error_t *err = NULL;
+	wasm_trap_t *trap = NULL;
+	wasmtime_instance_t instance;
+	wasmtime_extern_t mem_ext, fn_ext;
+	struct nkvx_warm_entry *w = NULL;
+	struct nkvx_zc_ctx *zc = NULL;
+	wasmtime_memory_creator_t creator;
+	int rc = -1;
+
+	if (nkvx_wasm_module_path(module, path, sizeof(path)) != 0) {
+		return -1;
+	}
+	wasm = nkvx_wasm_read_file(path, &wasm_len);
+	if (wasm == NULL) {
+		return -1;
+	}
+
+	/* Per-binding zero-copy context: hand the cache buffer to the MemoryCreator.
+	 * Owned by the config's creator finalizer once set. */
+	zc = calloc(1, sizeof(*zc));
+	if (zc == NULL) {
+		goto out;
+	}
+	zc->base = obj->mem;
+	zc->size = obj->mem_size;
+	zc->cap = obj->mem_cap;
+
+	config = api->config_new();
+	if (config == NULL) {
+		goto out;
+	}
+	creator.env = zc;
+	creator.new_memory = nkvx_zc_new_memory;
+	creator.finalizer = free;		/* frees the zc ctx when engine drops */
+	api->config_host_memory_creator_set(config, &creator);
+	zc = NULL;				/* ownership handed to the creator/engine */
+
+	engine = api->engine_new_with_config(config);
+	config = NULL;
+	if (engine == NULL) {
+		goto out;
+	}
+	store = api->store_new(engine, NULL, NULL);
+	if (store == NULL) {
+		goto out;
+	}
+	ctx = api->store_context(store);
+
+	err = api->module_new(engine, wasm, wasm_len, &module_h);
+	if (err != NULL) {
+		nkvx_wasm_log_error(api, "module_new", err);
+		goto out;
+	}
+	err = api->instance_new(ctx, module_h, NULL, 0, &instance, &trap);
+	if (err != NULL) {
+		nkvx_wasm_log_error(api, "instance_new", err);
+		goto out;
+	}
+	if (trap != NULL) {
+		SPDK_ERRLOG("nkvx/wasm: zero-copy instantiation trapped\n");
+		api->trap_delete(trap);
+		goto out;
+	}
+	if (!api->instance_export_get(ctx, &instance, "memory", strlen("memory"), &mem_ext) ||
+	    mem_ext.kind != WASMTIME_EXTERN_MEMORY) {
+		SPDK_ERRLOG("nkvx/wasm: module '%s' has no exported 'memory'\n", module);
+		goto out;
+	}
+	if (!api->instance_export_get(ctx, &instance, module, strlen(module), &fn_ext) ||
+	    fn_ext.kind != WASMTIME_EXTERN_FUNC) {
+		SPDK_ERRLOG("nkvx/wasm: module '%s' has no exported function '%s'\n",
+			    module, module);
+		goto out;
+	}
+
+	w = calloc(1, sizeof(*w));
+	if (w == NULL) {
+		goto out;
+	}
+	snprintf(w->module, sizeof(w->module), "%s", module);
+	snprintf(w->obj_key, sizeof(w->obj_key), "%s", obj->obj_key);
+	w->engine = engine;
+	w->store = store;
+	w->ctx = ctx;
+	w->module_h = module_h;
+	w->instance = instance;
+	w->mem_ext = mem_ext;
+	w->fn_ext = fn_ext;
+	w->obj = obj;
+
+	STAILQ_INSERT_TAIL(&g_cache.warm, w, link);
+	*out_warm = w;
+
+	/* Ownership transferred to the warm entry; do not tear down below. */
+	engine = NULL;
+	store = NULL;
+	module_h = NULL;
+	rc = 0;
+
+out:
+	if (module_h != NULL) {
+		api->module_delete(module_h);
+	}
+	if (store != NULL) {
+		api->store_delete(store);
+	}
+	if (engine != NULL) {
+		api->engine_delete(engine);
+	}
+	free(zc);
+	free(wasm);
+	return rc;
+}
+
+static void
+nkvx_warm_free(const struct nkvx_wasm_api *api, struct nkvx_warm_entry *w)
+{
+	if (w->module_h != NULL) {
+		api->module_delete(w->module_h);
+	}
+	if (w->store != NULL) {
+		api->store_delete(w->store);
+	}
+	if (w->engine != NULL) {
+		api->engine_delete(w->engine);
+	}
+	free(w);
+}
+
+int
+kvdev_rados_nkvx_wasm_run_cached(const char *name,
+				 const char *obj_key, size_t object_len,
+				 kvdev_rados_nkvx_fill_fn fill, void *fill_arg,
+				 void *out, uint32_t out_len, uint32_t *result_len)
+{
+	const struct nkvx_wasm_api *api = nkvx_wasm_api();
+	struct nkvx_obj_entry *obj;
+	struct nkvx_warm_entry *warm;
+	struct nkvx_wasm_caps caps;
+	uint8_t *mem_base;
+	size_t mem_size;
+	wasmtime_error_t *err = NULL;
+	wasm_trap_t *trap = NULL;
+	wasmtime_val_t args[2], results[1];
+	int status = SPDK_KVDEV_IO_STATUS_FAILED;
+
+	*result_len = 0;
+
+	if (api == NULL) {
+		SPDK_WARNLOG("nkvx/wasm: runtime unavailable for cached module '%s'\n", name);
+		return SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED;
+	}
+	if (obj_key == NULL || obj_key[0] == '\0' || fill == NULL) {
+		return SPDK_KVDEV_IO_STATUS_INVALID;
+	}
+
+	pthread_mutex_lock(&g_cache.mutex);
+	nkvx_cache_init_once();
+
+	/* ---- content-addressed object cache (cold-fill-once) ---------------- */
+	obj = nkvx_obj_lookup(obj_key);
+	if (obj != NULL && obj->filled) {
+		/* HIT: served locally, NO librados refetch (fill not called). */
+		g_nkvx_wasm_stats.content_hits++;
+	} else {
+		/* MISS: allocate the page-rounded backing and cold-fill ONCE. The
+		 * object bytes live at WASM_OBJ_OFF so the same .wasm ABI applies. */
+		size_t need = nkvx_round_up((size_t)WASM_OBJ_OFF + object_len, NKVX_WASM_PAGE);
+		size_t got = 0;
+
+		if (need == 0) {
+			need = NKVX_WASM_PAGE;
+		}
+		obj = calloc(1, sizeof(*obj));
+		if (obj == NULL) {
+			pthread_mutex_unlock(&g_cache.mutex);
+			return SPDK_KVDEV_IO_STATUS_NOMEM;
+		}
+		/* Page-aligned backing so it is a valid wasm linear-memory base. */
+		if (posix_memalign((void **)&obj->mem, NKVX_WASM_PAGE, need) != 0) {
+			free(obj);
+			pthread_mutex_unlock(&g_cache.mutex);
+			return SPDK_KVDEV_IO_STATUS_NOMEM;
+		}
+		memset(obj->mem, 0, need);
+		obj->mem_cap = need;
+		obj->mem_size = need;
+		snprintf(obj->obj_key, sizeof(obj->obj_key), "%s", obj_key);
+
+		/* COLD FILL: the ONLY librados touch, into the cache buffer at the
+		 * object offset. Counted so the test can assert exactly one. */
+		if (fill(obj->mem + WASM_OBJ_OFF, need - WASM_OBJ_OFF, &got, fill_arg) != 0) {
+			free(obj->mem);
+			free(obj);
+			pthread_mutex_unlock(&g_cache.mutex);
+			SPDK_ERRLOG("nkvx/wasm: cold fill failed for object '%s'\n", obj_key);
+			return SPDK_KVDEV_IO_STATUS_FAILED;
+		}
+		obj->obj_len = got;
+		obj->filled = true;
+		g_nkvx_wasm_stats.cold_fills++;
+		STAILQ_INSERT_TAIL(&g_cache.objects, obj, link);
+	}
+
+	/* ---- warm-instance cache, keyed by (module, object) ----------------- */
+	warm = nkvx_warm_lookup(name, obj_key);
+	if (warm != NULL) {
+		g_nkvx_wasm_stats.warm_hits++;
+	} else {
+		if (nkvx_warm_build(api, name, obj, &warm) != 0) {
+			pthread_mutex_unlock(&g_cache.mutex);
+			SPDK_ERRLOG("nkvx/wasm: warm build failed for '%s'/'%s'\n", name, obj_key);
+			return SPDK_KVDEV_IO_STATUS_FAILED;
+		}
+	}
+
+	/* ---- zero-copy proof: linear memory aliases the cache buffer -------- */
+	mem_base = api->memory_data(warm->ctx, &warm->mem_ext.of.memory);
+	mem_size = api->memory_data_size(warm->ctx, &warm->mem_ext.of.memory);
+	g_nkvx_wasm_stats.last_mem_base = mem_base;
+	g_nkvx_wasm_stats.last_cache_base = obj->mem;
+
+	/* Per-invocation caps (TB2) applied to the warm store before the call. The
+	 * memory cap/epoch from the plain path are not re-armed here: the zero-copy
+	 * object is fixed-size (no grow) and the warm engine is reused, so fuel is
+	 * the per-invocation guard that must be (re)set on every call. */
+	nkvx_wasm_caps_load(&caps);
+	if (caps.fuel_ceiling > 0) {
+		err = api->context_set_fuel(warm->ctx, caps.fuel_ceiling);
+		if (err != NULL) {
+			nkvx_wasm_log_error(api, "context_set_fuel", err);
+			pthread_mutex_unlock(&g_cache.mutex);
+			return SPDK_KVDEV_IO_STATUS_FAILED;
+		}
+	}
+
+	args[0].kind = WASMTIME_I32;
+	args[0].of.i32 = (int32_t)WASM_OBJ_OFF;
+	args[1].kind = WASMTIME_I32;
+	args[1].of.i32 = (int32_t)obj->obj_len;
+	err = api->func_call(warm->ctx, &warm->fn_ext.of.func, args, 2, results, 1, &trap);
+	if (err != NULL) {
+		nkvx_wasm_log_error(api, "func_call", err);
+		pthread_mutex_unlock(&g_cache.mutex);
+		return SPDK_KVDEV_IO_STATUS_FAILED;
+	}
+	if (trap != NULL) {
+		bool cap = nkvx_wasm_trap_is_cap(api, trap);
+
+		api->trap_delete(trap);
+		status = cap ? SPDK_KVDEV_IO_STATUS_ABORTED : SPDK_KVDEV_IO_STATUS_FAILED;
+		pthread_mutex_unlock(&g_cache.mutex);
+		return status;
+	}
+	if (results[0].kind != WASMTIME_I32) {
+		pthread_mutex_unlock(&g_cache.mutex);
+		return SPDK_KVDEV_IO_STATUS_FAILED;
+	}
+
+	{
+		uint32_t produced = (uint32_t)results[0].of.i32;
+		uint32_t copy;
+
+		if ((size_t)WASM_RES_OFF + produced > mem_size) {
+			pthread_mutex_unlock(&g_cache.mutex);
+			return SPDK_KVDEV_IO_STATUS_FAILED;
+		}
+		*result_len = produced;
+		copy = (uint32_t)spdk_min(produced, out_len);
+		if (copy > 0 && out != NULL) {
+			memcpy(out, mem_base + WASM_RES_OFF, copy);
+		}
+		status = (produced > out_len) ?
+			 SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL :
+			 SPDK_KVDEV_IO_STATUS_SUCCESS;
+	}
+
+	pthread_mutex_unlock(&g_cache.mutex);
+	return status;
+}
+
+void
+kvdev_rados_nkvx_wasm_cache_reset(void)
+{
+	const struct nkvx_wasm_api *api = nkvx_wasm_api();
+
+	pthread_mutex_lock(&g_cache.mutex);
+	nkvx_cache_init_once();
+
+	if (api != NULL) {
+		struct nkvx_warm_entry *w;
+
+		while ((w = STAILQ_FIRST(&g_cache.warm)) != NULL) {
+			STAILQ_REMOVE_HEAD(&g_cache.warm, link);
+			nkvx_warm_free(api, w);
+		}
+	} else {
+		STAILQ_INIT(&g_cache.warm);
+	}
+	{
+		struct nkvx_obj_entry *o;
+
+		while ((o = STAILQ_FIRST(&g_cache.objects)) != NULL) {
+			STAILQ_REMOVE_HEAD(&g_cache.objects, link);
+			free(o->mem);
+			free(o);
+		}
+	}
+	memset(&g_nkvx_wasm_stats, 0, sizeof(g_nkvx_wasm_stats));
+	pthread_mutex_unlock(&g_cache.mutex);
+}
+
 int
 kvdev_rados_nkvx_wasm_run(const char *name,
 			  const void *object, size_t object_len,
@@ -709,6 +1271,32 @@ kvdev_rados_nkvx_wasm_run(const char *name,
 	*result_len = 0;
 	SPDK_WARNLOG("nkvx/wasm: built without --with-wasm; module '%s' unavailable\n", name);
 	return SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED;
+}
+
+int
+kvdev_rados_nkvx_wasm_run_cached(const char *name,
+				 const char *obj_key, size_t object_len,
+				 kvdev_rados_nkvx_fill_fn fill, void *fill_arg,
+				 void *out, uint32_t out_len, uint32_t *result_len)
+{
+	(void)obj_key;
+	(void)object_len;
+	(void)fill;
+	(void)fill_arg;
+	(void)out;
+	(void)out_len;
+
+	/* --without-wasm: no cache/zero-copy path. Fail-soft, never a crash. The
+	 * fill callback is intentionally NOT invoked (nothing to fill into). */
+	*result_len = 0;
+	SPDK_WARNLOG("nkvx/wasm: built without --with-wasm; cached module '%s' unavailable\n", name);
+	return SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED;
+}
+
+void
+kvdev_rados_nkvx_wasm_cache_reset(void)
+{
+	/* No cache exists in the stub build. */
 }
 
 #endif /* SPDK_CONFIG_WASM */

@@ -400,6 +400,264 @@ test_nkvx_wasm_normal_within_caps(void)
 	kvdev_rados_nkvx_stop();
 }
 
+/* ==========================================================================
+ * TB4 (spdk-ii0): content-addressed object cache + zero-copy DMA + warm instance.
+ *
+ * These exercise the executor's cache layer DIRECTLY (kvdev_rados_nkvx_wasm_run_cached),
+ * with a FAKE cold-fill callback that counts how many times it actually ran. The
+ * four acceptance criteria map to explicit asserts below. The cache code is real;
+ * the fill callback stands in for the librados cold fill (the executor never calls
+ * librados itself — it only invokes this callback on a content-cache miss).
+ *
+ * Graceful-degradation aware, exactly like the other wasm tests: when the runtime
+ * is unavailable (built --without-wasm OR libwasmtime.so absent), run_cached returns
+ * NOT_SUPPORTED and the fill callback is never reached; the test asserts that
+ * fail-soft path instead and skips the cache-specific assertions.
+ * ========================================================================== */
+
+struct fake_fill {
+	const void	*bytes;
+	size_t		len;
+	uint64_t	calls;		/* number of cold fills actually performed */
+};
+
+static int
+fake_cold_fill(void *buf, size_t cap, size_t *out_len, void *arg)
+{
+	struct fake_fill *f = arg;
+
+	f->calls++;			/* a cold fill (the only "librados" touch) happened */
+	if (f->len > cap) {
+		return -1;
+	}
+	memcpy(buf, f->bytes, f->len);
+	*out_len = f->len;
+	return 0;
+}
+
+/* Expected checksum.wasm result for a given object: must match checksum.c. */
+static uint64_t
+expected_checksum(const uint8_t *obj, size_t len)
+{
+	uint64_t sum = 0;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		sum += (uint64_t)obj[i] * (uint64_t)(i + 1u);
+	}
+	sum ^= (uint64_t)len << 32;
+	return sum;
+}
+
+static bool
+nkvx_wasm_runtime_available(void)
+{
+	/* A cheap probe: run_cached returns NOT_SUPPORTED iff the runtime is absent. */
+	struct kvdev_rados_nkvx_wasm_stats before, after;
+	struct fake_fill f = { .bytes = "x", .len = 1 };
+	uint8_t out[16];
+	uint32_t rlen = 0;
+	int rc;
+
+	kvdev_rados_nkvx_wasm_get_stats(&before);
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", "__probe__", 1,
+					      fake_cold_fill, &f, out, sizeof(out), &rlen);
+	(void)before;
+	(void)after;
+	if (rc == SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED) {
+		return false;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+	return true;
+}
+
+/*
+ * Acceptance criteria 1+2+3+4 in one flow:
+ *   #4 cold-fill correct: 1st Exec returns the right checksum (depends on the
+ *      object bytes actually being in linear memory).
+ *   #1 no refetch:        2nd Exec of the SAME (module,object) does NOT call the
+ *      fill callback again (cold_fills stays at 1; content_hits increments).
+ *   #2 zero-copy:         the wasm linear-memory base pointer ALIASES the cache
+ *      buffer (last_mem_base == last_cache_base) — no gather copy-in.
+ *   #3 warm instance:     the 2nd Exec reuses the instantiated instance
+ *      (warm_hits increments).
+ */
+static void
+test_nkvx_tb4_cache_zerocopy_warm(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	/* Generous caps so checksum completes; per-invocation source is env (TB2). */
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB4 cache test skipped (fail-soft)\n");
+		return;
+	}
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	static const uint8_t obj[] = "graph-partition-bytes-AABBCCDD";
+	const size_t obj_len = sizeof(obj);	/* includes NUL */
+	struct fake_fill fill = { .bytes = obj, .len = obj_len, .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	uint64_t got = 0;
+	int rc;
+	struct kvdev_rados_nkvx_wasm_stats st;
+
+	/* ---- 1st Exec: COLD FILL ---- */
+	memset(out, 0, sizeof(out));
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", "objK", obj_len,
+					      fake_cold_fill, &fill,
+					      out, sizeof(out), &rlen);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(rlen == sizeof(uint64_t));
+	memcpy(&got, out, sizeof(got));
+	/* #4 cold-fill correct: checksum reflects the actual object bytes. */
+	CU_ASSERT(got == expected_checksum(obj, obj_len));
+	CU_ASSERT(fill.calls == 1);
+
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	/* #2 zero-copy: linear memory aliases the cache buffer. */
+	CU_ASSERT(st.cold_fills == 1);
+	CU_ASSERT(st.last_mem_base != NULL);
+	CU_ASSERT(st.last_mem_base == st.last_cache_base);
+	printf("\n    TB4 1st Exec: checksum=0x%llx cold_fills=%llu mem_base=%p cache_base=%p (alias=%s)\n",
+	       (unsigned long long)got, (unsigned long long)st.cold_fills,
+	       st.last_mem_base, st.last_cache_base,
+	       st.last_mem_base == st.last_cache_base ? "YES" : "NO");
+
+	/* ---- 2nd Exec of the SAME (module,object) ---- */
+	memset(out, 0, sizeof(out));
+	got = 0;
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", "objK", obj_len,
+					      fake_cold_fill, &fill,
+					      out, sizeof(out), &rlen);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&got, out, sizeof(got));
+	CU_ASSERT(got == expected_checksum(obj, obj_len));	/* still correct */
+
+	/* #1 no librados refetch: the fill callback did NOT run again. */
+	CU_ASSERT(fill.calls == 1);
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	CU_ASSERT(st.cold_fills == 1);
+	CU_ASSERT(st.content_hits == 1);
+	/* #3 warm instance reused. */
+	CU_ASSERT(st.warm_hits == 1);
+	/* #2 still zero-copy on the warm path. */
+	CU_ASSERT(st.last_mem_base == st.last_cache_base);
+	printf("    TB4 2nd Exec: cold_fills=%llu content_hits=%llu warm_hits=%llu (no refetch, warm reuse)\n",
+	       (unsigned long long)st.cold_fills, (unsigned long long)st.content_hits,
+	       (unsigned long long)st.warm_hits);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: TB4 cache/zero-copy test is a no-op\n");
+#endif
+}
+
+/*
+ * A DIFFERENT object key is a genuine miss: it cold-fills again (a second fill)
+ * and gets its OWN cache buffer (distinct zero-copy backing), proving the cache
+ * is content-addressed (per-object), not a single global slot.
+ */
+static void
+test_nkvx_tb4_distinct_object_is_miss(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB4 distinct-object test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	static const uint8_t a[] = "object-AAAA";
+	static const uint8_t b[] = "object-BBBBBBBB";
+	struct fake_fill fa = { .bytes = a, .len = sizeof(a), .calls = 0 };
+	struct fake_fill fb = { .bytes = b, .len = sizeof(b), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	uint64_t ga = 0, gb = 0;
+	const void *base_a;
+	struct kvdev_rados_nkvx_wasm_stats st;
+
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "A", sizeof(a),
+			fake_cold_fill, &fa, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&ga, out, sizeof(ga));
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	base_a = st.last_cache_base;
+
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "B", sizeof(b),
+			fake_cold_fill, &fb, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&gb, out, sizeof(gb));
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+
+	/* Both cold-filled exactly once -> two distinct cold fills, zero hits. */
+	CU_ASSERT(fa.calls == 1);
+	CU_ASSERT(fb.calls == 1);
+	CU_ASSERT(st.cold_fills == 2);
+	CU_ASSERT(st.content_hits == 0);
+	/* Distinct content-addressed buffers (different zero-copy backings). */
+	CU_ASSERT(st.last_cache_base != base_a);
+	CU_ASSERT(st.last_cache_base == st.last_mem_base);	/* B still zero-copy */
+	/* Correct, distinct results. */
+	CU_ASSERT(ga == expected_checksum(a, sizeof(a)));
+	CU_ASSERT(gb == expected_checksum(b, sizeof(b)));
+	CU_ASSERT(ga != gb);
+	printf("\n    TB4 distinct objects: cold_fills=%llu hits=%llu base_a=%p base_b=%p (distinct=%s)\n",
+	       (unsigned long long)st.cold_fills, (unsigned long long)st.content_hits,
+	       base_a, st.last_cache_base, base_a != st.last_cache_base ? "YES" : "NO");
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: TB4 distinct-object test is a no-op\n");
+#endif
+}
+
+/*
+ * Fail-soft: --without-wasm or libwasmtime.so absent -> run_cached returns
+ * NOT_SUPPORTED and NEVER invokes the fill callback (the executor cannot run the
+ * module, so it must not cold-fill). Deterministic in both build modes.
+ */
+static void
+test_nkvx_tb4_cached_failsoft(void)
+{
+	struct fake_fill f = { .bytes = "x", .len = 1, .calls = 0 };
+	uint8_t out[16];
+	uint32_t rlen = 0;
+	int rc;
+
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	if (nkvx_wasm_runtime_available()) {
+		/* Runtime present: this test's fail-soft assertion does not apply. */
+		printf("\n    wasm runtime available -> fail-soft test not applicable (ok)\n");
+		kvdev_rados_nkvx_wasm_cache_reset();
+		return;
+	}
+#endif
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", "objK", 1,
+					      fake_cold_fill, &f, out, sizeof(out), &rlen);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED);
+	CU_ASSERT(f.calls == 0);	/* no cold fill when the runtime can't run it */
+	CU_ASSERT(rlen == 0);
+	printf("\n    TB4 cached fail-soft: NOT_SUPPORTED, fill not called (ok)\n");
+}
+
 static void
 test_nkvx_dispatch_without_thread_fails(void)
 {
@@ -436,6 +694,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_wasm_walltime_runaway_epoch_aborted);
 	CU_ADD_TEST(suite, test_nkvx_wasm_overalloc_contained);
 	CU_ADD_TEST(suite, test_nkvx_wasm_normal_within_caps);
+	CU_ADD_TEST(suite, test_nkvx_tb4_cache_zerocopy_warm);
+	CU_ADD_TEST(suite, test_nkvx_tb4_distinct_object_is_miss);
+	CU_ADD_TEST(suite, test_nkvx_tb4_cached_failsoft);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
 
 	/* One SPDK thread stands in for the reactor; the executor worker is a real
