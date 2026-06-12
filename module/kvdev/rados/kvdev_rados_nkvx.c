@@ -33,6 +33,7 @@
 
 struct kvdev_rados_nkvx_job {
 	char				module[32];
+	char				obj_key[256];	/* content/identity key (oid) for the cache */
 	const void			*object;
 	size_t				object_len;
 	void				*out;
@@ -81,22 +82,59 @@ static struct {
  *   contract and the off-reactor threading proven here do not change — only this
  *   function's body does. Marked clearly so the swap is local.
  */
+/*
+ * Cold-fill shim (TB4): the executor's content-addressed cache invokes this only
+ * on a MISS to populate the cache slot. Here the bytes were already cold-filled
+ * from RADOS upstream (kvdev_rados.c) and are carried on the job; we copy them
+ * into the cache's page-rounded buffer. On a HIT the cache reuses its buffer and
+ * this is NOT called — so a repeat Exec of the same object skips re-instantiation
+ * and is served zero-copy from the warm instance.
+ */
+struct nkvx_fill_src {
+	const void	*object;
+	size_t		object_len;
+};
+
 static int
-kvdev_rados_nkvx_run_module(const char *module, const void *object, size_t object_len,
+kvdev_rados_nkvx_fill_from_job(void *buf, size_t cap, size_t *out_len, void *arg)
+{
+	struct nkvx_fill_src *src = arg;
+
+	if (src->object_len > cap) {
+		return -1;
+	}
+	if (src->object_len > 0 && src->object != NULL) {
+		memcpy(buf, src->object, src->object_len);
+	}
+	*out_len = src->object_len;
+	return 0;
+}
+
+static int
+kvdev_rados_nkvx_run_module(const char *module, const char *obj_key,
+			    const void *object, size_t object_len,
 			    void *out, uint32_t out_len, uint32_t *result_len)
 {
 	/*
-	 * Real-wasm path (TB-WIMP / ADR-0013). A module named "wasm:<name>" routes
-	 * to the dlopen-backed wasmtime runtime, which on-demand instantiates
-	 * <name>.wasm and runs it against a PLAIN COPY of the object bytes in linear
-	 * memory. If SPDK was built --without-wasm, or libwasmtime.so is absent, this
-	 * returns NOT_SUPPORTED (distinct "runtime unavailable" — never a crash); the
-	 * C built-ins below remain fully functional regardless.
+	 * Real-wasm path. A module named "wasm:<name>" routes to the dlopen-backed
+	 * wasmtime runtime. TB4 (ADR-0013): when an object key is available it runs
+	 * through the content-addressed cache + zero-copy MemoryCreator + warm-
+	 * instance cache (cold-fill-once, served locally thereafter). Without a key
+	 * (or on the --without-wasm stub) it falls back to the plain-copy run. If the
+	 * runtime is unavailable this returns NOT_SUPPORTED (never a crash); the C
+	 * built-ins below remain fully functional regardless.
 	 */
 	if (strncmp(module, KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX,
 		    strlen(KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX)) == 0) {
 		const char *name = module + strlen(KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX);
 
+		if (obj_key != NULL && obj_key[0] != '\0') {
+			struct nkvx_fill_src src = { .object = object, .object_len = object_len };
+
+			return kvdev_rados_nkvx_wasm_run_cached(name, obj_key, object_len,
+							        kvdev_rados_nkvx_fill_from_job, &src,
+							        out, out_len, result_len);
+		}
 		return kvdev_rados_nkvx_wasm_run(name, object, object_len, out, out_len,
 						 result_len);
 	}
@@ -185,8 +223,8 @@ kvdev_rados_nkvx_worker_main(void *arg)
 		job->run_tid = pthread_self();
 
 		/* The actual off-reactor compute. */
-		job->kvstatus = kvdev_rados_nkvx_run_module(job->module, job->object,
-				job->object_len, job->out, job->out_len,
+		job->kvstatus = kvdev_rados_nkvx_run_module(job->module, job->obj_key,
+				job->object, job->object_len, job->out, job->out_len,
 				&job->result_len);
 
 		/* Hand the result back to the SPDK thread that submitted it; the
@@ -245,7 +283,7 @@ kvdev_rados_nkvx_stop(void)
 }
 
 int
-kvdev_rados_nkvx_dispatch(const char *module,
+kvdev_rados_nkvx_dispatch(const char *module, const char *obj_key,
 			  const void *object, size_t object_len,
 			  void *out, uint32_t out_len,
 			  kvdev_rados_nkvx_done_fn done_fn, void *done_arg)
@@ -268,6 +306,9 @@ kvdev_rados_nkvx_dispatch(const char *module,
 		return -ENOMEM;
 	}
 	snprintf(job->module, sizeof(job->module), "%s", module);
+	if (obj_key != NULL) {
+		snprintf(job->obj_key, sizeof(job->obj_key), "%s", obj_key);
+	}
 	job->object = object;
 	job->object_len = object_len;
 	job->out = out;

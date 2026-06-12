@@ -75,6 +75,10 @@ void kvdev_rados_nkvx_stop(void);
  * Dispatch a built-in module run OFF the SPDK reactor.
  *
  * \param module      built-in module name (after the "nkvx:" prefix).
+ * \param obj_key     stable content/identity key for the object (the oid). Keys
+ *                    the executor's content-addressed object cache and, with the
+ *                    module, the warm-instance cache (TB4 / spdk-ii0). May be NULL
+ *                    or "" to bypass the cache (plain-copy run).
  * \param object      object bytes cold-filled from RADOS (owned by caller; must
  *                    remain valid until done_fn fires).
  * \param object_len  length of \c object.
@@ -89,7 +93,7 @@ void kvdev_rados_nkvx_stop(void);
  */
 typedef void (*kvdev_rados_nkvx_done_fn)(void *done_arg, int kvstatus, uint32_t out_len);
 
-int kvdev_rados_nkvx_dispatch(const char *module,
+int kvdev_rados_nkvx_dispatch(const char *module, const char *obj_key,
 			      const void *object, size_t object_len,
 			      void *out, uint32_t out_len,
 			      kvdev_rados_nkvx_done_fn done_fn, void *done_arg);

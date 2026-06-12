@@ -65,7 +65,9 @@ dispatch_and_wait(const char *module, const void *obj, size_t obj_len,
 	memset(r, 0, sizeof(*r));
 
 	set_thread(0);
-	rc = kvdev_rados_nkvx_dispatch(module, obj, obj_len, out, out_cap,
+	/* NULL obj_key: these dispatch-level tests use the plain-copy path; the TB4
+	 * cache/zero-copy path is exercised directly via _wasm_run_cached below. */
+	rc = kvdev_rados_nkvx_dispatch(module, NULL, obj, obj_len, out, out_cap,
 				       nkvx_done, r);
 	CU_ASSERT(rc == 0);
 	set_thread(INVALID_THREAD);
@@ -658,6 +660,86 @@ test_nkvx_tb4_cached_failsoft(void)
 	printf("\n    TB4 cached fail-soft: NOT_SUPPORTED, fill not called (ok)\n");
 }
 
+/*
+ * Live executor wiring (TB4): a wasm: dispatch carrying an obj_key flows through
+ * the off-reactor worker into the content-addressed cache. Two dispatches of the
+ * SAME (module, oid) cold-fill ONCE (the worker's fill shim runs once); the second
+ * is a content hit + warm reuse — proving the executor, not just the cache unit,
+ * is wired to TB4.
+ */
+static void
+test_nkvx_tb4_dispatch_wires_cache(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	static const char obj[] = "dispatch-cached-object";
+	const uint32_t obj_len = (uint32_t)sizeof(obj);
+	uint8_t out[64];
+	struct nkvx_result r;
+	struct kvdev_rados_nkvx_wasm_stats st;
+
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB4 dispatch-wiring test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+
+	/* 1st dispatch of (checksum, oidZ): cold fill via the worker shim. */
+	memset(&r, 0, sizeof(r));
+	memset(out, 0, sizeof(out));
+	set_thread(0);
+	CU_ASSERT(kvdev_rados_nkvx_dispatch("wasm:checksum", "oidZ", obj, obj_len,
+					    out, sizeof(out), nkvx_done, &r) == 0);
+	set_thread(INVALID_THREAD);
+	for (int i = 0; i < 100000 && !r.completed; i++) {
+		poll_threads();
+		if (!r.completed) {
+			usleep(100);
+		}
+	}
+	CU_ASSERT(r.completed);
+	CU_ASSERT(r.kvstatus == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	CU_ASSERT(st.cold_fills == 1);
+	CU_ASSERT(st.last_mem_base == st.last_cache_base);	/* zero-copy */
+
+	/* 2nd dispatch of the SAME (module, oid): content hit + warm reuse. */
+	memset(&r, 0, sizeof(r));
+	memset(out, 0, sizeof(out));
+	set_thread(0);
+	CU_ASSERT(kvdev_rados_nkvx_dispatch("wasm:checksum", "oidZ", obj, obj_len,
+					    out, sizeof(out), nkvx_done, &r) == 0);
+	set_thread(INVALID_THREAD);
+	for (int i = 0; i < 100000 && !r.completed; i++) {
+		poll_threads();
+		if (!r.completed) {
+			usleep(100);
+		}
+	}
+	CU_ASSERT(r.completed);
+	CU_ASSERT(r.kvstatus == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	CU_ASSERT(st.cold_fills == 1);		/* NO refetch */
+	CU_ASSERT(st.content_hits == 1);
+	CU_ASSERT(st.warm_hits == 1);		/* warm reuse */
+	printf("\n    TB4 dispatch wiring: cold_fills=%llu content_hits=%llu warm_hits=%llu (executor wired)\n",
+	       (unsigned long long)st.cold_fills, (unsigned long long)st.content_hits,
+	       (unsigned long long)st.warm_hits);
+
+	kvdev_rados_nkvx_stop();
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: TB4 dispatch-wiring test is a no-op\n");
+#endif
+}
+
 static void
 test_nkvx_dispatch_without_thread_fails(void)
 {
@@ -668,7 +750,7 @@ test_nkvx_dispatch_without_thread_fails(void)
 
 	/* Off any SPDK thread there is no origin to complete on -> -EINVAL. */
 	set_thread(INVALID_THREAD);
-	rc = kvdev_rados_nkvx_dispatch(KVDEV_RADOS_NKVX_MODULE_IDENTITY, "x", 1,
+	rc = kvdev_rados_nkvx_dispatch(KVDEV_RADOS_NKVX_MODULE_IDENTITY, NULL, "x", 1,
 				       out, sizeof(out), nkvx_done, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
@@ -697,6 +779,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_tb4_cache_zerocopy_warm);
 	CU_ADD_TEST(suite, test_nkvx_tb4_distinct_object_is_miss);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cached_failsoft);
+	CU_ADD_TEST(suite, test_nkvx_tb4_dispatch_wires_cache);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
 
 	/* One SPDK thread stands in for the reactor; the executor worker is a real

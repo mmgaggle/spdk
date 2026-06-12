@@ -128,6 +128,7 @@ struct kvdev_rados_io {
 	 * the object (stat); the librados read_op fills it, then io_finish hands it
 	 * to the off-reactor worker, which frees it after the module runs. */
 	char				nkvx_module[32];
+	char				nkvx_oid[KVDEV_RADOS_OID_MAX];	/* TB4 cache key */
 	void				*nkvx_obj;
 	uint32_t			nkvx_obj_cap;	/* allocated size of nkvx_obj */
 	spdk_kvdev_io_completion_cb	cb_fn;
@@ -598,7 +599,7 @@ kvdev_rados_nkvx_dispatch_or_fail(struct kvdev_rados_io *io, int ret)
 
 		/* Dispatch the built-in module off the reactor against the true
 		 * object length. The buffer + io live until nkvx_io_done frees them. */
-		rc = kvdev_rados_nkvx_dispatch(io->nkvx_module, io->nkvx_obj,
+		rc = kvdev_rados_nkvx_dispatch(io->nkvx_module, io->nkvx_oid, io->nkvx_obj,
 					       io->stat_size, io->host_out, io->buf_len,
 					       kvdev_rados_nkvx_io_done, io);
 		if (rc != 0) {
@@ -1018,6 +1019,9 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
 	io->buf_len = output_buf_len;
 	io->host_out = output_buf;
 	snprintf(io->nkvx_module, sizeof(io->nkvx_module), "%s", module);
+	/* The oid (hex of the key) is the stable content/identity key for the
+	 * executor's TB4 content-addressed object + warm-instance cache. */
+	snprintf(io->nkvx_oid, sizeof(io->nkvx_oid), "%s", oid);
 
 	io->nkvx_obj_cap = KVDEV_RADOS_NKVX_COLDFILL_CAP;
 	io->nkvx_obj = malloc(io->nkvx_obj_cap);

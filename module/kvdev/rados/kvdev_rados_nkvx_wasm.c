@@ -740,6 +740,16 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	if (config == NULL) {
 		goto out;
 	}
+	/*
+	 * Enable the FUEL feature on the WARM engine's config (an engine property;
+	 * the warm engine is reused across invocations), so each call can (re)set a
+	 * fuel ceiling. We deliberately do NOT enable epoch interruption here: this
+	 * cached/zero-copy path does not arm the epoch ticker, and enabling epoch
+	 * without setting a deadline traps immediately (deadline defaults to 0).
+	 * Fuel is the per-invocation guard on this path; the wall-clock backstop is
+	 * a follow-up if the warm path ever needs it.
+	 */
+	api->config_consume_fuel_set(config, true);
 	creator.env = zc;
 	creator.new_memory = nkvx_zc_new_memory;
 	creator.finalizer = free;		/* frees the zc ctx when engine drops */
@@ -936,8 +946,15 @@ kvdev_rados_nkvx_wasm_run_cached(const char *name,
 	 * object is fixed-size (no grow) and the warm engine is reused, so fuel is
 	 * the per-invocation guard that must be (re)set on every call. */
 	nkvx_wasm_caps_load(&caps);
-	if (caps.fuel_ceiling > 0) {
-		err = api->context_set_fuel(warm->ctx, caps.fuel_ceiling);
+	/*
+	 * The warm engine ALWAYS has the fuel feature enabled (see nkvx_warm_build),
+	 * so the store starts each instantiation with 0 fuel and would trap unless we
+	 * (re)set it every call. Set the per-invocation ceiling, or a very large
+	 * value when the caps disable fuel (so an "unlimited" run still proceeds). */
+	{
+		uint64_t fuel = caps.fuel_ceiling > 0 ? caps.fuel_ceiling : UINT64_MAX;
+
+		err = api->context_set_fuel(warm->ctx, fuel);
 		if (err != NULL) {
 			nkvx_wasm_log_error(api, "context_set_fuel", err);
 			pthread_mutex_unlock(&g_cache.mutex);
