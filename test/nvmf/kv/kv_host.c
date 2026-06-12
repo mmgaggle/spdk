@@ -179,17 +179,22 @@ main(int argc, char **argv)
 	int sc;
 	bool exec_reject;
 	bool exec_rados;
+	bool exec_nkvx;
 
 	if (argc < 2) {
-		fprintf(stderr, "Usage: %s <vfio-user-socket-path> [reject|allow|rados-exec]\n", argv[0]);
+		fprintf(stderr, "Usage: %s <vfio-user-socket-path> [reject|allow|rados-exec|nkvx-exec]\n",
+			argv[0]);
 		return 1;
 	}
 	/* KV Exec allowlist phase (ADR-0005): "reject" => expect default-deny,
 	 * "rados-exec" => exercise the librados backend's KV Exec -> rados_aio_exec
-	 * path (KVX-3) against the OSD-side kvtest cls, anything else (default) =>
-	 * the in-memory op-IDs are allowlisted and exec must succeed. */
+	 * path (KVX-3) against the OSD-side kvtest cls, "nkvx-exec" => exercise the
+	 * NEW in-process sandboxed executor (ADR-0009/TB1) running a built-in module
+	 * OFF the reactor against a RADOS object, anything else (default) => the
+	 * in-memory op-IDs are allowlisted and exec must succeed. */
 	exec_reject = (argc > 2 && strcmp(argv[2], "reject") == 0);
 	exec_rados = (argc > 2 && strcmp(argv[2], "rados-exec") == 0);
+	exec_nkvx = (argc > 2 && strcmp(argv[2], "nkvx-exec") == 0);
 
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
@@ -287,6 +292,193 @@ main(int argc, char **argv)
 	 * We just stored g_value under g_key; verify both cls methods round-trip
 	 * through the OSD. This proves the cls actually ran server-side.
 	 */
+	/*
+	 * rados-nkvx KV Exec e2e (ADR-0009 / TB1). KV Exec routed to the NEW
+	 * in-process sandboxed executor (binding prefix "nkvx:") that cold-fills the
+	 * object from RADOS and runs a built-in module OFF the SPDK reactor. The
+	 * target's allowlist must map:
+	 *   op_id 10 -> binding "nkvx:bytecount" (result = object length, LE u64)
+	 *   op_id 11 -> binding "nkvx:identity"  (result = object bytes, copied)
+	 * We just stored g_value (sizeof(g_value) bytes) under g_key.
+	 */
+	if (exec_nkvx) {
+		char *exec_buf = spdk_dma_zmalloc(buf_len, 0, NULL);
+		const uint32_t expect_len = (uint32_t)sizeof(g_value);
+
+		if (exec_buf == NULL) {
+			fprintf(stderr, "Failed to allocate exec DMA buffer\n");
+			rc = 1;
+			goto free_qpair;
+		}
+
+		/* --- Criterion 1+3: bytecount built-in via static op_id 10 --- */
+		memset(exec_buf, 0, buf_len);
+		rc = spdk_nvme_kv_exec(ctx.ns, ctx.qpair, g_key, strlen(g_key),
+				       10 /* nkvx:bytecount */, exec_buf, 0,
+				       exec_buf, buf_len, io_complete, &ctx);
+		if (rc != 0 || wait_for_completion_timeout(&ctx, KV_RADOS_EXEC_TIMEOUT_S) != 0) {
+			fprintf(stderr, "KV Exec nkvx bytecount failed\n");
+			spdk_dma_free(exec_buf);
+			rc = 1;
+			goto free_qpair;
+		}
+		{
+			uint64_t got = 0;
+
+			memcpy(&got, exec_buf, sizeof(got));
+			if (ctx.last_sc != SPDK_NVME_SC_SUCCESS ||
+			    ctx.last_cdw0 != sizeof(uint64_t) || got != expect_len) {
+				fprintf(stderr,
+					"FAIL: nkvx bytecount sc=0x%02x cdw0=%u got=%" PRIu64
+					" (expected sc=0 cdw0=8 count=%u)\n",
+					ctx.last_sc, ctx.last_cdw0, got, expect_len);
+				spdk_dma_free(exec_buf);
+				rc = 1;
+				goto free_qpair;
+			}
+		}
+		fprintf(stderr,
+			"KV Exec nkvx BYTECOUNT OK: built-in (op_id 10) computed object "
+			"length %u from RADOS object, returned LE u64\n", expect_len);
+
+		/* --- identity built-in via static op_id 11 --- */
+		memset(exec_buf, 0, buf_len);
+		rc = spdk_nvme_kv_exec(ctx.ns, ctx.qpair, g_key, strlen(g_key),
+				       11 /* nkvx:identity */, exec_buf, 0,
+				       exec_buf, buf_len, io_complete, &ctx);
+		if (rc != 0 || wait_for_completion_timeout(&ctx, KV_RADOS_EXEC_TIMEOUT_S) != 0) {
+			fprintf(stderr, "KV Exec nkvx identity failed\n");
+			spdk_dma_free(exec_buf);
+			rc = 1;
+			goto free_qpair;
+		}
+		if (ctx.last_sc != SPDK_NVME_SC_SUCCESS || ctx.last_cdw0 != expect_len ||
+		    memcmp(exec_buf, g_value, sizeof(g_value)) != 0) {
+			fprintf(stderr,
+				"FAIL: nkvx identity sc=0x%02x cdw0=%u (expected sc=0 cdw0=%u, "
+				"bytes==stored value)\n", ctx.last_sc, ctx.last_cdw0, expect_len);
+			spdk_dma_free(exec_buf);
+			rc = 1;
+			goto free_qpair;
+		}
+		fprintf(stderr,
+			"KV Exec nkvx IDENTITY OK: built-in (op_id 11) returned the RADOS "
+			"object bytes unchanged (%u bytes)\n", expect_len);
+
+		/*
+		 * --- Criterion 2: off-reactor proof. With SPDK_NKVX_TEST_DELAY_US set on
+		 * the target, the bytecount module sleeps that long ON THE WORKER thread.
+		 * We submit the (slow) Exec, then immediately submit a Retrieve on the
+		 * same qpair and time it. If the module ran ON the reactor it would
+		 * head-of-line-block the Retrieve, whose completion latency would track
+		 * the Exec delay. Off-reactor, the reactor keeps polling and the Retrieve
+		 * completes promptly (well under the delay), and the Exec completes only
+		 * after ~the delay. We assert exactly that ordering + latencies.
+		 */
+		{
+			struct kv_ctx exec_ctx = ctx;
+			struct kv_ctx rtv_ctx = ctx;
+			char *slow_exec_buf = spdk_dma_zmalloc(buf_len, 0, NULL);
+			char *rtv_buf = spdk_dma_zmalloc(buf_len, 0, NULL);
+			uint64_t hz = spdk_get_ticks_hz();
+			uint64_t t0, t_rtv = 0, t_exec = 0;
+			uint64_t deadline;
+
+			if (slow_exec_buf == NULL || rtv_buf == NULL) {
+				fprintf(stderr, "Failed to allocate latency DMA buffers\n");
+				spdk_dma_free(slow_exec_buf);
+				spdk_dma_free(rtv_buf);
+				spdk_dma_free(exec_buf);
+				rc = 1;
+				goto free_qpair;
+			}
+
+			exec_ctx.done = false; exec_ctx.failed = false;
+			rtv_ctx.done = false; rtv_ctx.failed = false;
+
+			t0 = spdk_get_ticks();
+			/* Slow Exec first (delayed off-reactor on the target). */
+			rc = spdk_nvme_kv_exec(ctx.ns, ctx.qpair, g_key, strlen(g_key),
+					       10 /* nkvx:bytecount */, slow_exec_buf, 0,
+					       slow_exec_buf, buf_len, io_complete, &exec_ctx);
+			/* Then a Retrieve that must NOT wait behind the Exec's compute. */
+			if (rc == 0) {
+				rc = spdk_nvme_kv_retrieve(ctx.ns, ctx.qpair, g_key, strlen(g_key),
+							   rtv_buf, buf_len, io_complete, &rtv_ctx, 0);
+			}
+			if (rc != 0) {
+				fprintf(stderr, "latency-probe submit failed: %d\n", rc);
+				spdk_dma_free(slow_exec_buf);
+				spdk_dma_free(rtv_buf);
+				spdk_dma_free(exec_buf);
+				rc = 1;
+				goto free_qpair;
+			}
+
+			deadline = spdk_get_ticks() + (uint64_t)KV_RADOS_EXEC_TIMEOUT_S * hz;
+			while (!exec_ctx.done || !rtv_ctx.done) {
+				spdk_nvme_qpair_process_completions(ctx.qpair, 0);
+				if (rtv_ctx.done && t_rtv == 0) {
+					t_rtv = spdk_get_ticks();
+				}
+				if (exec_ctx.done && t_exec == 0) {
+					t_exec = spdk_get_ticks();
+				}
+				if (spdk_get_ticks() >= deadline) {
+					fprintf(stderr, "TIMEOUT waiting for latency-probe completions\n");
+					spdk_dma_free(slow_exec_buf);
+					spdk_dma_free(rtv_buf);
+					spdk_dma_free(exec_buf);
+					rc = 1;
+					goto free_qpair;
+				}
+			}
+
+			{
+				double rtv_ms = 1000.0 * (double)(t_rtv - t0) / (double)hz;
+				double exec_ms = 1000.0 * (double)(t_exec - t0) / (double)hz;
+
+				if (exec_ctx.failed || rtv_ctx.failed) {
+					fprintf(stderr, "FAIL: latency-probe command error\n");
+					spdk_dma_free(slow_exec_buf);
+					spdk_dma_free(rtv_buf);
+					spdk_dma_free(exec_buf);
+					rc = 1;
+					goto free_qpair;
+				}
+				fprintf(stderr,
+					"KV nkvx OFF-REACTOR latency: concurrent Retrieve=%.3f ms, "
+					"delayed Exec=%.3f ms\n", rtv_ms, exec_ms);
+				/* The Retrieve must finish well before the delayed Exec; if the
+				 * module had run on the reactor, the Retrieve would be stuck
+				 * behind it and complete at ~exec_ms. Require a clear margin. */
+				if (!(t_rtv < t_exec) || !(rtv_ms * 2.0 < exec_ms)) {
+					fprintf(stderr,
+						"FAIL: Retrieve not clearly ahead of Exec "
+						"(rtv=%.3f ms exec=%.3f ms) -> reactor may be blocked\n",
+						rtv_ms, exec_ms);
+					spdk_dma_free(slow_exec_buf);
+					spdk_dma_free(rtv_buf);
+					spdk_dma_free(exec_buf);
+					rc = 1;
+					goto free_qpair;
+				}
+				fprintf(stderr,
+					"KV nkvx OFF-REACTOR OK: Retrieve completed %.1fx faster than "
+					"the delayed Exec -> polled reactor NOT blocked by module\n",
+					exec_ms / (rtv_ms > 0 ? rtv_ms : 1e-3));
+			}
+
+			spdk_dma_free(slow_exec_buf);
+			spdk_dma_free(rtv_buf);
+		}
+
+		spdk_dma_free(exec_buf);
+		fprintf(stderr, "PASS: KV Exec nkvx e2e (off-reactor built-in module ran)\n");
+		rc = 0;
+		goto free_qpair;
+	}
+
 	if (exec_rados) {
 		const char echo_in[] = "near-data-compute";
 		char *exec_buf = spdk_dma_zmalloc(buf_len, 0, NULL);
