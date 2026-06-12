@@ -315,14 +315,20 @@ spdk_kvdev_list(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 int
 spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 		const void *key, uint8_t key_len, uint32_t op_id,
-		const char *binding,
+		const struct spdk_kv_exec_binding *binding,
 		const void *input, uint32_t input_len,
 		void *output_buf, uint32_t output_buf_len,
 		spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
 {
 	struct spdk_kvdev *kvdev = desc->kvdev;
 
-	if (key == NULL || key_len < SPDK_KVDEV_KEY_MIN_LEN || key_len > kvdev->caps.max_key_len) {
+	/*
+	 * KV Exec keys ride length-prefixed in the request payload (ADR-0014), so
+	 * they are bounded by SPDK_KVDEV_EXEC_KEY_MAX_LEN (255: 32B hashes + RADOS
+	 * names), NOT the spec's 16-byte inline cap that gates Store/Retrieve.
+	 */
+	if (key == NULL || key_len < SPDK_KVDEV_KEY_MIN_LEN ||
+	    key_len > SPDK_KVDEV_EXEC_KEY_MAX_LEN) {
 		return -EINVAL;
 	}
 

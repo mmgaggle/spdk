@@ -560,7 +560,32 @@
         {
           "name": "binding",
           "type": "string",
-          "description": "Optional opaque binding descriptor the backend interprets"
+          "description": "Legacy opaque 'class:method' binding (ADR-0005). Deprecated by the structured fields below; accepted for migration and mapped to runtime='cls'."
+        },
+        {
+          "name": "runtime",
+          "type": "string",
+          "description": "Structured binding runtime (ADR-0012/0014): 'wasm' (sandboxed executor) or 'cls' (legacy Ceph object-class)."
+        },
+        {
+          "name": "module_namespace",
+          "type": "string",
+          "description": "Structured binding cold-fetch locator namespace (ADR-0014)."
+        },
+        {
+          "name": "module_key",
+          "type": "string",
+          "description": "Structured binding cold-fetch locator key (ADR-0014)."
+        },
+        {
+          "name": "sha256",
+          "type": "string",
+          "description": "Structured binding artifact content hash, 64 hex chars; the auth/integrity anchor (ADR-0010)."
+        },
+        {
+          "name": "caps",
+          "type": "uint64",
+          "description": "Structured binding per-invocation capability bitmask (reserved; 0 in v1)."
         }
       ]
     }
