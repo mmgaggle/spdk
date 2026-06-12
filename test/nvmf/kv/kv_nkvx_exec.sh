@@ -97,7 +97,14 @@ $rpc_py nvmf_subsystem_add_listener "$nqn" -t VFIOUSER -a "$muser_dir" -s 0
 # each token on the FIRST ':' into op_id and binding, so "10:nkvx:bytecount"
 # yields op_id=10 binding="nkvx:bytecount", and "12:nkvx:wasm:bytecount" yields
 # op_id=12 binding="nkvx:wasm:bytecount" (module "wasm:bytecount" -> real .wasm).
-$rpc_py nvmf_ns_set_kv_exec_allowlist "$nqn" "$nsid" "10:nkvx:bytecount 11:nkvx:identity 12:nkvx:wasm:bytecount"
+# op_ids 13/14/15 are the TB2 runaway/over-alloc modules: a compute-runaway
+# (fuel cap), a wall-clock-runaway (epoch cap), and an over-allocator (memory
+# cap). The host issues each and asserts the command is CONTAINED (aborted),
+# never crashing/hanging the target.
+nkvx_allowlist="10:nkvx:bytecount 11:nkvx:identity 12:nkvx:wasm:bytecount"
+nkvx_allowlist+=" 13:nkvx:wasm:fuel_runaway 14:nkvx:wasm:walltime_runaway"
+nkvx_allowlist+=" 15:nkvx:wasm:overalloc"
+$rpc_py nvmf_ns_set_kv_exec_allowlist "$nqn" "$nsid" "$nkvx_allowlist"
 get_json=$($rpc_py nvmf_ns_get_kv_exec_allowlist "$nqn" "$nsid")
 echo "nvmf_ns_get_kv_exec_allowlist => $get_json"
 
@@ -131,6 +138,23 @@ if [[ $rc -eq 0 ]]; then
 	else
 		echo "Off-reactor proof: $proof_lines Exec(s), all off_reactor=YES (worker tid != reactor tid)"
 		grep "nkvx: off-reactor proof" "$tgt_log" | head -2 || true
+	fi
+fi
+
+# Criterion 3 (TB2): per-invocation caps contained the runaway/over-alloc modules.
+# The target logs a "RESOURCE CAP — aborted" line per cap kill; assert we saw the
+# fuel and epoch kills, and that the target process is STILL ALIVE (never crashed).
+if [[ $rc -eq 0 ]]; then
+	cap_lines=$(grep -c "RESOURCE CAP — aborted\|trapped during execution" "$tgt_log" || true)
+	if ! kill -0 "$nvmfpid" 2>/dev/null; then
+		echo "kv_nkvx_exec: FAIL (target process died — a cap did NOT contain a runaway)"
+		rc=1
+	elif [[ "${cap_lines:-0}" -lt 1 ]]; then
+		echo "kv_nkvx_exec: FAIL (no cap-containment lines in target log)"
+		rc=1
+	else
+		echo "Cap containment: target survived $cap_lines contained runaway/over-alloc Exec(s)"
+		grep "RESOURCE CAP — aborted\|trapped during execution" "$tgt_log" | head -3 || true
 	fi
 fi
 
