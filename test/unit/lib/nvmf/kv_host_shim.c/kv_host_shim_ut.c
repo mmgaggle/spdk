@@ -22,14 +22,19 @@
  *   - test_reconnect_after_failure: a subsequent op transparently reconnects
  *                                  the disconnected qpair, then succeeds.
  *   - test_reconnect_stale_completion_interleave: the regression for the
- *                                  PCIe/vfio-user abort-on-reconnect race --
- *                                  op A times out (its hardware tracker is left
- *                                  outstanding), op B reconnects and on the
- *                                  first poll the transport fires A's STALE
- *                                  aborted callback; B must still return its OWN
- *                                  result, not A's ABORTED (0x08) status. This
- *                                  test FAILS on the un-drained code (returns 8)
- *                                  and PASSES after the drain/expecting fix.
+ *                                  vfio-user orphaned-tracker race -- op A times
+ *                                  out (its hardware tracker is left outstanding
+ *                                  and is NOT aborted by reconnect on this
+ *                                  transport), op B reconnects and arms, and A's
+ *                                  orphan callback fires at a LATER poll -- past
+ *                                  the bounded drain, inside B's armed window.
+ *                                  B must still return its OWN result, not A's
+ *                                  ABORTED (0x08) status. FAILS on the old
+ *                                  boolean-`expecting` gate (returns 8), PASSES
+ *                                  with the per-op identity-token gate.
+ *   - test_reconnect_stale_completion_two_deep: same, two orphans deep -- B's
+ *                                  orphan lands inside C's armed window; the
+ *                                  distinct per-op tokens keep C clean.
  *
  * The mocked clock (spdk_get_ticks / spdk_get_ticks_hz from test_env.c) lets
  * the timeout test jump past the deadline instantly, so the suite never waits
@@ -80,24 +85,44 @@ static spdk_nvme_cmd_cb g_saved_cb;
 static void *g_saved_cb_arg;
 
 /*
- * Faithful model of the PCIe/vfio-user abort-on-reconnect semantics.
+ * Faithful model of the vfio-user abort semantics (transport facts verified in
+ * lib/nvme/: nvme_qpair.c:797 gates the CONNECTED->ENABLING tracker abort on
+ * trtype == PCIE, so for vfio-user that abort is SKIPPED on reconnect).
  *
- * On PCIe/vfio-user, spdk_nvme_ctrlr_disconnect_io_qpair() does NOT abort a
- * healthy in-flight op's HARDWARE tracker -- it only flushes software-queued
- * reqs. The outstanding tracker is aborted LATER, on reconnect, when the next
- * spdk_nvme_qpair_process_completions() fires its callback with
- * SC_ABORTED_SQ_DELETION (0x08).
+ * Consequences this mock reproduces:
+ *   - disconnect does NOT abort an in-flight op's HARDWARE tracker (it only
+ *     flushes software-queued reqs, which the shim has none of). The tracker is
+ *     left OUTSTANDING.
+ *   - reconnect does NOT abort it either. The orphan callback therefore fires at
+ *     an UNBOUNDED later poll, NOT deterministically on the first poll after
+ *     reconnect, and NOT during the bounded reconnect drain.
  *
- * We model that here: when the captured op is still "in flight" (its callback
- * was captured and not yet completed) and we disconnect, the tracker becomes a
- * pending STALE completion. After a reconnect, the FIRST process_completions
- * fires that stale callback (into the same io_complete/cb_arg the shim
- * registered) before doing anything else. This is exactly the interleaving that
- * corrupted the next op's status before the fix.
+ * We model the worst case the reviewer demanded: the orphan fires on the Nth
+ * process_completions AFTER reconnect, chosen to land PAST the shim's bounded
+ * 8-pass drain AND while the NEXT op is armed (mid poll_to_completion()). With
+ * this faithful timing, the OLD boolean-`expecting` fix FAILS (it records the
+ * orphan's 0x08 into the armed op's slot) and only the identity-token fix PASSES.
  */
-static spdk_nvme_cmd_cb g_stale_cb;	/* aborted tracker pending to fire */
+static spdk_nvme_cmd_cb g_stale_cb;	/* orphaned tracker pending to fire */
 static void *g_stale_cb_arg;
 static bool g_op_in_flight;		/* a submitted op has not yet completed */
+
+/*
+ * When >= 0, an orphan is pending and will fire after this many MORE
+ * process_completions calls have been observed (counts down; fires at 0). This
+ * lets a test schedule the orphan at an arbitrary later poll rather than on the
+ * first one. -1 means no orphan pending.
+ */
+static int g_stale_fire_after = -1;
+
+/*
+ * How many polls after the disconnect the orphan should fire. Default 0 = the
+ * legacy "fires on the first poll" timing (used by tests that don't care). The
+ * interleave test sets this large enough to land PAST the shim's bounded 8-pass
+ * reconnect drain and INSIDE the next op's armed poll window, which is the
+ * faithful vfio-user worst case.
+ */
+static int g_stale_default_delay;
 
 void
 spdk_nvme_ctrlr_disconnect_io_qpair(struct spdk_nvme_qpair *qpair)
@@ -105,18 +130,22 @@ spdk_nvme_ctrlr_disconnect_io_qpair(struct spdk_nvme_qpair *qpair)
 	g_disconnect_calls++;
 	/*
 	 * If an op was in flight when we disconnected, its hardware tracker is
-	 * left OUTSTANDING (not aborted here) -- it becomes a stale completion
-	 * the transport will fire on reconnect.
+	 * left OUTSTANDING (NOT aborted here, and NOT aborted on reconnect for
+	 * vfio-user). It becomes an orphan that the transport fires at some later
+	 * poll. By default schedule it g_stale_default_delay polls out, which the
+	 * interleave test sets to land past the drain and inside op B's armed
+	 * window.
 	 */
 	if (g_op_in_flight) {
 		g_stale_cb = g_saved_cb;
 		g_stale_cb_arg = g_saved_cb_arg;
-		/* The tracker moves from "in flight" to "stale, pending abort on
-		 * reconnect". Clear the saved cb so it is fired exactly once, as
-		 * the stale aborted completion, not again as a fresh success. */
+		/* Move the tracker from "in flight" to "orphan, pending". Clear the
+		 * saved cb so it fires exactly once, as the orphan, not again as a
+		 * fresh success. */
 		g_saved_cb = NULL;
 		g_saved_cb_arg = NULL;
 		g_op_in_flight = false;
+		g_stale_fire_after = g_stale_default_delay;
 	}
 }
 
@@ -192,21 +221,38 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 	struct spdk_nvme_cpl cpl = {};
 
 	/*
-	 * Model the transport's abort-on-reconnect drain: a stale tracker left
-	 * outstanding by a disconnected op fires its aborted callback on the
-	 * FIRST poll, ahead of any fresh op's completion. This is the
-	 * interleaving that corrupted the next op's status before the fix.
+	 * Faithful orphan timing: an outstanding tracker left by a disconnected op
+	 * fires its aborted callback at an ARBITRARY later poll (g_stale_fire_after
+	 * polls after the disconnect), NOT necessarily on the first poll. The
+	 * transport fires it unconditionally -- it has no knowledge of the shim's
+	 * arming, so it can (and in the interleave test, does) land while the NEXT
+	 * op is armed and mid-poll. The shim's identity token, not this timing, is
+	 * what must reject it.
 	 */
-	if (g_stale_cb != NULL) {
-		struct spdk_nvme_cpl acpl = {};
+	if (g_stale_cb != NULL && g_stale_fire_after >= 0) {
+		if (g_stale_fire_after == 0) {
+			struct spdk_nvme_cpl acpl = {};
 
-		acpl.status.sct = SPDK_NVME_SCT_GENERIC;
-		acpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;	/* 0x08 */
-		acpl.cdw0 = 0xdeadbeef;	/* a wrong cdw0, to catch slot corruption */
-		g_stale_cb(g_stale_cb_arg, &acpl);
-		g_stale_cb = NULL;
-		g_stale_cb_arg = NULL;
-		return 1;
+			acpl.status.sct = SPDK_NVME_SCT_GENERIC;
+			acpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;	/* 0x08 */
+			acpl.cdw0 = 0xdeadbeef;	/* wrong cdw0, to catch slot corruption */
+			g_stale_fire_after = -1;
+			g_stale_cb(g_stale_cb_arg, &acpl);
+			g_stale_cb = NULL;
+			g_stale_cb_arg = NULL;
+			return 1;
+		}
+		/*
+		 * Orphan pending but not ready this poll. Hold off the armed op's
+		 * own completion so the orphan is GUARANTEED to land while that op
+		 * is still armed and polling (the faithful worst case). For the
+		 * POLL_HANG/POLL_TRANSPORT_FAIL modes the op was going to make
+		 * progress toward timeout/failure anyway, so fall through.
+		 */
+		g_stale_fire_after--;
+		if (g_poll_mode == POLL_COMPLETE_SUCCESS) {
+			return 0;	/* armed op stays in flight; orphan fires soon */
+		}
 	}
 
 	switch (g_poll_mode) {
@@ -256,6 +302,8 @@ reset_state(void)
 	g_saved_cb_arg = NULL;
 	g_stale_cb = NULL;
 	g_stale_cb_arg = NULL;
+	g_stale_fire_after = -1;
+	g_stale_default_delay = 0;
 	g_op_in_flight = false;
 	g_submit_rc = 0;
 	g_poll_mode = POLL_COMPLETE_SUCCESS;
@@ -378,23 +426,31 @@ test_reconnect_after_failure(void)
 }
 
 /*
- * Regression for the PCIe/vfio-user abort-on-reconnect race.
+ * Regression for the vfio-user orphaned-tracker race -- with FAITHFUL timing.
  *
- * Walk the exact interleaving the reviewer's repro hit:
+ * Transport facts (lib/nvme/): vfio-user does NOT abort an outstanding tracker
+ * on disconnect or reconnect, so a timed-out op's orphan callback fires at an
+ * UNBOUNDED later poll -- past any bounded reconnect drain, and possibly while
+ * the NEXT op is armed and mid-poll. This test models exactly that worst case:
+ *
  *   1. Op A is submitted and HANGS -> times out (-ETIMEDOUT). The shim
- *      disconnects the qpair, but A's hardware TRACKER is left OUTSTANDING
- *      (modeled by g_stale_cb), not aborted yet.
- *   2. Op B runs: ensure_connected() reconnects the qpair. On the FIRST poll
- *      after reconnect the transport fires A's STALE aborted callback
- *      (SC_ABORTED_SQ_DELETION == 0x08, plus a bogus cdw0).
- *   3. B then submits and completes with its OWN success status.
+ *      disconnects the qpair; A's TRACKER is left OUTSTANDING (g_stale_cb),
+ *      scheduled to fire g_stale_default_delay polls later -- chosen to land
+ *      PAST the shim's bounded 8-pass reconnect drain and INSIDE op B's armed
+ *      poll window (NOT on the first poll after reconnect).
+ *   2. Op B runs: ensure_connected() reconnects and best-effort drains (the
+ *      orphan is NOT ready during the drain). B arms a NEW identity token and
+ *      submits.
+ *   3. During B's poll_to_completion(), A's orphan fires
+ *      (SC_ABORTED_SQ_DELETION == 0x08, bogus cdw0) carrying A's OLD token. The
+ *      next poll completes B with SUCCESS.
  *
- * Before the fix (no reconnect drain + io_complete unconditionally records),
- * A's stale callback lands in B's slot during B's poll_to_completion(): done is
- * set with sc=0x08, the loop exits, and B returns 8 instead of 0 (the exact
- * rc=8-instead-of-0 the reviewer saw). After the fix the stale callback is
- * drained on reconnect with no op armed and ignored by io_complete()
- * (expecting == false), so B returns its own correct result.
+ * Before the identity-token fix (single boolean `expecting`, which is TRUE while
+ * B is armed), A's orphan landing in B's armed window is recorded as B's result:
+ * done set with sc=0x08, loop exits, B returns 8 (the exact rc=8-instead-of-0
+ * the reviewer saw). The bounded drain does NOT help because the orphan fires
+ * after it. After the fix, A's orphan carries A's token != B's armed token, so
+ * io_complete() discards it and B returns its own correct result.
  */
 static void
 test_reconnect_stale_completion_interleave(void)
@@ -402,34 +458,40 @@ test_reconnect_stale_completion_interleave(void)
 	int rc;
 	uint32_t vlen = 0;
 
-	/* 1. Op A times out, leaving its tracker outstanding. */
+	/* 1. Op A times out, leaving its tracker outstanding, scheduled to fire
+	 * PAST the drain and inside B's armed poll window (delay 3: drain does one
+	 * pass -> 2 left; B poll#1 -> 1; B poll#2 -> fires orphan; B poll#3 ->
+	 * completes B). */
 	reset_state();
+	g_stale_default_delay = 3;
 	g_poll_mode = POLL_HANG;
 	rc = kv_host_shim_store(&g_sh, "A", 1, "v", 1);
 	CU_ASSERT(rc == -ETIMEDOUT);
 	CU_ASSERT(g_sh.qpair_failed == true);
 	CU_ASSERT(g_disconnect_calls == 1);
-	/* A's tracker is now a pending stale completion (not yet fired). */
+	/* A's tracker is now a pending orphan (not yet fired). */
 	CU_ASSERT(g_stale_cb != NULL);
+	CU_ASSERT(g_stale_fire_after == 3);
 
-	/* 2+3. Op B reconnects (draining A's stale aborted callback) then
-	 * completes with SUCCESS. B must return ITS OWN result, never A's 0x08. */
+	/* 2+3. Op B reconnects, arms a fresh token, and completes with SUCCESS.
+	 * A's orphan fires mid-B-poll but carries A's OLD token, so it is dropped.
+	 * B must return ITS OWN result, never A's 0x08. */
 	g_poll_mode = POLL_COMPLETE_SUCCESS;
 	g_reconnect_rc = 0;
 	MOCK_SET(spdk_get_ticks, 0);
 	rc = kv_host_shim_retrieve(&g_sh, "B", 1, (void *)0x4, 4, &vlen);
 
 	CU_ASSERT(g_reconnect_calls == 1);
-	CU_ASSERT(rc == 0);			/* fails (rc==8) on the un-drained code */
+	CU_ASSERT(rc == 0);			/* FAILS (rc==8) on the old boolean-gate code */
 	CU_ASSERT(g_sh.last_sc == SPDK_NVME_SC_SUCCESS);
 	CU_ASSERT(g_sh.qpair_failed == false);
 	/* B's own (zero) value length, not A's bogus 0xdeadbeef cdw0. */
 	CU_ASSERT(vlen == 0);
-	/* A's stale completion was consumed exactly once. */
+	/* A's orphan was consumed exactly once. */
 	CU_ASSERT(g_stale_cb == NULL);
 	/* B's own tracker is not left dangling: it completed and was consumed. */
 	CU_ASSERT(g_op_in_flight == false);
-	CU_ASSERT(g_sh.expecting == false);
+	CU_ASSERT(g_sh.armed_op_id == 0);
 
 	/* 4. A follow-on op C runs cleanly with no leftover stale state -- proves
 	 * B did not leave its tracker dangling to corrupt C. */
@@ -437,6 +499,58 @@ test_reconnect_stale_completion_interleave(void)
 	CU_ASSERT(rc == 0);
 	CU_ASSERT(g_reconnect_calls == 1);	/* qpair stayed healthy, no reconnect */
 	CU_ASSERT(g_sh.last_sc == SPDK_NVME_SC_SUCCESS);
+}
+
+/*
+ * Two-deep faithful interleave: A times out, then B times out, then C runs --
+ * and B's orphan lands inside C's armed poll window. Proves the identity token
+ * protects across MORE than one generation of orphan: C must complete clean even
+ * though B's orphan (B's token) fires while C (a third, distinct token) is armed.
+ *
+ * (A's orphan is fired during B's run so that exactly one orphan -- B's -- is
+ * pending when C runs, which is the case this test isolates.)
+ */
+static void
+test_reconnect_stale_completion_two_deep(void)
+{
+	int rc;
+
+	/* 1. Op A times out; its orphan is scheduled to fire on the first poll of
+	 * B's run (delay 0) so it is consumed during B and does not co-mingle with
+	 * B's own orphan below. */
+	reset_state();
+	g_stale_default_delay = 0;
+	g_poll_mode = POLL_HANG;
+	rc = kv_host_shim_store(&g_sh, "A", 1, "v", 1);
+	CU_ASSERT(rc == -ETIMEDOUT);
+	CU_ASSERT(g_stale_cb != NULL);
+
+	/* 2. Op B also times out. ensure_connected() reconnects (consuming A's
+	 * orphan during the drain), B arms+submits, hangs, times out. B's tracker
+	 * is now the outstanding orphan, scheduled to fire PAST C's drain and
+	 * inside C's armed poll window. */
+	g_stale_default_delay = 3;
+	g_poll_mode = POLL_HANG;
+	MOCK_SET(spdk_get_ticks, 0);
+	rc = kv_host_shim_store(&g_sh, "B", 1, "v", 1);
+	CU_ASSERT(rc == -ETIMEDOUT);
+	CU_ASSERT(g_reconnect_calls == 1);	/* reconnected once, before B */
+	CU_ASSERT(g_sh.qpair_failed == true);
+	/* B's tracker is the pending orphan (A's was consumed during B's drain). */
+	CU_ASSERT(g_stale_cb != NULL);
+	CU_ASSERT(g_stale_fire_after == 3);
+
+	/* 3. Op C reconnects, arms a THIRD distinct token, and completes SUCCESS.
+	 * B's orphan fires mid-C-poll carrying B's OLD token and is dropped. */
+	g_poll_mode = POLL_COMPLETE_SUCCESS;
+	MOCK_SET(spdk_get_ticks, 0);
+	rc = kv_host_shim_exist(&g_sh, "C", 1);
+	CU_ASSERT(rc == 0);			/* clean, not B's 0x08 */
+	CU_ASSERT(g_reconnect_calls == 2);	/* reconnected again, before C */
+	CU_ASSERT(g_sh.last_sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_sh.qpair_failed == false);
+	CU_ASSERT(g_stale_cb == NULL);
+	CU_ASSERT(g_sh.armed_op_id == 0);
 }
 
 int
@@ -454,6 +568,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_op_transport_failure);
 	CU_ADD_TEST(suite, test_reconnect_after_failure);
 	CU_ADD_TEST(suite, test_reconnect_stale_completion_interleave);
+	CU_ADD_TEST(suite, test_reconnect_stale_completion_two_deep);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

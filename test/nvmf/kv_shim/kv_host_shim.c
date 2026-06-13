@@ -18,6 +18,41 @@
 
 #include "kv_host_shim.h"
 
+/*
+ * Size of the per-op identity-token context ring (see struct kv_host_shim).
+ *
+ * The shim is strictly synchronous: at most one op is armed at a time, and an
+ * orphaned tracker from a timed-out/failed op is at most ONE generation old (it
+ * fires during the immediately following op's poll). A ring of this many
+ * slots therefore guarantees an orphan's slot is not reused (its stored op_id
+ * not overwritten) for far longer than any orphan can survive, so a late orphan
+ * callback always reads back its OWN (stale) op_id and is rejected. Must be a
+ * power of two so the index masks cheaply.
+ */
+#define KV_HOST_SHIM_OP_RING 64u
+
+struct kv_host_shim;
+
+/*
+ * Per-op identity-token context. One of these is handed to the transport as the
+ * completion cb_arg for each submitted op. It carries a back-pointer to the
+ * shim and the op's unique monotonically-increasing token (op_id).
+ *
+ * LIFETIME: these contexts live in a fixed ring embedded in struct kv_host_shim
+ * (op_ctx[]). They are NEVER freed individually -- only when the whole shim is
+ * freed in kv_host_shim_close(). A late orphan callback can therefore fire
+ * arbitrarily later (even after the op that submitted it has returned) and STILL
+ * safely dereference its context: the memory outlives the orphan because it is
+ * owned by the shim, and the slot's op_id is not overwritten until the ring
+ * wraps KV_HOST_SHIM_OP_RING ops later (which an at-most-one-generation-old
+ * orphan never reaches). So io_complete() never touches freed memory and never
+ * reads a slot whose op_id has been recycled out from under the orphan.
+ */
+struct kv_op_ctx {
+	struct kv_host_shim	*sh;
+	uint64_t		op_id;
+};
+
 struct kv_host_shim {
 	struct spdk_nvme_ctrlr	*ctrlr;
 	struct spdk_nvme_ns	*ns;
@@ -34,25 +69,71 @@ struct kv_host_shim {
 	 */
 	bool			qpair_failed;
 	/*
-	 * Per-op completion state.
+	 * Per-op completion state with a PER-OP IDENTITY TOKEN.
 	 *
-	 * `expecting` gates io_complete(): it records a completion into the slot
-	 * ONLY while an op is armed (expecting == true), and clears it as soon as
-	 * the matching completion arrives. This is what makes a STALE completion
-	 * race-safe on the PCIe/vfio-user transport: when an op times out we
-	 * disconnect the qpair, but its hardware tracker is still outstanding and
-	 * is only aborted LATER, on reconnect, inside the next
-	 * spdk_nvme_qpair_process_completions(). That aborted callback fires with
-	 * expecting == false (we drain it on reconnect, and the next op does not
-	 * arm until after the drain), so it is discarded instead of being counted
-	 * as the next op's result.
+	 * The transport (vfio-user, which reuses the PCIe qpair ops) does NOT
+	 * abort an outstanding HARDWARE tracker on disconnect or on reconnect for
+	 * this transport: the CONNECTED->ENABLING tracker abort in nvme_qpair.c is
+	 * gated on trtype == PCIE and is skipped for vfio-user. So when an op times
+	 * out or transport-fails, its tracker stays outstanding and its callback
+	 * (an orphan) can fire at an UNBOUNDED later poll -- including DURING the
+	 * NEXT op's poll_to_completion(). A bounded drain on reconnect cannot
+	 * guarantee consuming it.
+	 *
+	 * To make that orphan harmless we give every op a unique token:
+	 *   - next_op_id is a monotonically increasing counter; each op takes the
+	 *     next value as its token before submitting.
+	 *   - armed_op_id holds the token of the op currently being polled.
+	 *   - the op's completion cb_arg is a struct kv_op_ctx (from op_ctx[])
+	 *     carrying that token.
+	 * io_complete() records a completion ONLY when ctx->op_id == armed_op_id;
+	 * a stale orphan carries an OLD token != armed_op_id and is DISCARDED. So
+	 * an orphan from op A can never be recorded as op B's result, even if it
+	 * fires in the middle of B's armed poll window.
 	 */
-	volatile bool		expecting;
+	uint64_t		next_op_id;
+	volatile uint64_t	armed_op_id;
+	struct kv_op_ctx	op_ctx[KV_HOST_SHIM_OP_RING];
 	volatile bool		done;
 	volatile uint8_t	last_sct;
 	volatile uint8_t	last_sc;
 	volatile uint32_t	last_cdw0;
 };
+
+/*
+ * Arm the next op: allocate a fresh identity token, stamp it into the ring slot
+ * that will be used as this op's cb_arg, and publish it as the armed token.
+ * Returns the per-op context to hand to the transport as cb_arg.
+ *
+ * The slot index round-robins over the ring. Because the shim is synchronous,
+ * the slot being (re)stamped here cannot still hold a live orphan (that would
+ * require an orphan to survive KV_HOST_SHIM_OP_RING ops, which cannot happen).
+ */
+static struct kv_op_ctx *
+arm_op(struct kv_host_shim *sh)
+{
+	uint64_t id = ++sh->next_op_id;
+	struct kv_op_ctx *ctx = &sh->op_ctx[id & (KV_HOST_SHIM_OP_RING - 1)];
+
+	ctx->sh = sh;
+	ctx->op_id = id;
+	sh->done = false;
+	sh->armed_op_id = id;
+	return ctx;
+}
+
+/*
+ * Disarm the armed op: no completion will be accepted into the status slot until
+ * the next arm_op(). Setting armed_op_id to 0 (never a valid token, since
+ * next_op_id is pre-incremented so the first token is 1) means io_complete()
+ * rejects EVERY callback -- including a stale orphan that fires after a timeout
+ * or transport failure. Idempotent and cheap.
+ */
+static void
+disarm_op(struct kv_host_shim *sh)
+{
+	sh->armed_op_id = 0;
+}
 
 static bool
 probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
@@ -73,19 +154,28 @@ attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 static void
 io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 {
-	struct kv_host_shim *sh = arg;
+	struct kv_op_ctx *ctx = arg;
+	struct kv_host_shim *sh = ctx->sh;
 
 	/*
-	 * Only record a completion that belongs to the currently armed op. A
-	 * stale callback from a timed-out/aborted prior op (its hardware tracker
-	 * is flushed on reconnect, see ensure_connected()) fires with
-	 * expecting == false and is discarded here, so it cannot corrupt the
-	 * status slot of the next op.
+	 * Identity-token gate. Record a completion ONLY when it belongs to the
+	 * currently armed op (ctx->op_id == armed_op_id). A stale orphan from a
+	 * timed-out/transport-failed prior op carries that op's OLD token, which
+	 * no longer matches armed_op_id (the timeout/failure path disarmed it, and
+	 * a later op armed a new token), so it is DISCARDED here. This is what
+	 * closes the vfio-user abort-on-reconnect window: the orphan's tracker is
+	 * NOT aborted by disconnect/reconnect for this transport, so its callback
+	 * may fire at an arbitrary later poll -- even in the middle of the next
+	 * op's armed poll window -- yet it can never be mistaken for that op's
+	 * result because its token differs.
+	 *
+	 * ctx points into the shim's op_ctx[] ring, which outlives every orphan
+	 * (freed only at kv_host_shim_close()), so this dereference is always safe.
 	 */
-	if (!sh->expecting) {
+	if (ctx->op_id != sh->armed_op_id) {
 		return;
 	}
-	sh->expecting = false;
+	sh->armed_op_id = 0;	/* consume: the matching completion arrived */
 	sh->last_sct = cpl->status.sct;
 	sh->last_sc = cpl->status.sc;
 	sh->last_cdw0 = cpl->cdw0;
@@ -93,15 +183,16 @@ io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 }
 
 /*
- * Drain any completions sitting on the qpair WITHOUT an op armed (expecting ==
- * false), so io_complete() discards them. Used after a reconnect to consume the
- * stale aborted trackers from a prior timed-out/failed op before the next op
- * arms. Bounded: a fixed number of poll passes (the abort drain settles in the
- * first pass; the extra passes are cheap insurance) so this can never hang.
+ * Best-effort backstop drain. Pump a bounded number of poll passes with NO op
+ * armed (armed_op_id == 0), so io_complete() discards anything that fires.
  *
- * A transport failure here (-ENXIO) means the reconnected qpair is already dead
- * again; we stop draining and let ensure_connected() re-flag the qpair so the
- * caller fails fast rather than submitting onto a dead qpair.
+ * This is NOT the primary protection and CANNOT be: on vfio-user the orphaned
+ * tracker is not aborted by reconnect, so its callback may fire at an UNBOUNDED
+ * later poll -- past any fixed number of passes here, and even during the next
+ * op's armed poll. The identity-token gate in io_complete() is what actually
+ * makes such an orphan harmless. This drain just opportunistically consumes any
+ * orphan that happens to be ready right now, keeping the qpair tidy; the bound
+ * means it can never hang.
  */
 static void
 drain_stale_completions(struct kv_host_shim *sh)
@@ -146,15 +237,17 @@ drain_stale_completions(struct kv_host_shim *sh)
  * On any error path the qpair is disconnected and the shim is flagged for
  * reconnect (see ensure_connected()).
  *
- * IMPORTANT (PCIe/vfio-user semantics): disconnecting the qpair does NOT abort
- * the outstanding HARDWARE tracker for a healthy in-flight op -- it only flushes
- * software-QUEUED requests (nvme_qpair_abort_all_queued_reqs). The outstanding
- * tracker is aborted only LATER, on RECONNECT, when the next
- * spdk_nvme_qpair_process_completions() drives the qpair CONNECTED->ENABLING and
- * fires the tracker callback with SC_ABORTED_SQ_DELETION. That stale callback is
- * made harmless two ways: (1) it is drained on reconnect while no op is armed
- * (drain_stale_completions()), and (2) io_complete() ignores any completion that
- * arrives with expecting == false. So a late completion from a timed-out op can
+ * IMPORTANT (vfio-user semantics): this transport does NOT abort an outstanding
+ * HARDWARE tracker on disconnect OR on reconnect. disconnect only flushes
+ * software-QUEUED requests; and the CONNECTED->ENABLING tracker abort is gated
+ * on trtype == PCIE in nvme_qpair.c, so it is SKIPPED for vfio-user. The
+ * outstanding tracker is aborted only on qpair DELETE/free or a full ctrlr
+ * reset. So a timed-out/failed op's callback (an orphan) can fire at an
+ * UNBOUNDED later poll -- including during the NEXT op's poll below. We make
+ * that orphan harmless with the PER-OP IDENTITY TOKEN: on every error path here
+ * we disarm the op (armed_op_id = 0) so the orphan no longer matches, and the
+ * next op arms a fresh token. io_complete() then records only the token-matching
+ * completion, dropping the orphan. So a late completion from a timed-out op can
  * never be mistaken for, or corrupt the status of, the NEXT op.
  */
 static int
@@ -171,9 +264,10 @@ poll_to_completion(struct kv_host_shim *sh)
 		if (n < 0) {
 			/* Transport-level failure (e.g. -ENXIO: qpair failed). The
 			 * target is gone; disconnect and flag for reconnect. The
-			 * outstanding tracker (if any) is flushed on reconnect and
-			 * ignored by io_complete() (expecting cleared below). */
-			sh->expecting = false;
+			 * outstanding tracker (if any) is NOT aborted by this
+			 * transport, so its orphan callback may fire later; disarm
+			 * the op (token cleared) so io_complete() drops it. */
+			disarm_op(sh);
 			spdk_nvme_ctrlr_disconnect_io_qpair(sh->qpair);
 			sh->qpair_failed = true;
 			return n;
@@ -181,10 +275,11 @@ poll_to_completion(struct kv_host_shim *sh)
 		if (!sh->done && spdk_get_ticks() >= deadline) {
 			/* Bounded backstop: the op never completed (target hung
 			 * but not yet transport-failed). Disconnect and flag for
-			 * reconnect. The op's hardware tracker is still outstanding;
-			 * it is flushed on reconnect and discarded by io_complete()
-			 * because we clear `expecting` here. */
-			sh->expecting = false;
+			 * reconnect. The op's hardware tracker is still outstanding
+			 * and is NOT aborted by this transport; its orphan callback
+			 * may fire at an arbitrary later poll. Disarm the op (token
+			 * cleared) so io_complete() discards that orphan. */
+			disarm_op(sh);
 			spdk_nvme_ctrlr_disconnect_io_qpair(sh->qpair);
 			sh->qpair_failed = true;
 			return -ETIMEDOUT;
@@ -199,13 +294,13 @@ poll_to_completion(struct kv_host_shim *sh)
  * usable, or a negated errno if it could not be reconnected (the target is
  * still down) so the op fails fast rather than submitting onto a dead qpair.
  *
- * After a SUCCESSFUL reconnect, the prior op's outstanding hardware tracker is
- * aborted by the transport (it fires SC_ABORTED_SQ_DELETION on the next
- * process_completions). We pump those stale callbacks here, with no op armed
- * (expecting == false), so io_complete() discards them. This MUST happen before
- * the caller arms and submits the next op, otherwise the first
- * process_completions in poll_to_completion() would fire the stale callback into
- * the new op's slot and return the wrong status.
+ * NOTE on the prior op's orphan: on vfio-user the prior op's outstanding tracker
+ * is NOT aborted by reconnect (the CONNECTED->ENABLING abort is PCIe-only), so
+ * its orphan callback may still fire later -- possibly during the next op's
+ * poll. The best-effort drain below opportunistically consumes any orphan that
+ * is ready right now (with no op armed, armed_op_id == 0, so io_complete()
+ * discards it), but it is NOT relied upon: the per-op identity token is what
+ * guarantees a late orphan can never be recorded as the next op's result.
  */
 static int
 ensure_connected(struct kv_host_shim *sh)
@@ -219,8 +314,8 @@ ensure_connected(struct kv_host_shim *sh)
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;
 	}
-	/* Not expecting a completion: drain the aborted prior tracker(s). */
-	sh->expecting = false;
+	/* No op armed: best-effort consume any orphan that is ready right now. */
+	disarm_op(sh);
 	drain_stale_completions(sh);
 	sh->qpair_failed = false;
 	return 0;
@@ -400,6 +495,7 @@ int
 kv_host_shim_store(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 		   const void *value, uint32_t value_len)
 {
+	struct kv_op_ctx *ctx;
 	int rc;
 
 	if (sh == NULL) {
@@ -409,14 +505,13 @@ kv_host_shim_store(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 	if (rc != 0) {
 		return rc;
 	}
-	/* Arm the completion slot: done clears, expecting opens so the matching
-	 * callback (and only it) is recorded by io_complete(). */
-	sh->done = false;
-	sh->expecting = true;
+	/* Arm a fresh identity token; io_complete() records only the completion
+	 * carrying this token (ctx), dropping any stale orphan from a prior op. */
+	ctx = arm_op(sh);
 	rc = spdk_nvme_kv_store(sh->ns, sh->qpair, key, key_len, value, value_len,
-				io_complete, sh, 0);
+				io_complete, ctx, 0);
 	if (rc != 0) {
-		sh->expecting = false;	/* no tracker created; disarm the slot */
+		disarm_op(sh);	/* no tracker created; drop the armed token */
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
@@ -430,6 +525,7 @@ int
 kv_host_shim_retrieve(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 		      void *value, uint32_t buf_len, uint32_t *value_len_out)
 {
+	struct kv_op_ctx *ctx;
 	int rc;
 
 	if (sh == NULL) {
@@ -439,14 +535,13 @@ kv_host_shim_retrieve(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 	if (rc != 0) {
 		return rc;
 	}
-	/* Arm the completion slot: done clears, expecting opens so the matching
-	 * callback (and only it) is recorded by io_complete(). */
-	sh->done = false;
-	sh->expecting = true;
+	/* Arm a fresh identity token; io_complete() records only the completion
+	 * carrying this token (ctx), dropping any stale orphan from a prior op. */
+	ctx = arm_op(sh);
 	rc = spdk_nvme_kv_retrieve(sh->ns, sh->qpair, key, key_len, value, buf_len,
-				   io_complete, sh, 0);
+				   io_complete, ctx, 0);
 	if (rc != 0) {
-		sh->expecting = false;	/* no tracker created; disarm the slot */
+		disarm_op(sh);	/* no tracker created; drop the armed token */
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
@@ -464,6 +559,7 @@ kv_host_shim_retrieve(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 int
 kv_host_shim_exist(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 {
+	struct kv_op_ctx *ctx;
 	int rc;
 
 	if (sh == NULL) {
@@ -473,13 +569,12 @@ kv_host_shim_exist(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 	if (rc != 0) {
 		return rc;
 	}
-	/* Arm the completion slot: done clears, expecting opens so the matching
-	 * callback (and only it) is recorded by io_complete(). */
-	sh->done = false;
-	sh->expecting = true;
-	rc = spdk_nvme_kv_exist(sh->ns, sh->qpair, key, key_len, io_complete, sh);
+	/* Arm a fresh identity token; io_complete() records only the completion
+	 * carrying this token (ctx), dropping any stale orphan from a prior op. */
+	ctx = arm_op(sh);
+	rc = spdk_nvme_kv_exist(sh->ns, sh->qpair, key, key_len, io_complete, ctx);
 	if (rc != 0) {
-		sh->expecting = false;	/* no tracker created; disarm the slot */
+		disarm_op(sh);	/* no tracker created; drop the armed token */
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
@@ -492,6 +587,7 @@ kv_host_shim_exist(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 int
 kv_host_shim_delete(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 {
+	struct kv_op_ctx *ctx;
 	int rc;
 
 	if (sh == NULL) {
@@ -501,13 +597,12 @@ kv_host_shim_delete(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 	if (rc != 0) {
 		return rc;
 	}
-	/* Arm the completion slot: done clears, expecting opens so the matching
-	 * callback (and only it) is recorded by io_complete(). */
-	sh->done = false;
-	sh->expecting = true;
-	rc = spdk_nvme_kv_delete(sh->ns, sh->qpair, key, key_len, io_complete, sh);
+	/* Arm a fresh identity token; io_complete() records only the completion
+	 * carrying this token (ctx), dropping any stale orphan from a prior op. */
+	ctx = arm_op(sh);
+	rc = spdk_nvme_kv_delete(sh->ns, sh->qpair, key, key_len, io_complete, ctx);
 	if (rc != 0) {
-		sh->expecting = false;	/* no tracker created; disarm the slot */
+		disarm_op(sh);	/* no tracker created; drop the armed token */
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
