@@ -33,7 +33,21 @@ struct kv_host_shim {
 	 * before submitting, or fails fast if the target is still down.
 	 */
 	bool			qpair_failed;
-	/* Per-op completion state. */
+	/*
+	 * Per-op completion state.
+	 *
+	 * `expecting` gates io_complete(): it records a completion into the slot
+	 * ONLY while an op is armed (expecting == true), and clears it as soon as
+	 * the matching completion arrives. This is what makes a STALE completion
+	 * race-safe on the PCIe/vfio-user transport: when an op times out we
+	 * disconnect the qpair, but its hardware tracker is still outstanding and
+	 * is only aborted LATER, on reconnect, inside the next
+	 * spdk_nvme_qpair_process_completions(). That aborted callback fires with
+	 * expecting == false (we drain it on reconnect, and the next op does not
+	 * arm until after the drain), so it is discarded instead of being counted
+	 * as the next op's result.
+	 */
+	volatile bool		expecting;
 	volatile bool		done;
 	volatile uint8_t	last_sct;
 	volatile uint8_t	last_sc;
@@ -61,10 +75,46 @@ io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 {
 	struct kv_host_shim *sh = arg;
 
+	/*
+	 * Only record a completion that belongs to the currently armed op. A
+	 * stale callback from a timed-out/aborted prior op (its hardware tracker
+	 * is flushed on reconnect, see ensure_connected()) fires with
+	 * expecting == false and is discarded here, so it cannot corrupt the
+	 * status slot of the next op.
+	 */
+	if (!sh->expecting) {
+		return;
+	}
+	sh->expecting = false;
 	sh->last_sct = cpl->status.sct;
 	sh->last_sc = cpl->status.sc;
 	sh->last_cdw0 = cpl->cdw0;
 	sh->done = true;
+}
+
+/*
+ * Drain any completions sitting on the qpair WITHOUT an op armed (expecting ==
+ * false), so io_complete() discards them. Used after a reconnect to consume the
+ * stale aborted trackers from a prior timed-out/failed op before the next op
+ * arms. Bounded: a fixed number of poll passes (the abort drain settles in the
+ * first pass; the extra passes are cheap insurance) so this can never hang.
+ *
+ * A transport failure here (-ENXIO) means the reconnected qpair is already dead
+ * again; we stop draining and let ensure_connected() re-flag the qpair so the
+ * caller fails fast rather than submitting onto a dead qpair.
+ */
+static void
+drain_stale_completions(struct kv_host_shim *sh)
+{
+	unsigned int pass;
+
+	for (pass = 0; pass < 8; pass++) {
+		int32_t n = spdk_nvme_qpair_process_completions(sh->qpair, 0);
+
+		if (n <= 0) {
+			break;
+		}
+	}
 }
 
 /*
@@ -93,12 +143,19 @@ io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
  *   -ENXIO     the qpair failed at the transport layer (dead/removed target)
  *   -ETIMEDOUT the command did not complete within KV_HOST_SHIM_OP_TIMEOUT_S
  *
- * On any error path the outstanding request is aborted by disconnecting the
- * qpair (which completes/cancels every in-flight command on it). This prevents
- * a late completion from later firing into io_complete() and corrupting the
- * status of the NEXT op, since the shim reuses a single in-flight slot. The
- * shim is flagged for reconnect so the next op transparently reconnects the
- * qpair (see ensure_connected()).
+ * On any error path the qpair is disconnected and the shim is flagged for
+ * reconnect (see ensure_connected()).
+ *
+ * IMPORTANT (PCIe/vfio-user semantics): disconnecting the qpair does NOT abort
+ * the outstanding HARDWARE tracker for a healthy in-flight op -- it only flushes
+ * software-QUEUED requests (nvme_qpair_abort_all_queued_reqs). The outstanding
+ * tracker is aborted only LATER, on RECONNECT, when the next
+ * spdk_nvme_qpair_process_completions() drives the qpair CONNECTED->ENABLING and
+ * fires the tracker callback with SC_ABORTED_SQ_DELETION. That stale callback is
+ * made harmless two ways: (1) it is drained on reconnect while no op is armed
+ * (drain_stale_completions()), and (2) io_complete() ignores any completion that
+ * arrives with expecting == false. So a late completion from a timed-out op can
+ * never be mistaken for, or corrupt the status of, the NEXT op.
  */
 static int
 poll_to_completion(struct kv_host_shim *sh)
@@ -113,16 +170,21 @@ poll_to_completion(struct kv_host_shim *sh)
 
 		if (n < 0) {
 			/* Transport-level failure (e.g. -ENXIO: qpair failed). The
-			 * target is gone; abort the op and report the error. */
+			 * target is gone; disconnect and flag for reconnect. The
+			 * outstanding tracker (if any) is flushed on reconnect and
+			 * ignored by io_complete() (expecting cleared below). */
+			sh->expecting = false;
 			spdk_nvme_ctrlr_disconnect_io_qpair(sh->qpair);
 			sh->qpair_failed = true;
 			return n;
 		}
 		if (!sh->done && spdk_get_ticks() >= deadline) {
 			/* Bounded backstop: the op never completed (target hung
-			 * but not yet transport-failed). Abort the outstanding
-			 * request by disconnecting the qpair so a late completion
-			 * cannot corrupt the next op. */
+			 * but not yet transport-failed). Disconnect and flag for
+			 * reconnect. The op's hardware tracker is still outstanding;
+			 * it is flushed on reconnect and discarded by io_complete()
+			 * because we clear `expecting` here. */
+			sh->expecting = false;
 			spdk_nvme_ctrlr_disconnect_io_qpair(sh->qpair);
 			sh->qpair_failed = true;
 			return -ETIMEDOUT;
@@ -136,6 +198,14 @@ poll_to_completion(struct kv_host_shim *sh)
  * disconnected it. Called before submitting each op. Returns 0 if the qpair is
  * usable, or a negated errno if it could not be reconnected (the target is
  * still down) so the op fails fast rather than submitting onto a dead qpair.
+ *
+ * After a SUCCESSFUL reconnect, the prior op's outstanding hardware tracker is
+ * aborted by the transport (it fires SC_ABORTED_SQ_DELETION on the next
+ * process_completions). We pump those stale callbacks here, with no op armed
+ * (expecting == false), so io_complete() discards them. This MUST happen before
+ * the caller arms and submits the next op, otherwise the first
+ * process_completions in poll_to_completion() would fire the stale callback into
+ * the new op's slot and return the wrong status.
  */
 static int
 ensure_connected(struct kv_host_shim *sh)
@@ -149,6 +219,9 @@ ensure_connected(struct kv_host_shim *sh)
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;
 	}
+	/* Not expecting a completion: drain the aborted prior tracker(s). */
+	sh->expecting = false;
+	drain_stale_completions(sh);
 	sh->qpair_failed = false;
 	return 0;
 }
@@ -336,10 +409,14 @@ kv_host_shim_store(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 	if (rc != 0) {
 		return rc;
 	}
+	/* Arm the completion slot: done clears, expecting opens so the matching
+	 * callback (and only it) is recorded by io_complete(). */
 	sh->done = false;
+	sh->expecting = true;
 	rc = spdk_nvme_kv_store(sh->ns, sh->qpair, key, key_len, value, value_len,
 				io_complete, sh, 0);
 	if (rc != 0) {
+		sh->expecting = false;	/* no tracker created; disarm the slot */
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
@@ -362,10 +439,14 @@ kv_host_shim_retrieve(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 	if (rc != 0) {
 		return rc;
 	}
+	/* Arm the completion slot: done clears, expecting opens so the matching
+	 * callback (and only it) is recorded by io_complete(). */
 	sh->done = false;
+	sh->expecting = true;
 	rc = spdk_nvme_kv_retrieve(sh->ns, sh->qpair, key, key_len, value, buf_len,
 				   io_complete, sh, 0);
 	if (rc != 0) {
+		sh->expecting = false;	/* no tracker created; disarm the slot */
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
@@ -392,9 +473,13 @@ kv_host_shim_exist(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 	if (rc != 0) {
 		return rc;
 	}
+	/* Arm the completion slot: done clears, expecting opens so the matching
+	 * callback (and only it) is recorded by io_complete(). */
 	sh->done = false;
+	sh->expecting = true;
 	rc = spdk_nvme_kv_exist(sh->ns, sh->qpair, key, key_len, io_complete, sh);
 	if (rc != 0) {
+		sh->expecting = false;	/* no tracker created; disarm the slot */
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
@@ -416,9 +501,13 @@ kv_host_shim_delete(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 	if (rc != 0) {
 		return rc;
 	}
+	/* Arm the completion slot: done clears, expecting opens so the matching
+	 * callback (and only it) is recorded by io_complete(). */
 	sh->done = false;
+	sh->expecting = true;
 	rc = spdk_nvme_kv_delete(sh->ns, sh->qpair, key, key_len, io_complete, sh);
 	if (rc != 0) {
+		sh->expecting = false;	/* no tracker created; disarm the slot */
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);

@@ -21,6 +21,15 @@
  *                                  disconnected.
  *   - test_reconnect_after_failure: a subsequent op transparently reconnects
  *                                  the disconnected qpair, then succeeds.
+ *   - test_reconnect_stale_completion_interleave: the regression for the
+ *                                  PCIe/vfio-user abort-on-reconnect race --
+ *                                  op A times out (its hardware tracker is left
+ *                                  outstanding), op B reconnects and on the
+ *                                  first poll the transport fires A's STALE
+ *                                  aborted callback; B must still return its OWN
+ *                                  result, not A's ABORTED (0x08) status. This
+ *                                  test FAILS on the un-drained code (returns 8)
+ *                                  and PASSES after the drain/expecting fix.
  *
  * The mocked clock (spdk_get_ticks / spdk_get_ticks_hz from test_env.c) lets
  * the timeout test jump past the deadline instantly, so the suite never waits
@@ -64,10 +73,51 @@ static int g_disconnect_calls;
 static int g_reconnect_calls;
 static int g_reconnect_rc;
 
+/* Captured submit callback for the currently/last submitted op (see
+ * ut_capture_submit). Declared here so the disconnect stub can snapshot it as
+ * the stale outstanding tracker. */
+static spdk_nvme_cmd_cb g_saved_cb;
+static void *g_saved_cb_arg;
+
+/*
+ * Faithful model of the PCIe/vfio-user abort-on-reconnect semantics.
+ *
+ * On PCIe/vfio-user, spdk_nvme_ctrlr_disconnect_io_qpair() does NOT abort a
+ * healthy in-flight op's HARDWARE tracker -- it only flushes software-queued
+ * reqs. The outstanding tracker is aborted LATER, on reconnect, when the next
+ * spdk_nvme_qpair_process_completions() fires its callback with
+ * SC_ABORTED_SQ_DELETION (0x08).
+ *
+ * We model that here: when the captured op is still "in flight" (its callback
+ * was captured and not yet completed) and we disconnect, the tracker becomes a
+ * pending STALE completion. After a reconnect, the FIRST process_completions
+ * fires that stale callback (into the same io_complete/cb_arg the shim
+ * registered) before doing anything else. This is exactly the interleaving that
+ * corrupted the next op's status before the fix.
+ */
+static spdk_nvme_cmd_cb g_stale_cb;	/* aborted tracker pending to fire */
+static void *g_stale_cb_arg;
+static bool g_op_in_flight;		/* a submitted op has not yet completed */
+
 void
 spdk_nvme_ctrlr_disconnect_io_qpair(struct spdk_nvme_qpair *qpair)
 {
 	g_disconnect_calls++;
+	/*
+	 * If an op was in flight when we disconnected, its hardware tracker is
+	 * left OUTSTANDING (not aborted here) -- it becomes a stale completion
+	 * the transport will fire on reconnect.
+	 */
+	if (g_op_in_flight) {
+		g_stale_cb = g_saved_cb;
+		g_stale_cb_arg = g_saved_cb_arg;
+		/* The tracker moves from "in flight" to "stale, pending abort on
+		 * reconnect". Clear the saved cb so it is fired exactly once, as
+		 * the stale aborted completion, not again as a fresh success. */
+		g_saved_cb = NULL;
+		g_saved_cb_arg = NULL;
+		g_op_in_flight = false;
+	}
 }
 
 int
@@ -88,8 +138,6 @@ enum poll_mode {
 };
 
 static enum poll_mode g_poll_mode;
-static spdk_nvme_cmd_cb g_saved_cb;
-static void *g_saved_cb_arg;
 static int g_submit_rc;
 
 static int
@@ -97,6 +145,9 @@ ut_capture_submit(spdk_nvme_cmd_cb cb_fn, void *cb_arg)
 {
 	g_saved_cb = cb_fn;
 	g_saved_cb_arg = cb_arg;
+	if (g_submit_rc == 0) {
+		g_op_in_flight = true;	/* a tracker is now outstanding */
+	}
 	return g_submit_rc;
 }
 
@@ -140,6 +191,24 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 {
 	struct spdk_nvme_cpl cpl = {};
 
+	/*
+	 * Model the transport's abort-on-reconnect drain: a stale tracker left
+	 * outstanding by a disconnected op fires its aborted callback on the
+	 * FIRST poll, ahead of any fresh op's completion. This is the
+	 * interleaving that corrupted the next op's status before the fix.
+	 */
+	if (g_stale_cb != NULL) {
+		struct spdk_nvme_cpl acpl = {};
+
+		acpl.status.sct = SPDK_NVME_SCT_GENERIC;
+		acpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;	/* 0x08 */
+		acpl.cdw0 = 0xdeadbeef;	/* a wrong cdw0, to catch slot corruption */
+		g_stale_cb(g_stale_cb_arg, &acpl);
+		g_stale_cb = NULL;
+		g_stale_cb_arg = NULL;
+		return 1;
+	}
+
 	switch (g_poll_mode) {
 	case POLL_COMPLETE_SUCCESS:
 		cpl.status.sct = SPDK_NVME_SCT_GENERIC;
@@ -147,8 +216,15 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 		cpl.cdw0 = 0;
 		if (g_saved_cb != NULL) {
 			g_saved_cb(g_saved_cb_arg, &cpl);
+			/* Op completed; its tracker is consumed. Clear the saved cb
+			 * so a subsequent poll (e.g. the reconnect drain loop) finds
+			 * nothing pending and returns 0, matching a real qpair. */
+			g_saved_cb = NULL;
+			g_saved_cb_arg = NULL;
+			g_op_in_flight = false;
+			return 1;
 		}
-		return 1;
+		return 0;
 	case POLL_HANG:
 		/* Simulate a target that accepted the command but will never
 		 * complete it (hung, not yet transport-failed). Advance the
@@ -178,6 +254,9 @@ reset_state(void)
 	g_reconnect_rc = 0;
 	g_saved_cb = NULL;
 	g_saved_cb_arg = NULL;
+	g_stale_cb = NULL;
+	g_stale_cb_arg = NULL;
+	g_op_in_flight = false;
 	g_submit_rc = 0;
 	g_poll_mode = POLL_COMPLETE_SUCCESS;
 	MOCK_SET(spdk_get_ticks, 0);
@@ -298,6 +377,68 @@ test_reconnect_after_failure(void)
 	CU_ASSERT(g_saved_cb == NULL);	/* never submitted */
 }
 
+/*
+ * Regression for the PCIe/vfio-user abort-on-reconnect race.
+ *
+ * Walk the exact interleaving the reviewer's repro hit:
+ *   1. Op A is submitted and HANGS -> times out (-ETIMEDOUT). The shim
+ *      disconnects the qpair, but A's hardware TRACKER is left OUTSTANDING
+ *      (modeled by g_stale_cb), not aborted yet.
+ *   2. Op B runs: ensure_connected() reconnects the qpair. On the FIRST poll
+ *      after reconnect the transport fires A's STALE aborted callback
+ *      (SC_ABORTED_SQ_DELETION == 0x08, plus a bogus cdw0).
+ *   3. B then submits and completes with its OWN success status.
+ *
+ * Before the fix (no reconnect drain + io_complete unconditionally records),
+ * A's stale callback lands in B's slot during B's poll_to_completion(): done is
+ * set with sc=0x08, the loop exits, and B returns 8 instead of 0 (the exact
+ * rc=8-instead-of-0 the reviewer saw). After the fix the stale callback is
+ * drained on reconnect with no op armed and ignored by io_complete()
+ * (expecting == false), so B returns its own correct result.
+ */
+static void
+test_reconnect_stale_completion_interleave(void)
+{
+	int rc;
+	uint32_t vlen = 0;
+
+	/* 1. Op A times out, leaving its tracker outstanding. */
+	reset_state();
+	g_poll_mode = POLL_HANG;
+	rc = kv_host_shim_store(&g_sh, "A", 1, "v", 1);
+	CU_ASSERT(rc == -ETIMEDOUT);
+	CU_ASSERT(g_sh.qpair_failed == true);
+	CU_ASSERT(g_disconnect_calls == 1);
+	/* A's tracker is now a pending stale completion (not yet fired). */
+	CU_ASSERT(g_stale_cb != NULL);
+
+	/* 2+3. Op B reconnects (draining A's stale aborted callback) then
+	 * completes with SUCCESS. B must return ITS OWN result, never A's 0x08. */
+	g_poll_mode = POLL_COMPLETE_SUCCESS;
+	g_reconnect_rc = 0;
+	MOCK_SET(spdk_get_ticks, 0);
+	rc = kv_host_shim_retrieve(&g_sh, "B", 1, (void *)0x4, 4, &vlen);
+
+	CU_ASSERT(g_reconnect_calls == 1);
+	CU_ASSERT(rc == 0);			/* fails (rc==8) on the un-drained code */
+	CU_ASSERT(g_sh.last_sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_sh.qpair_failed == false);
+	/* B's own (zero) value length, not A's bogus 0xdeadbeef cdw0. */
+	CU_ASSERT(vlen == 0);
+	/* A's stale completion was consumed exactly once. */
+	CU_ASSERT(g_stale_cb == NULL);
+	/* B's own tracker is not left dangling: it completed and was consumed. */
+	CU_ASSERT(g_op_in_flight == false);
+	CU_ASSERT(g_sh.expecting == false);
+
+	/* 4. A follow-on op C runs cleanly with no leftover stale state -- proves
+	 * B did not leave its tracker dangling to corrupt C. */
+	rc = kv_host_shim_exist(&g_sh, "C", 1);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_reconnect_calls == 1);	/* qpair stayed healthy, no reconnect */
+	CU_ASSERT(g_sh.last_sc == SPDK_NVME_SC_SUCCESS);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -312,6 +453,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_op_timeout);
 	CU_ADD_TEST(suite, test_op_transport_failure);
 	CU_ADD_TEST(suite, test_reconnect_after_failure);
+	CU_ADD_TEST(suite, test_reconnect_stale_completion_interleave);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();
