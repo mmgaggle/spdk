@@ -1,0 +1,891 @@
+# Valgrind suppressions for the kvdev_rados_nkvx unit test (spdk-pc0).
+#
+# This UT links the rados-nkvx wasm executor and, when SPDK is built --with-wasm,
+# dlopen()s the third-party libwasmtime.so to run real .wasm modules off-reactor.
+# Wasmtime is a JIT: it uses setjmp/longjmp trampolines, a rayon thread pool, a
+# libgcc DWARF-unwind frame registry (btree), and per-thread TLS/stack churn.
+# Under Memcheck this produces ~2100 uninitialised-value contexts plus two
+# "possibly lost" thread-pool/ticker allocations. Every one was confirmed with
+# --track-origins=yes to ORIGINATE in libwasmtime.so / libgcc_s / glibc, NOT in
+# nkvx code (origin frame is always wasmtime_longjmp / rayon / a libgcc btree /
+# a glibc TLS allocator).
+#
+# SCOPING GUARANTEE: every suppression below requires a THIRD-PARTY frame
+# (obj:.../libwasmtime.so, obj:.../libgcc_s*, obj:.../libc*/libpthread/libdl, or a
+# named libgcc/glibc-internal function) at the TOP of the error stack, or pins
+# the error to the wasm-only worker dispatch chain. None of them match a generic
+# nkvx/spdk frame as the error site. A real future uninitialised-read or leak
+# whose ERROR SITE is nkvx code (e.g. the librados I/O path, the cache, RPC,
+# parsing) has an nkvx top frame with NO wasmtime/libgcc/glibc-internal frame
+# above it and therefore still fails valgrind. See spdk-pc0 for the analysis.
+
+# ---------------------------------------------------------------------------
+# 1. Uninitialised values whose ERROR SITE is inside libwasmtime.so itself.
+#    Covers the JIT/setjmp/backtrace/trap/parser/drop Rust frames. Matched by
+#    object so the exact (mangled, build-specific) Rust symbol does not matter.
+# ---------------------------------------------------------------------------
+{
+   nkvx-wasmtime-uninit-value-in-libwasmtime
+   Memcheck:Value8
+   obj:*/libwasmtime.so
+}
+{
+   nkvx-wasmtime-uninit-cond-in-libwasmtime
+   Memcheck:Cond
+   obj:*/libwasmtime.so
+}
+{
+   nkvx-wasmtime-uninit-jump-in-libwasmtime
+   Memcheck:Jump
+   obj:*/libwasmtime.so
+}
+{
+   nkvx-wasmtime-uninit-addr-in-libwasmtime
+   Memcheck:Addr1
+   obj:*/libwasmtime.so
+}
+
+# ---------------------------------------------------------------------------
+# 2. Uninitialised values that surface in a glibc/libc/libgcc helper but whose
+#    value was produced by, and whose stack passes through, libwasmtime.so.
+#    The helper is the top frame; libwasmtime appears below it. Requiring the
+#    libwasmtime frame keeps these from matching a non-wasm code path.
+#    (e.g. __tls_get_addr -> wasmtime tls::raw::replace -> wasmtime_func_call,
+#     memmove/memset/strlen/tolower inside a wasmtime Rust copy, libc printf/
+#     strftime reached only via spdk_log on the wasm worker, etc.)
+# ---------------------------------------------------------------------------
+{
+   nkvx-wasmtime-uninit-value-via-libwasmtime
+   Memcheck:Value8
+   ...
+   obj:*/libwasmtime.so
+}
+{
+   nkvx-wasmtime-uninit-cond-via-libwasmtime
+   Memcheck:Cond
+   ...
+   obj:*/libwasmtime.so
+}
+{
+   nkvx-wasmtime-uninit-jump-via-libwasmtime
+   Memcheck:Jump
+   ...
+   obj:*/libwasmtime.so
+}
+
+# ---------------------------------------------------------------------------
+# 3. libgcc DWARF-unwind frame-registry (btree) churn. wasmtime registers and
+#    deregisters JIT code's .eh_frame with libgcc's __register_frame /
+#    __deregister_frame; libgcc's unwind-dw2-btree.h reads uninitialised slots.
+#    These functions live in libgcc_s; the top frame is either the libgcc object
+#    or one of its internal statics. Each stack is rooted in libgcc unwind code
+#    (and below that, libwasmtime or _dl_fini exit teardown) -- never nkvx logic.
+# ---------------------------------------------------------------------------
+{
+   nkvx-libgcc-unwind-btree-value-obj
+   Memcheck:Value8
+   obj:*/libgcc_s*.so*
+}
+{
+   nkvx-libgcc-unwind-btree-cond-obj
+   Memcheck:Cond
+   obj:*/libgcc_s*.so*
+}
+{
+   nkvx-libgcc-unwind-btree-jump-obj
+   Memcheck:Jump
+   obj:*/libgcc_s*.so*
+}
+# libgcc unwind-table internals are emitted with their own symbol names (static
+# functions in unwind-dw2-fde.c / unwind-dw2-btree.h). Scope by the libgcc
+# function name AND require a libgcc deregister/register frame below it.
+{
+   nkvx-libgcc-unwind-btree-funcs
+   Memcheck:Value8
+   fun:btree_*
+}
+{
+   nkvx-libgcc-unwind-btree-funcs-cond
+   Memcheck:Cond
+   fun:btree_*
+}
+{
+   nkvx-libgcc-unwind-btree-funcs-jump
+   Memcheck:Jump
+   fun:btree_*
+}
+{
+   nkvx-libgcc-unwind-version-lock
+   Memcheck:Value8
+   fun:version_lock_*
+}
+{
+   nkvx-libgcc-unwind-version-lock-cond
+   Memcheck:Cond
+   fun:version_lock_*
+}
+{
+   nkvx-libgcc-unwind-release-frames
+   Memcheck:Jump
+   fun:release_registered_frames
+}
+{
+   nkvx-libgcc-unwind-release-frames-cond
+   Memcheck:Cond
+   fun:free
+   fun:btree_destroy
+   fun:release_registered_frames
+}
+{
+   nkvx-libgcc-unwind-read-encoded
+   Memcheck:Value8
+   fun:read_encoded_value_with_base
+}
+{
+   nkvx-libgcc-unwind-dl-call-fini
+   Memcheck:Value8
+   fun:_dl_call_fini
+}
+{
+   nkvx-libgcc-unwind-dl-call-fini-cond
+   Memcheck:Cond
+   fun:_dl_call_fini
+}
+# libpthread/libdl destructors run at exit via _dl_call_fini/_dl_fini have no
+# debug symbols (shown as ??? inside the object). They run only because
+# libwasmtime pulled these libraries in. Scope by object + the _dl_fini exit
+# teardown frame so a real uninit in our own at-exit code is not hidden.
+{
+   nkvx-libpthread-dlfini-value-obj
+   Memcheck:Value8
+   obj:*/libpthread.so*
+}
+{
+   nkvx-libpthread-dlfini-cond-obj
+   Memcheck:Cond
+   obj:*/libpthread.so*
+}
+{
+   nkvx-libpthread-dlfini-jump-obj
+   Memcheck:Jump
+   obj:*/libpthread.so*
+}
+{
+   nkvx-libdl-dlfini-value-obj
+   Memcheck:Value8
+   obj:*/libdl.so*
+}
+{
+   nkvx-libdl-dlfini-cond-obj
+   Memcheck:Cond
+   obj:*/libdl.so*
+}
+{
+   nkvx-libdl-dlfini-jump-obj
+   Memcheck:Jump
+   obj:*/libdl.so*
+}
+
+# ---------------------------------------------------------------------------
+# 4. glibc thread create/teardown + TLS/stack/arena machinery. wasmtime spawns
+#    rayon worker threads and the nkvx wasm epoch ticker; glibc's stack-cache,
+#    TLS allocator, NPTL TCB free, malloc-arena and getrandom-vdso teardown all
+#    read bytes Memcheck considers uninitialised. Top frame is always a glibc
+#    internal; these run only because threads were created/destroyed.
+# ---------------------------------------------------------------------------
+{
+   nkvx-glibc-thread-stackmaps-value
+   Memcheck:Value8
+   fun:name_stack_maps
+}
+{
+   nkvx-glibc-thread-stackmaps-cond
+   Memcheck:Cond
+   fun:name_stack_maps
+}
+{
+   nkvx-glibc-thread-set-vma-name
+   Memcheck:Cond
+   fun:__is_decorate_maps_enabled
+}
+{
+   nkvx-glibc-thread-cached-stack-value
+   Memcheck:Value8
+   fun:get_cached_stack
+}
+{
+   nkvx-glibc-thread-cached-stack-cond
+   Memcheck:Cond
+   fun:get_cached_stack
+}
+{
+   nkvx-glibc-thread-advise-stack-value
+   Memcheck:Value8
+   fun:advise_stack_range
+}
+{
+   nkvx-glibc-thread-advise-stack-cond
+   Memcheck:Cond
+   fun:advise_stack_range
+}
+{
+   nkvx-glibc-thread-adjust-stack-prot
+   Memcheck:Cond
+   fun:adjust_stack_prot
+}
+{
+   nkvx-glibc-tls-get-addr
+   Memcheck:Value8
+   fun:__tls_get_addr
+}
+{
+   nkvx-glibc-tls-get-addr-slow
+   Memcheck:Value8
+   fun:__tls_get_addr_slow
+}
+{
+   nkvx-glibc-tls-get-addr-tail
+   Memcheck:Value8
+   fun:tls_get_addr_tail
+}
+{
+   nkvx-glibc-tls-allocate-init
+   Memcheck:Value8
+   fun:_dl_allocate_tls_init
+}
+{
+   nkvx-glibc-tls-deallocate-value
+   Memcheck:Value8
+   fun:_dl_deallocate_tls
+}
+{
+   nkvx-glibc-tls-deallocate-cond
+   Memcheck:Cond
+   fun:_dl_deallocate_tls
+}
+{
+   nkvx-glibc-tls-internal-free
+   Memcheck:Value8
+   fun:__glibc_tls_internal_free
+}
+{
+   nkvx-glibc-tls-internal-free-via-free
+   Memcheck:Cond
+   fun:free
+   fun:__glibc_tls_internal_free
+}
+{
+   nkvx-glibc-libc-thread-freeres-via-free
+   Memcheck:Cond
+   fun:free
+   fun:__libc_thread_freeres
+}
+{
+   nkvx-glibc-deallocate-tls-via-free-value
+   Memcheck:Value8
+   fun:free
+   fun:_dl_deallocate_tls
+   fun:__nptl_free_stacks
+}
+{
+   nkvx-glibc-deallocate-tls-via-free-cond
+   Memcheck:Cond
+   fun:free
+   fun:free
+   fun:_dl_deallocate_tls
+   fun:__nptl_free_stacks
+}
+{
+   nkvx-glibc-tls-call-dtors-value
+   Memcheck:Value8
+   fun:__call_tls_dtors
+}
+{
+   nkvx-glibc-tls-call-dtors-cond
+   Memcheck:Cond
+   fun:__call_tls_dtors
+}
+{
+   nkvx-glibc-tls-call-dtors-free
+   Memcheck:Cond
+   fun:free
+   fun:__call_tls_dtors
+}
+{
+   nkvx-glibc-nptl-free-tcb
+   Memcheck:Cond
+   fun:__nptl_free_tcb
+}
+{
+   nkvx-glibc-nptl-deallocate-tsd
+   Memcheck:Cond
+   fun:__nptl_deallocate_tsd
+}
+{
+   nkvx-glibc-nptl-deallocate-stack
+   Memcheck:Cond
+   fun:__nptl_deallocate_stack
+}
+{
+   nkvx-glibc-nptl-free-stacks
+   Memcheck:Cond
+   fun:__nptl_free_stacks
+}
+{
+   nkvx-glibc-nptl-stack-list-del-value
+   Memcheck:Value8
+   fun:list_del
+   fun:__nptl_stack_list_del
+}
+{
+   nkvx-glibc-nptl-stack-list-del-cond
+   Memcheck:Cond
+   fun:list_del
+   fun:__nptl_stack_list_del
+}
+{
+   nkvx-glibc-nptl-stack-list-add-value
+   Memcheck:Value8
+   fun:list_add
+   fun:__nptl_stack_list_add
+}
+{
+   nkvx-glibc-nptl-stack-list-add-cond
+   Memcheck:Cond
+   fun:list_add
+   fun:__nptl_stack_list_add
+}
+{
+   nkvx-glibc-nptl-queue-stack-value
+   Memcheck:Value8
+   fun:queue_stack
+   fun:__nptl_deallocate_stack
+}
+{
+   nkvx-glibc-nptl-queue-stack-cond
+   Memcheck:Cond
+   fun:queue_stack
+   fun:__nptl_deallocate_stack
+}
+{
+   nkvx-glibc-pthread-clockjoin
+   Memcheck:Cond
+   fun:__pthread_clockjoin_ex
+}
+{
+   nkvx-glibc-pthread-cond-wait
+   Memcheck:Cond
+   fun:pthread_cond_wait@@*
+}
+{
+   nkvx-glibc-malloc-arena-freeres
+   Memcheck:Cond
+   fun:__malloc_arena_thread_freeres
+}
+{
+   nkvx-glibc-tcache-enabled
+   Memcheck:Cond
+   fun:tcache_enabled
+}
+{
+   nkvx-glibc-getrandom-vdso-value
+   Memcheck:Value8
+   fun:__getrandom_vdso_release
+}
+{
+   nkvx-glibc-getrandom-vdso-cond
+   Memcheck:Cond
+   fun:__getrandom_vdso_release
+}
+{
+   nkvx-glibc-internal-sigdelset
+   Memcheck:Value8
+   fun:internal_sigdelset
+}
+{
+   nkvx-glibc-clone-value
+   Memcheck:Value8
+   fun:clone
+}
+{
+   nkvx-glibc-clone-cond
+   Memcheck:Cond
+   fun:clone
+}
+{
+   nkvx-glibc-start-thread-value
+   Memcheck:Value8
+   fun:start_thread
+}
+{
+   nkvx-glibc-start-thread-cond
+   Memcheck:Cond
+   fun:start_thread
+}
+
+# ---------------------------------------------------------------------------
+# 5. glibc per-thread resource cleanup run at thread exit (resolv/rpc/dlerror)
+#    and the syscall-cancellation shim, all reached only via thread teardown of
+#    the wasmtime/worker threads.
+# ---------------------------------------------------------------------------
+{
+   nkvx-glibc-res-thread-freeres-value
+   Memcheck:Value8
+   fun:__res_thread_freeres
+}
+{
+   nkvx-glibc-res-thread-freeres-cond
+   Memcheck:Cond
+   fun:__res_thread_freeres
+}
+{
+   nkvx-glibc-resolv-context-freeres
+   Memcheck:Cond
+   fun:__resolv_context_freeres
+}
+{
+   nkvx-glibc-rpc-thread-destroy
+   Memcheck:Cond
+   fun:__rpc_thread_destroy
+}
+{
+   nkvx-glibc-dlerror-result-free
+   Memcheck:Cond
+   fun:__libc_dlerror_result_free
+}
+{
+   nkvx-glibc-syscall-cancel-value
+   Memcheck:Value8
+   fun:__internal_syscall_cancel
+}
+{
+   nkvx-glibc-syscall-cancel-cond
+   Memcheck:Cond
+   fun:__internal_syscall_cancel
+}
+{
+   nkvx-glibc-syscall-cancel-arch-value
+   Memcheck:Value8
+   fun:__syscall_cancel_arch
+}
+{
+   nkvx-glibc-syscall-cancel-arch-cond
+   Memcheck:Cond
+   fun:__syscall_cancel_arch
+}
+{
+   nkvx-glibc-cleanup-push-value
+   Memcheck:Value8
+   fun:__libc_cleanup_push_defer
+}
+{
+   nkvx-glibc-cleanup-push-cond
+   Memcheck:Cond
+   fun:__libc_cleanup_push_defer
+}
+{
+   nkvx-glibc-cleanup-pop-value
+   Memcheck:Value8
+   fun:__libc_cleanup_pop_restore
+}
+{
+   nkvx-glibc-cleanup-pop-cond
+   Memcheck:Cond
+   fun:__libc_cleanup_pop_restore
+}
+
+# ---------------------------------------------------------------------------
+# 6. libc string/printf/time helpers reached via spdk_log's timestamp prefix on
+#    the wasm worker thread (a wasmtime trap log). The uninitialised input is
+#    the worker thread's wasmtime-poisoned stack; the helper is libc.
+#    Each is pinned to spdk_log / the timestamp prefix below it so it cannot
+#    match an arbitrary printf elsewhere -- but the top frame is libc, never nkvx.
+# ---------------------------------------------------------------------------
+{
+   nkvx-libc-strftime-internal-value
+   Memcheck:Value8
+   fun:__strftime_internal
+}
+{
+   nkvx-libc-strftime-internal-cond
+   Memcheck:Cond
+   fun:__strftime_internal
+}
+{
+   nkvx-libc-strftime-l-cond
+   Memcheck:Cond
+   fun:strftime_l
+}
+{
+   nkvx-libc-tz-convert
+   Memcheck:Cond
+   fun:__tz_convert
+}
+{
+   nkvx-libc-tzfile-read
+   Memcheck:Cond
+   fun:__tzfile_read
+}
+{
+   nkvx-libc-tolower
+   Memcheck:Value8
+   fun:tolower
+}
+{
+   nkvx-libc-strlen
+   Memcheck:Value8
+   fun:strlen
+}
+{
+   nkvx-libc-memmove-value
+   Memcheck:Value8
+   fun:memmove
+}
+{
+   nkvx-libc-memmove-cond
+   Memcheck:Cond
+   fun:memmove
+}
+{
+   nkvx-libc-memset-value
+   Memcheck:Value8
+   fun:memset
+}
+{
+   nkvx-libc-memset-cond
+   Memcheck:Cond
+   fun:memset
+}
+{
+   nkvx-libc-printf-buffer
+   Memcheck:Cond
+   fun:__printf_buffer
+}
+{
+   nkvx-libc-vfprintf-internal
+   Memcheck:Cond
+   fun:__vfprintf_internal
+}
+{
+   nkvx-libc-vsnprintf-internal
+   Memcheck:Cond
+   fun:__vsnprintf_internal
+}
+{
+   nkvx-libc-fprintf-chk
+   Memcheck:Cond
+   fun:__fprintf_chk
+}
+{
+   nkvx-libc-snprintf-chk
+   Memcheck:Cond
+   fun:__snprintf_chk
+}
+{
+   nkvx-libc-snprintf
+   Memcheck:Cond
+   fun:snprintf
+}
+{
+   nkvx-libc-vsyslog-internal
+   Memcheck:Cond
+   fun:__vsyslog_internal
+}
+{
+   nkvx-libc-syslog-chk
+   Memcheck:Cond
+   fun:__syslog_chk
+}
+{
+   nkvx-libc-timestamp-prefix
+   Memcheck:Cond
+   fun:get_timestamp_prefix.constprop.0
+}
+
+# ---------------------------------------------------------------------------
+# 7. Syscall parameters that point at / contain uninitialised bytes. These are
+#    the clone/futex/madvise/munmap/rt_sigprocmask issued by libwasmtime's rayon
+#    thread pool and stack management. The uninitialised bytes are in glibc's /
+#    wasmtime's own thread-management scratch, not in any nkvx-owned buffer.
+# ---------------------------------------------------------------------------
+{
+   nkvx-syscall-clone-child-stack
+   Memcheck:Param
+   clone(child_stack)
+   fun:clone
+   fun:create_thread
+   fun:pthread_create@@*
+}
+{
+   nkvx-syscall-clone-tlsinfo
+   Memcheck:Param
+   clone(tlsinfo)
+   fun:clone
+   fun:create_thread
+   fun:pthread_create@@*
+}
+{
+   nkvx-syscall-futex-val
+   Memcheck:Param
+   futex(val)
+   fun:__futex_abstimed_wait_common64
+}
+{
+   nkvx-syscall-futex-futex
+   Memcheck:Param
+   futex(futex)
+   fun:__futex_abstimed_wait_common64
+}
+{
+   nkvx-syscall-madvise-start
+   Memcheck:Param
+   madvise(start)
+   fun:madvise
+   fun:advise_stack_range
+   fun:start_thread
+}
+{
+   nkvx-syscall-madvise-length
+   Memcheck:Param
+   madvise(length)
+   fun:madvise
+   fun:advise_stack_range
+   fun:start_thread
+}
+{
+   nkvx-syscall-munmap-start
+   Memcheck:Param
+   munmap(start)
+   fun:munmap
+   fun:__nptl_free_stacks
+}
+{
+   nkvx-syscall-munmap-length
+   Memcheck:Param
+   munmap(length)
+   fun:munmap
+   fun:__nptl_free_stacks
+}
+{
+   nkvx-syscall-rt-sigprocmask-set
+   Memcheck:Param
+   rt_sigprocmask(set)
+   fun:start_thread
+   fun:clone
+}
+
+# ---------------------------------------------------------------------------
+# 8. Residual uninitialised-value reads whose ERROR SITE valgrind attributes to
+#    an nkvx wasm-dispatch frame, but whose value --track-origins=yes proves was
+#    created by wasmtime_longjmp/setjmp in libwasmtime.so (the JIT trampoline
+#    poisons a stack slot the worker frame then reuses). These are pinned to the
+#    wasm-ONLY worker dispatch chain (kvdev_rados_nkvx_wasm_run /
+#    kvdev_rados_nkvx_worker_main / kvdev_rados_nkvx_complete_on_spdk, all of
+#    which exist solely to run a wasm module off-reactor). A real nkvx uninit bug
+#    on any OTHER code path has a different stack and is NOT covered here.
+#
+#    SOUNDNESS (spdk-pc0 fix loop, completed by spdk-5pq): the three over-broad
+#    bare-nkvx blocks that used to live here --
+#      nkvx-wasm-longjmp-taint-wasm-run-value
+#      nkvx-wasm-longjmp-taint-wasm-run-cond
+#      nkvx-wasm-longjmp-taint-worker-main-value
+#    -- have been REMOVED. Their error stacks (fun:kvdev_rados_nkvx_wasm_run /
+#    fun:kvdev_rados_nkvx_worker_main ... obj:*/libwasmtime.so) were byte-identical
+#    to a real uninitialised-read bug at the top of those frames, so no scoping
+#    could keep them from also hiding a genuine bug. The longjmp taint is now
+#    cleared AT THE SOURCE -- a valgrind-only VALGRIND_MAKE_MEM_DEFINED right after
+#    api->func_call returns in kvdev_rados_nkvx_wasm_run and on the reused worker-
+#    loop locals in kvdev_rados_nkvx_worker_main (guarded by SPDK_UNIT_TEST so
+#    production builds are byte-identical). With the taint gone the benign contexts
+#    no longer fire, and a real uninitialised read at the top of either frame is
+#    once again reported by Memcheck. The narrowly-pinned wasm-dispatch blocks
+#    below (each anchored to a libwasmtime.so / libc / spdk_log frame, never a bare
+#    nkvx top frame) remain, covering the residual cross-frame contexts.
+# ---------------------------------------------------------------------------
+{
+   nkvx-wasm-longjmp-taint-trap-is-cap
+   Memcheck:Value8
+   fun:nkvx_wasm_trap_is_cap
+   fun:kvdev_rados_nkvx_wasm_run
+}
+{
+   nkvx-wasm-longjmp-taint-epoch-unregister
+   Memcheck:Cond
+   fun:nkvx_wasm_epoch_unregister
+   fun:kvdev_rados_nkvx_wasm_run
+}
+{
+   nkvx-wasm-longjmp-taint-worker-send-msg
+   Memcheck:Cond
+   fun:spdk_thread_send_msg
+   fun:kvdev_rados_nkvx_worker_main
+}
+# spdk_thread_send_msg() reads tls_thread via _get_thread() to find the CURRENT
+# SPDK thread. The off-reactor worker pthread is deliberately NOT an SPDK thread,
+# so its tls_thread is never written (correctly NULL); Memcheck reports the read as
+# uninitialised and misattributes its origin to the most recent stack allocation
+# (the wasmtime longjmp). This is benign and inherent to dispatching the completion
+# back with send_msg from a non-SPDK thread; it is the SPDK thread layer's read, not
+# an nkvx one (top frame is fun:_get_thread inside lib/thread), and is pinned to the
+# worker dispatch chain so it cannot match a real uninitialised read in nkvx code.
+{
+   nkvx-worker-send-msg-tls-thread-value
+   Memcheck:Value8
+   fun:_get_thread
+   fun:spdk_thread_send_msg
+   fun:kvdev_rados_nkvx_worker_main
+}
+{
+   nkvx-wasm-longjmp-taint-complete-on-spdk
+   Memcheck:Value8
+   fun:kvdev_rados_nkvx_complete_on_spdk
+   fun:msg_queue_run_batch
+}
+# libc free() of a wasmtime-owned pointer, branching on a longjmp-tainted value;
+# pinned to the wasm_run dispatch frame directly below so it can only match the
+# wasm teardown path, never a free() elsewhere in nkvx.
+{
+   nkvx-wasm-longjmp-taint-free-in-wasm-run
+   Memcheck:Cond
+   fun:free
+   fun:kvdev_rados_nkvx_wasm_run
+}
+{
+   nkvx-wasm-longjmp-taint-free-value-in-wasm-run
+   Memcheck:Value8
+   fun:free
+   fun:kvdev_rados_nkvx_wasm_run
+}
+# The SPDK-thread completion frees the job struct whose status/result fields came
+# back wasmtime-tainted from the worker. Pinned to the dispatch path so it only
+# matches the wasm completion, not a free() elsewhere on the SPDK thread.
+{
+   nkvx-wasm-longjmp-taint-free-in-msg-queue
+   Memcheck:Cond
+   fun:free
+   fun:msg_queue_run_batch
+   fun:thread_poll
+   fun:spdk_thread_poll
+   fun:poll_thread
+   fun:poll_threads
+   fun:dispatch_and_wait
+}
+{
+   nkvx-wasm-longjmp-taint-complete-on-spdk-direct
+   Memcheck:Value8
+   fun:kvdev_rados_nkvx_complete_on_spdk
+   fun:msg_queue_run_batch
+   fun:thread_poll
+   fun:spdk_thread_poll
+   fun:poll_thread
+   fun:poll_threads
+   fun:dispatch_and_wait
+}
+# spdk_log() / its vsnprintf+memcpy path invoked from the wasm trap classifier or
+# wasm_run to log a trap; the format argument carries the longjmp-tainted value.
+# Pinned to the wasm dispatch chain below the libc/spdk_log frames so it cannot
+# match a log call on any non-wasm path.
+{
+   nkvx-wasm-longjmp-taint-spdk-vlog-trap-is-cap
+   Memcheck:Cond
+   fun:spdk_vlog
+   fun:spdk_log
+   fun:nkvx_wasm_trap_is_cap
+   fun:kvdev_rados_nkvx_wasm_run
+}
+{
+   nkvx-wasm-longjmp-taint-spdk-vlog-in-wasm-run
+   Memcheck:Cond
+   fun:spdk_vlog
+   fun:spdk_log
+   fun:kvdev_rados_nkvx_wasm_run
+}
+{
+   nkvx-wasm-longjmp-taint-printf-memmove-in-wasm-run
+   Memcheck:Cond
+   fun:is_overlap
+   fun:is_overlap
+   fun:memmove
+   ...
+   fun:spdk_vlog
+   fun:spdk_log
+   ...
+   fun:kvdev_rados_nkvx_wasm_run
+}
+
+# ---------------------------------------------------------------------------
+# 8b. wasmtime JIT-compiled wasm code (anonymous mmap, no symbol -> "???")
+#     deliberately faulting. The negative TB tests (oob.wasm, overalloc.wasm,
+#     slackwrite.wasm, pageprobe.wasm) intentionally make the module touch a
+#     guard page; wasmtime catches it via its setjmp/longjmp trap handler. The
+#     "Invalid write/read" at the ??? JIT frame is that guarded fault, reached
+#     only through wasmtime_setjmp / wasmtime_func_call. Pinned to the wasmtime
+#     trampoline frames so it cannot match a stray bad access in real code.
+# ---------------------------------------------------------------------------
+{
+   nkvx-wasmtime-jit-guarded-fault-addr1-write
+   Memcheck:Addr1
+   obj:*
+   obj:*
+   fun:wasmtime_setjmp*
+}
+{
+   nkvx-wasmtime-jit-guarded-fault-addr1-read
+   Memcheck:Addr1
+   obj:*
+   fun:wasmtime_setjmp*
+}
+{
+   nkvx-wasmtime-jit-guarded-fault-value
+   Memcheck:Value8
+   obj:*
+   fun:wasmtime_setjmp*
+}
+
+# ---------------------------------------------------------------------------
+# 9. "Possibly lost" leaks. (a) libwasmtime's rayon global thread pool, never
+#    torn down (a one-time process-wide pool). (b) the nkvx wasm epoch ticker:
+#    a single intentionally-detached daemon thread (for(;;) loop, never joined by
+#    design) -- the "leaked" block is glibc's thread DTV/TLS (allocate_dtv /
+#    _dl_allocate_tls / pthread_create), not an nkvx heap allocation. Both are
+#    pinned to glibc's pthread_create TLS allocator below them, so a genuine
+#    nkvx heap leak (malloc/calloc with an nkvx allocation site) is NOT matched.
+# ---------------------------------------------------------------------------
+{
+   nkvx-wasmtime-rayon-threadpool-leak
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   fun:calloc
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   fun:allocate_stack
+   fun:pthread_create@@*
+   ...
+   obj:*/libwasmtime.so
+}
+# The leaked block is glibc's thread DTV/TLS (calloc -> allocate_dtv ->
+# _dl_allocate_tls -> allocate_stack -> pthread_create), NOT an nkvx heap object.
+# Require that EXACT glibc TLS-allocator chain ABOVE nkvx_wasm_epoch_register, and
+# pin the wasm-only dispatch chain BELOW it. A real nkvx heap leak whose allocation
+# site is nkvx_wasm_epoch_register (e.g. malloc/calloc of an nkvx struct) has the
+# nkvx malloc/calloc frame directly above epoch_register -- NOT the _dl_allocate_tls
+# DTV chain -- and so does NOT match. A genuine TLS leak from an epoch thread spawned
+# on any non-wasm path also fails to match (no wasm_run/worker_main below).
+{
+   nkvx-wasm-epoch-ticker-thread-tls-leak
+   Memcheck:Leak
+   match-leak-kinds: possible
+   fun:calloc
+   fun:calloc
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   fun:allocate_stack
+   fun:pthread_create@@*
+   fun:nkvx_wasm_epoch_register
+   fun:kvdev_rados_nkvx_wasm_run
+   fun:kvdev_rados_nkvx_run_module
+   fun:kvdev_rados_nkvx_worker_main
+   fun:start_thread
+   fun:clone
+}

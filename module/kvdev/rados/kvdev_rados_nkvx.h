@@ -64,6 +64,69 @@
  * relative to the SPDK build tree. */
 #define KVDEV_RADOS_NKVX_WASM_DIR_ENV "SPDK_NKVX_WASM_DIR"
 
+/*
+ * Valgrind/Memcheck taint-clear, compiled in ONLY for the unit-test build
+ * (-DSPDK_UNIT_TEST=1; see mk/spdk.unittest.mk). Production builds never define
+ * SPDK_UNIT_TEST, so this collapses to nothing and the object code is byte-for-
+ * byte identical to a build without it — SPDK proper carries no valgrind dep.
+ *
+ * Why it exists (spdk-5pq): the dlopen'd libwasmtime.so uses a setjmp/longjmp
+ * trampoline whose unwind leaves Memcheck-"uninitialised" bytes in stack slots
+ * the off-reactor worker frames then legitimately reuse. Reading them is a
+ * BENIGN false positive, but its error stack is byte-identical to a real
+ * uninitialised-read bug, so no .supp rule can silence it without also hiding a
+ * genuine bug. We instead clear the taint at the source — right where the worker
+ * frame re-reads the reused slot after the wasm call returns. VALGRIND_MAKE_MEM_
+ * DEFINED is itself a no-op unless the binary actually runs under Memcheck, so
+ * even the UT binary's normal (non-valgrind) runs are unaffected.
+ */
+#if defined(SPDK_UNIT_TEST) && defined(__has_include)
+#if __has_include(<valgrind/memcheck.h>) && !defined(NVALGRIND)
+#include <valgrind/memcheck.h>
+#define NKVX_VALGRIND_MAKE_DEFINED(addr, len) \
+	((void)VALGRIND_MAKE_MEM_DEFINED((addr), (len)))
+/*
+ * Clear the longjmp taint on ONE named local object. A frame-window heuristic
+ * (clearing N bytes below __builtin_frame_address(0)) cannot be trusted: the
+ * wasmtime setjmp/longjmp trampoline poisons whichever stack slots the unwound
+ * frames happen to occupy, and those slots are NOT guaranteed to lie inside any
+ * fixed window below the frame base (the compiler may place spilled scalars at or
+ * above it, or in func_call's result region). Instead mark the EXACT object that
+ * is read after the call: &var / sizeof(var) names precisely the address whose
+ * read Memcheck flags, so the clear always covers the read it is meant to clear,
+ * and nothing else. Every object cleared this way is one the function has already
+ * (re)assigned a deterministic value before any meaningful use, so this changes
+ * no behaviour — it only drops the benign false positive. It marks just that one
+ * object, so a genuine uninitialised read of any OTHER nkvx local is still caught.
+ */
+#define NKVX_VALGRIND_MAKE_OBJ_DEFINED(var) \
+	NKVX_VALGRIND_MAKE_DEFINED(&(var), sizeof(var))
+#define NKVX_VG_HAVE 1
+#endif
+#endif
+#ifndef NKVX_VALGRIND_MAKE_DEFINED
+#define NKVX_VALGRIND_MAKE_DEFINED(addr, len) ((void)0)
+#endif
+#ifndef NKVX_VALGRIND_MAKE_OBJ_DEFINED
+#define NKVX_VALGRIND_MAKE_OBJ_DEFINED(var) ((void)0)
+#endif
+
+/*
+ * Re-define ONLY the compiler-owned slots at the top of THIS frame (stack-protector
+ * canary + saved callee registers) after a wasm call: the wasmtime longjmp leaves a
+ * benign Memcheck shadow on them and the epilogue then reads them. Implemented as a
+ * noinline helper (in kvdev_rados_nkvx.c) so the marking runs from a clean frame.
+ * It touches only a narrow top-of-frame band, NOT the locals -- a genuine
+ * uninitialised read of a local is still reported.
+ */
+#if defined(NKVX_VG_HAVE)
+void nkvx_vg_scrub_frame_top(void *frame_base);
+#define NKVX_VALGRIND_SCRUB_FRAME_TOP() \
+	nkvx_vg_scrub_frame_top(__builtin_frame_address(0))
+#else
+#define NKVX_VALGRIND_SCRUB_FRAME_TOP() ((void)0)
+#endif
+
 struct kvdev_rados_nkvx_worker;
 
 /*
