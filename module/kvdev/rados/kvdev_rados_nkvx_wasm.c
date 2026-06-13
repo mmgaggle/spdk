@@ -694,9 +694,24 @@ struct nkvx_module_entry {
 	STAILQ_ENTRY(nkvx_module_entry)	link;
 };
 
+/*
+ * EVICTION (spdk-wwy): the sha256 module cache is bounded by an LRU policy too
+ * (count + serialized bytes), env-overridable. A module entry has NO external pin
+ * (a lookup COPIES the blob out under the mutex and deserializes without holding
+ * it, so eviction can never free a blob in use), so this is a plain LRU drop —
+ * MRU at the tail, evict from the head. Re-running an evicted module simply
+ * re-verifies+recompiles from the fetched bytes on the next miss.
+ */
+#define NKVX_MOD_CACHE_MAX_COUNT_DEFAULT	128ull
+#define NKVX_MOD_CACHE_MAX_BYTES_DEFAULT	(256ull * 1024ull * 1024ull)	/* 256 MiB */
+#define NKVX_ENV_MOD_CACHE_MAX_COUNT		"SPDK_NKVX_MOD_CACHE_MAX_COUNT"
+#define NKVX_ENV_MOD_CACHE_MAX_BYTES		"SPDK_NKVX_MOD_CACHE_MAX_BYTES"
+
 static struct {
 	pthread_mutex_t				mutex;
 	STAILQ_HEAD(, nkvx_module_entry)	modules;
+	uint64_t				count;
+	uint64_t				bytes;
 	bool					inited;
 } g_modcache = {
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -707,11 +722,14 @@ nkvx_modcache_init_once(void)
 {
 	if (!g_modcache.inited) {
 		STAILQ_INIT(&g_modcache.modules);
+		g_modcache.count = 0;
+		g_modcache.bytes = 0;
 		g_modcache.inited = true;
 	}
 }
 
-/* Find a cached compiled module by hash (mutex held). */
+/* Find a cached compiled module by hash (mutex held). LRU touch on hit is done by
+ * the caller where it has write intent; lookup itself is read-only. */
 static struct nkvx_module_entry *
 nkvx_modcache_lookup(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN])
 {
@@ -723,6 +741,35 @@ nkvx_modcache_lookup(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN])
 		}
 	}
 	return NULL;
+}
+
+/* Enforce the module-cache caps (mutex held): evict LRU entries from the head past
+ * the count/byte caps. Plain LRU (no pins). Call AFTER inserting the new entry. */
+static void
+nkvx_modcache_enforce_caps(void)
+{
+	uint64_t max_count = nkvx_wasm_env_u64(NKVX_ENV_MOD_CACHE_MAX_COUNT,
+					       NKVX_MOD_CACHE_MAX_COUNT_DEFAULT);
+	uint64_t max_bytes = nkvx_wasm_env_u64(NKVX_ENV_MOD_CACHE_MAX_BYTES,
+					       NKVX_MOD_CACHE_MAX_BYTES_DEFAULT);
+
+	if (max_count == 0 && max_bytes == 0) {
+		return;
+	}
+	while ((max_count != 0 && g_modcache.count > max_count) ||
+	       (max_bytes != 0 && g_modcache.bytes > max_bytes)) {
+		struct nkvx_module_entry *e = STAILQ_FIRST(&g_modcache.modules);
+
+		if (e == NULL) {
+			break;
+		}
+		STAILQ_REMOVE_HEAD(&g_modcache.modules, link);
+		g_modcache.count--;
+		g_modcache.bytes -= e->serialized_len;
+		free(e->serialized);
+		free(e);
+		g_nkvx_wasm_stats.mod_evictions++;
+	}
 }
 
 bool
@@ -842,7 +889,12 @@ kvdev_rados_nkvx_wasm_module_insert(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN
 		status = SPDK_KVDEV_IO_STATUS_SUCCESS;
 		goto out;
 	}
-	STAILQ_INSERT_TAIL(&g_modcache.modules, e, link);
+	STAILQ_INSERT_TAIL(&g_modcache.modules, e, link);	/* MRU at tail */
+	g_modcache.count++;
+	g_modcache.bytes += e->serialized_len;
+	/* Bound the module cache (spdk-wwy): evict LRU entries past the cap. The
+	 * just-inserted MRU entry is at the tail, so it is never the victim. */
+	nkvx_modcache_enforce_caps();
 	pthread_mutex_unlock(&g_modcache.mutex);
 	e = NULL;	/* owned by the cache now */
 	status = SPDK_KVDEV_IO_STATUS_SUCCESS;
@@ -873,20 +925,19 @@ kvdev_rados_nkvx_wasm_module_cache_reset(void)
 		free(e->serialized);
 		free(e);
 	}
+	g_modcache.count = 0;
+	g_modcache.bytes = 0;
 	pthread_mutex_unlock(&g_modcache.mutex);
 }
 
 uint64_t
 kvdev_rados_nkvx_wasm_module_cache_count(void)
 {
-	struct nkvx_module_entry *e;
-	uint64_t n = 0;
+	uint64_t n;
 
 	pthread_mutex_lock(&g_modcache.mutex);
 	nkvx_modcache_init_once();
-	STAILQ_FOREACH(e, &g_modcache.modules, link) {
-		n++;
-	}
+	n = g_modcache.count;
 	pthread_mutex_unlock(&g_modcache.mutex);
 	return n;
 }
@@ -925,6 +976,9 @@ nkvx_module_obtain(const struct nkvx_wasm_api *api, wasm_engine_t *engine,
 		}
 		memcpy(blob, e->serialized, e->serialized_len);
 		blob_len = e->serialized_len;
+		/* LRU touch: a reused module is hot — move it to the tail (mutex held). */
+		STAILQ_REMOVE(&g_modcache.modules, e, nkvx_module_entry, link);
+		STAILQ_INSERT_TAIL(&g_modcache.modules, e, link);
 	}
 	pthread_mutex_unlock(&g_modcache.mutex);
 
@@ -1025,10 +1079,42 @@ struct nkvx_warm_entry {
 	STAILQ_ENTRY(nkvx_warm_entry) link;
 };
 
+/*
+ * EVICTION (spdk-wwy). The object + warm caches are bounded by an LRU policy so
+ * they cannot grow without bound (important for 64 MiB partitions — a handful of
+ * objects would otherwise pin gigabytes). Each list is kept in LRU order:
+ * most-recently-USED at the TAIL, least-recently-used at the HEAD; a touch on
+ * access re-links the entry to the tail. On insert past the cap we evict from the
+ * head.
+ *
+ * RACE SAFETY (spdk-ii0 D2 carry-ref): eviction MUST reuse the existing pin/unref
+ * machinery — it must NOT free a PINNED object entry (a probe-hit Exec carries a
+ * pin from cache_pin through to the worker run, and a warm entry pins the object it
+ * aliases). Evicting an object therefore (1) tears down ALL its warm entries first
+ * (each drops its object pin), then (2) marks the object dead and runs it through
+ * nkvx_obj_unref: an unpinned object is removed+freed immediately, a still-pinned
+ * one stays dead-on-list and is freed by the LAST unpin — exactly as invalidation
+ * does. A dead object is invisible to nkvx_obj_lookup, so the probe→dispatch path
+ * is unaffected (it already pins; a pinned entry is never freed under it). No
+ * use-after-free, no eviction of in-use bytes.
+ *
+ * Caps are env-overridable so tests and tuning can drive them; 0 disables a cap.
+ */
+#define NKVX_OBJ_CACHE_MAX_COUNT_DEFAULT	256ull
+#define NKVX_OBJ_CACHE_MAX_BYTES_DEFAULT	(512ull * 1024ull * 1024ull)	/* 512 MiB */
+#define NKVX_WARM_CACHE_MAX_COUNT_DEFAULT	256ull
+
+#define NKVX_ENV_OBJ_CACHE_MAX_COUNT	"SPDK_NKVX_OBJ_CACHE_MAX_COUNT"
+#define NKVX_ENV_OBJ_CACHE_MAX_BYTES	"SPDK_NKVX_OBJ_CACHE_MAX_BYTES"
+#define NKVX_ENV_WARM_CACHE_MAX_COUNT	"SPDK_NKVX_WARM_CACHE_MAX_COUNT"
+
 static struct {
 	pthread_mutex_t				mutex;
 	STAILQ_HEAD(, nkvx_obj_entry)		objects;
 	STAILQ_HEAD(, nkvx_warm_entry)		warm;
+	uint64_t				obj_count;	/* LIVE+dead objects on list */
+	uint64_t				obj_bytes;	/* sum of mem_cap on list */
+	uint64_t				warm_count;
 	bool					inited;
 } g_cache = {
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -1040,6 +1126,9 @@ nkvx_cache_init_once(void)
 	if (!g_cache.inited) {
 		STAILQ_INIT(&g_cache.objects);
 		STAILQ_INIT(&g_cache.warm);
+		g_cache.obj_count = 0;
+		g_cache.obj_bytes = 0;
+		g_cache.warm_count = 0;
 		g_cache.inited = true;
 	}
 }
@@ -1078,11 +1167,41 @@ nkvx_obj_free(struct nkvx_obj_entry *o)
 	free(o);
 }
 
+/* Link an object onto the cache list as MOST-recently-used (tail) and account it
+ * (mutex held). */
+static void
+nkvx_obj_list_add(struct nkvx_obj_entry *o)
+{
+	STAILQ_INSERT_TAIL(&g_cache.objects, o, link);
+	g_cache.obj_count++;
+	g_cache.obj_bytes += o->mem_cap;
+}
+
+/* Unlink an object from the cache list and un-account it (mutex held). Does not
+ * free. */
+static void
+nkvx_obj_list_remove(struct nkvx_obj_entry *o)
+{
+	STAILQ_REMOVE(&g_cache.objects, o, nkvx_obj_entry, link);
+	assert(g_cache.obj_count > 0);
+	g_cache.obj_count--;
+	g_cache.obj_bytes -= o->mem_cap;
+}
+
+/* LRU touch: move a live object to the tail (most-recently-used) so eviction takes
+ * the genuinely-coldest entry from the head (mutex held). */
+static void
+nkvx_obj_touch(struct nkvx_obj_entry *o)
+{
+	STAILQ_REMOVE(&g_cache.objects, o, nkvx_obj_entry, link);
+	STAILQ_INSERT_TAIL(&g_cache.objects, o, link);
+}
+
 /* Drop one pin on an object entry (mutex held). When the last pin drops and the
- * entry is dead (invalidated), free it now — this is the carry-ref guarantee that
- * an in-flight Exec which pinned a version before a Store can finish over that
- * version without a use-after-free, while the entry is already invisible to new
- * Execs. */
+ * entry is dead (invalidated OR evicted), free it now — this is the carry-ref
+ * guarantee that an in-flight Exec which pinned a version before a Store/eviction
+ * can finish over that version without a use-after-free, while the entry is already
+ * invisible to new Execs. */
 static void
 nkvx_obj_unref(struct nkvx_obj_entry *o)
 {
@@ -1092,9 +1211,38 @@ nkvx_obj_unref(struct nkvx_obj_entry *o)
 		/* A dead entry stays ON the objects list (invisible to lookup via the
 		 * dead flag) until its last pin drops, so cache_reset can always find
 		 * and free it. Remove + free it now that no pin remains. */
-		STAILQ_REMOVE(&g_cache.objects, o, nkvx_obj_entry, link);
+		nkvx_obj_list_remove(o);
 		nkvx_obj_free(o);
 	}
+}
+
+/* Tear down a warm entry: unlink + un-account it, free the wasm artifacts, and
+ * drop the pin it held on its backing object (mutex held). The object unref may
+ * free a dead/evicted object once its last pin drops (carry-ref). */
+static void
+nkvx_warm_destroy(const struct nkvx_wasm_api *api, struct nkvx_warm_entry *w)
+{
+	struct nkvx_obj_entry *obj = w->obj;
+
+	STAILQ_REMOVE(&g_cache.warm, w, nkvx_warm_entry, link);
+	assert(g_cache.warm_count > 0);
+	g_cache.warm_count--;
+	if (api != NULL) {
+		nkvx_warm_free(api, w);
+	} else {
+		free(w);
+	}
+	if (obj != NULL) {
+		nkvx_obj_unref(obj);
+	}
+}
+
+/* LRU touch a warm entry to the tail (mutex held). */
+static void
+nkvx_warm_touch(struct nkvx_warm_entry *w)
+{
+	STAILQ_REMOVE(&g_cache.warm, w, nkvx_warm_entry, link);
+	STAILQ_INSERT_TAIL(&g_cache.warm, w, link);
 }
 
 /*
@@ -1116,17 +1264,7 @@ nkvx_cache_invalidate_locked(const struct nkvx_wasm_api *api, const char *obj_ke
 	 * so tearing the warm entry down (and unref'ing its object) drops that pin. */
 	STAILQ_FOREACH_SAFE(w, &g_cache.warm, link, wtmp) {
 		if (strcmp(w->obj_key, obj_key) == 0) {
-			struct nkvx_obj_entry *obj = w->obj;
-
-			STAILQ_REMOVE(&g_cache.warm, w, nkvx_warm_entry, link);
-			if (api != NULL) {
-				nkvx_warm_free(api, w);
-			} else {
-				free(w);
-			}
-			if (obj != NULL) {
-				nkvx_obj_unref(obj);
-			}
+			nkvx_warm_destroy(api, w);
 		}
 	}
 
@@ -1139,6 +1277,106 @@ nkvx_cache_invalidate_locked(const struct nkvx_wasm_api *api, const char *obj_ke
 			o->refcount++;
 			nkvx_obj_unref(o);
 		}
+	}
+}
+
+/*
+ * Evict ONE object entry e (mutex held), race-safely. First tear down ALL warm
+ * entries that pin e (dropping their pins), then mark e dead and run it through the
+ * single unref path: an unpinned e is removed+freed now, a still-pinned e (a
+ * probe-hit Exec carries a pin) stays dead-on-list and is freed by its last unpin.
+ * NEVER frees pinned bytes — same carry-ref discipline as invalidation. The caller
+ * must have selected e from the LRU head among LIVE entries.
+ */
+static void
+nkvx_obj_evict_locked(const struct nkvx_wasm_api *api, struct nkvx_obj_entry *e)
+{
+	struct nkvx_warm_entry *w, *wtmp;
+
+	STAILQ_FOREACH_SAFE(w, &g_cache.warm, link, wtmp) {
+		if (w->obj == e) {
+			nkvx_warm_destroy(api, w);
+		}
+	}
+	e->dead = true;
+	e->refcount++;
+	nkvx_obj_unref(e);	/* freed now if unpinned; deferred to last unpin if pinned */
+	g_nkvx_wasm_stats.obj_evictions++;
+}
+
+/*
+ * Enforce the object-cache caps (mutex held): while the LIVE object count or live
+ * bytes exceed the (env-overridable) caps, evict the least-recently-used LIVE
+ * object from the head. Dead entries are awaiting their last unpin and are skipped
+ * (they neither serve lookups nor can be re-evicted). A live-but-PINNED LRU entry
+ * is evicted safely (marked dead, freed on last unpin); we still advance past it so
+ * a fully-pinned cache cannot loop forever. Call AFTER inserting the new entry.
+ */
+static void
+nkvx_obj_cache_enforce_caps(const struct nkvx_wasm_api *api)
+{
+	uint64_t max_count = nkvx_wasm_env_u64(NKVX_ENV_OBJ_CACHE_MAX_COUNT,
+					       NKVX_OBJ_CACHE_MAX_COUNT_DEFAULT);
+	uint64_t max_bytes = nkvx_wasm_env_u64(NKVX_ENV_OBJ_CACHE_MAX_BYTES,
+					       NKVX_OBJ_CACHE_MAX_BYTES_DEFAULT);
+	struct nkvx_obj_entry *o, *otmp;
+
+	if (max_count == 0 && max_bytes == 0) {
+		return;		/* caps disabled */
+	}
+
+	/* Count only LIVE entries against the count cap (dead ones are transient). */
+	for (;;) {
+		uint64_t live = 0;
+		struct nkvx_obj_entry *victim = NULL;
+
+		STAILQ_FOREACH(o, &g_cache.objects, link) {
+			if (!o->dead) {
+				live++;
+				if (victim == NULL) {
+					victim = o;	/* LRU live = head-most live */
+				}
+			}
+		}
+		bool over_count = (max_count != 0 && live > max_count);
+		bool over_bytes = (max_bytes != 0 && g_cache.obj_bytes > max_bytes);
+
+		if (!over_count && !over_bytes) {
+			break;
+		}
+		if (victim == NULL) {
+			break;		/* nothing live to evict */
+		}
+		(void)otmp;
+		nkvx_obj_evict_locked(api, victim);
+		/* Guard against a pathological all-pinned set: if obj_bytes did not drop
+		 * (victim was pinned, deferred free) and it was the only live entry, stop. */
+		if (live == 1) {
+			break;
+		}
+	}
+}
+
+/* Enforce the warm-cache count cap (mutex held): evict LRU warm entries from the
+ * head. A warm entry holds no external pin (only the object pin it drops on
+ * destroy), so this is a plain LRU drop — no carry-ref needed. Call AFTER insert. */
+static void
+nkvx_warm_cache_enforce_caps(const struct nkvx_wasm_api *api)
+{
+	uint64_t max_count = nkvx_wasm_env_u64(NKVX_ENV_WARM_CACHE_MAX_COUNT,
+					       NKVX_WARM_CACHE_MAX_COUNT_DEFAULT);
+
+	if (max_count == 0) {
+		return;
+	}
+	while (g_cache.warm_count > max_count) {
+		struct nkvx_warm_entry *w = STAILQ_FIRST(&g_cache.warm);
+
+		if (w == NULL) {
+			break;
+		}
+		nkvx_warm_destroy(api, w);
+		g_nkvx_wasm_stats.warm_evictions++;
 	}
 }
 
@@ -1451,8 +1689,13 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	 * entry is torn down. */
 	obj->refcount++;
 
-	STAILQ_INSERT_TAIL(&g_cache.warm, w, link);
+	STAILQ_INSERT_TAIL(&g_cache.warm, w, link);	/* MRU at tail */
+	g_cache.warm_count++;
 	*out_warm = w;
+
+	/* Bound the warm cache (spdk-wwy): evict LRU warm entries past the cap. The
+	 * just-inserted MRU entry is at the tail, so it is never the eviction victim. */
+	nkvx_warm_cache_enforce_caps(api);
 
 	/* Ownership transferred to the warm entry; do not tear down below. */
 	engine = NULL;
@@ -1527,6 +1770,7 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 	warm = nkvx_warm_lookup(name, obj);
 	if (warm != NULL) {
 		g_nkvx_wasm_stats.warm_hits++;
+		nkvx_warm_touch(warm);		/* LRU: a reused warm entry is hot */
 	} else {
 		if (nkvx_warm_build(api, name, mod, obj, &warm) != 0) {
 			SPDK_ERRLOG("nkvx/wasm: warm build failed for '%s'/'%s'\n", name, obj->obj_key);
@@ -1708,8 +1952,10 @@ kvdev_rados_nkvx_wasm_run_cached(const char *name,
 	/* ---- content-addressed object cache (cold-fill-once) ---------------- */
 	obj = nkvx_obj_lookup(obj_key);
 	if (obj != NULL && obj->filled) {
-		/* HIT: served locally, NO librados refetch (fill not called). */
+		/* HIT: served locally, NO librados refetch (fill not called). LRU touch
+		 * so a frequently-used object is not evicted as if it were cold. */
 		g_nkvx_wasm_stats.content_hits++;
+		nkvx_obj_touch(obj);
 	} else {
 		/* MISS: allocate the page-rounded backing and cold-fill ONCE. The
 		 * object bytes live at WASM_OBJ_OFF so the same .wasm ABI applies. */
@@ -1747,7 +1993,12 @@ kvdev_rados_nkvx_wasm_run_cached(const char *name,
 		obj->obj_len = got;
 		obj->filled = true;
 		g_nkvx_wasm_stats.cold_fills++;
-		STAILQ_INSERT_TAIL(&g_cache.objects, obj, link);
+		nkvx_obj_list_add(obj);		/* MRU at tail + account bytes/count */
+		/* Bound the object cache (spdk-wwy): evict LRU LIVE objects past the cap.
+		 * The just-filled object is MRU (tail), so it is never the victim. Eviction
+		 * tears down the victim's warm entries and defers any pinned free. Done
+		 * before the run so this Exec's warm build observes the post-eviction set. */
+		nkvx_obj_cache_enforce_caps(api);
 	}
 
 	status = nkvx_run_on_object_locked(api, name, mod, obj, out, out_len, result_len);
@@ -1804,19 +2055,9 @@ kvdev_rados_nkvx_wasm_cache_reset(void)
 
 		/* Tear down every warm instance and drop the pin it held on its object
 		 * (a dead object that hits refcount 0 here is removed + freed by the
-		 * unref). With api==NULL (runtime gone) we can only free the wrapper. */
+		 * unref). nkvx_warm_destroy keeps warm_count consistent. */
 		while ((w = STAILQ_FIRST(&g_cache.warm)) != NULL) {
-			struct nkvx_obj_entry *obj = w->obj;
-
-			STAILQ_REMOVE_HEAD(&g_cache.warm, link);
-			if (api != NULL) {
-				nkvx_warm_free(api, w);
-			} else {
-				free(w);
-			}
-			if (obj != NULL) {
-				nkvx_obj_unref(obj);
-			}
+			nkvx_warm_destroy(api, w);
 		}
 	}
 	{
@@ -1824,14 +2065,58 @@ kvdev_rados_nkvx_wasm_cache_reset(void)
 
 		/* Free whatever objects remain on the list (live, or dead entries whose
 		 * pins all dropped above). A dead entry still pinned by an in-flight Exec
-		 * cannot exist at a clean reset point. */
+		 * cannot exist at a clean reset point. nkvx_obj_list_remove keeps the
+		 * count/bytes accounting consistent. */
 		while ((o = STAILQ_FIRST(&g_cache.objects)) != NULL) {
-			STAILQ_REMOVE_HEAD(&g_cache.objects, link);
+			nkvx_obj_list_remove(o);
 			nkvx_obj_free(o);
 		}
 	}
 	memset(&g_nkvx_wasm_stats, 0, sizeof(g_nkvx_wasm_stats));
 	pthread_mutex_unlock(&g_cache.mutex);
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_obj_cache_count(void)
+{
+	uint64_t live = 0;
+	struct nkvx_obj_entry *o;
+
+	pthread_mutex_lock(&g_cache.mutex);
+	nkvx_cache_init_once();
+	/* Report LIVE entries (dead-pinned entries are transient and invisible to
+	 * lookups), matching what the cap counts. */
+	STAILQ_FOREACH(o, &g_cache.objects, link) {
+		if (!o->dead) {
+			live++;
+		}
+	}
+	pthread_mutex_unlock(&g_cache.mutex);
+	return live;
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_obj_cache_bytes(void)
+{
+	uint64_t bytes;
+
+	pthread_mutex_lock(&g_cache.mutex);
+	nkvx_cache_init_once();
+	bytes = g_cache.obj_bytes;
+	pthread_mutex_unlock(&g_cache.mutex);
+	return bytes;
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_warm_cache_count(void)
+{
+	uint64_t n;
+
+	pthread_mutex_lock(&g_cache.mutex);
+	nkvx_cache_init_once();
+	n = g_cache.warm_count;
+	pthread_mutex_unlock(&g_cache.mutex);
+	return n;
 }
 
 bool
@@ -1861,6 +2146,12 @@ kvdev_rados_nkvx_wasm_cache_has(const char *obj_key)
  * serves exactly the version that existed at probe time — a correct linearization
  * (ordered before the concurrent Store) — while subsequent Execs miss the dead
  * entry and cold-fill fresh, so no stale value is ever served to a later Exec.
+ *
+ * EVICTION SAFETY (spdk-wwy): the same pin protects against LRU EVICTION. An
+ * evictor that selects this entry as the LRU victim marks it dead and defers the
+ * free to the last unpin (nkvx_obj_evict_locked, identical carry-ref to
+ * invalidation), so a probe-hit that pinned here is never freed under the
+ * dispatch->run_pinned path — no use-after-free on the probe-then-evicted race.
  */
 void *
 kvdev_rados_nkvx_wasm_cache_pin(const char *obj_key)
@@ -2292,6 +2583,24 @@ void
 kvdev_rados_nkvx_wasm_runtime_teardown(void)
 {
 	/* No epoch ticker / runtime in the stub build. */
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_obj_cache_count(void)
+{
+	return 0;
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_obj_cache_bytes(void)
+{
+	return 0;
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_warm_cache_count(void)
+{
+	return 0;
 }
 
 #endif /* SPDK_CONFIG_WASM */

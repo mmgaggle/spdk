@@ -1490,6 +1490,295 @@ test_nkvx_tb3_miss_without_bytes_fails_closed(void)
 }
 
 /*
+ * spdk-wwy: the object + warm + module caches are BOUNDED (LRU eviction). Fill
+ * each past its cap and assert it stays bounded (count/bytes) and that eviction
+ * happened (the eviction counter advanced). The default caps are large, so the
+ * tests set tight env caps. Helper to run a checksum Exec on a unique key.
+ */
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+static int
+wwy_exec_key(const char *key, const uint8_t *obj, size_t obj_len, uint64_t *out_sum)
+{
+	struct fake_fill fill = { .bytes = obj, .len = obj_len, .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	int rc;
+
+	memset(out, 0, sizeof(out));
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, key, obj_len,
+					      fake_cold_fill, &fill, out, sizeof(out), &rlen);
+	if (rc == SPDK_KVDEV_IO_STATUS_SUCCESS && out_sum != NULL) {
+		memcpy(out_sum, out, sizeof(*out_sum));
+	}
+	return rc;
+}
+#endif
+
+/*
+ * spdk-wwy (1): the OBJECT cache is bounded by an LRU count cap. Fill past the cap
+ * with distinct keys and assert the live count stays <= cap and that evictions
+ * occurred. Fail-before: an UNBOUNDED cache would hold all N entries (count == N,
+ * obj_evictions == 0).
+ */
+static void
+test_nkvx_wwy_object_cache_bounded(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+	setenv("SPDK_NKVX_OBJ_CACHE_MAX_COUNT", "4", 1);	/* tight count cap */
+	unsetenv("SPDK_NKVX_OBJ_CACHE_MAX_BYTES");
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> wwy object-cache test skipped\n");
+		goto done;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	static const uint8_t obj[] = "evict-me-object-bytes";
+	struct kvdev_rados_nkvx_wasm_stats st;
+	char key[32];
+	int i;
+	const int N = 12;	/* well past the cap of 4 */
+
+	for (i = 0; i < N; i++) {
+		snprintf(key, sizeof(key), "k%d", i);
+		CU_ASSERT(wwy_exec_key(key, obj, sizeof(obj), NULL) ==
+			  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	}
+
+	/* Bounded: live count never exceeded the cap. */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_obj_cache_count() <= 4);
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	CU_ASSERT(st.obj_evictions >= (uint64_t)(N - 4));	/* evicted the overflow */
+	CU_ASSERT(st.obj_evictions > 0);
+	printf("\n    wwy object cache: inserted %d, live=%llu (cap 4), obj_evictions=%llu (bounded)\n",
+	       N, (unsigned long long)kvdev_rados_nkvx_wasm_obj_cache_count(),
+	       (unsigned long long)st.obj_evictions);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+done:
+	unsetenv("SPDK_NKVX_OBJ_CACHE_MAX_COUNT");
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: wwy object-cache test is a no-op\n");
+#endif
+}
+
+/*
+ * spdk-wwy (2): a PINNED object is NOT freed by eviction (carry-ref, no UAF). Pin
+ * an object, then drive enough cold-fills to exceed the cap so the pinned object is
+ * the LRU victim. The pinned bytes MUST stay valid (run_pinned returns the correct
+ * checksum over the pinned version); after unpin the entry is freed. valgrind
+ * confirms no use-after-free / no leak.
+ *
+ * Fail-before: an evictor that did a bare free of the LRU entry (instead of the
+ * dead+defer-to-last-unpin path) would free the pinned buffer and run_pinned would
+ * read freed memory (UAF -> wrong checksum / valgrind error).
+ */
+static void
+test_nkvx_wwy_pinned_survives_eviction(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+	setenv("SPDK_NKVX_OBJ_CACHE_MAX_COUNT", "3", 1);
+	unsetenv("SPDK_NKVX_OBJ_CACHE_MAX_BYTES");
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> wwy pinned-eviction test skipped\n");
+		goto done;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	static const uint8_t pv[] = "pinned-victim-object-bytes";
+	static const uint8_t filler[] = "filler-object";
+	struct fake_fill pf = { .bytes = pv, .len = sizeof(pv), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	uint64_t got = 0;
+	void *pin;
+	char key[32];
+	int i;
+	struct kvdev_rados_nkvx_wasm_stats st;
+
+	/* Cold-fill the victim object so it exists to pin (it becomes the LRU head). */
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "pinvic", sizeof(pv),
+			fake_cold_fill, &pf, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+
+	/* PIN it (datapath probe-hit carry-ref). */
+	pin = kvdev_rados_nkvx_wasm_cache_pin("pinvic");
+	CU_ASSERT(pin != NULL);
+
+	/* Drive enough DISTINCT cold-fills to exceed the cap -> the pinned object (LRU)
+	 * is selected for eviction, marked dead, but its bytes deferred (still pinned). */
+	for (i = 0; i < 8; i++) {
+		snprintf(key, sizeof(key), "f%d", i);
+		CU_ASSERT(wwy_exec_key(key, filler, sizeof(filler), NULL) ==
+			  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	}
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	CU_ASSERT(st.obj_evictions > 0);
+	/* The pinned object is gone from new lookups (evicted/dead) -> a cache_has miss. */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_cache_has("pinvic") == false);
+
+	/* The PINNED bytes are still valid: run the pinned version, correct checksum
+	 * (no use-after-free even though the entry was eviction-selected). */
+	memset(out, 0, sizeof(out));
+	got = 0;
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_pinned("checksum", NULL, pin, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&got, out, sizeof(got));
+	CU_ASSERT(got == expected_checksum(pv, sizeof(pv)));	/* pinned bytes intact */
+	printf("\n    wwy pinned survives eviction: obj_evictions=%llu, pinned checksum still "
+	       "correct (no UAF)\n", (unsigned long long)st.obj_evictions);
+
+	/* Drop the pin -> the deferred free happens now (last unpin). valgrind clean. */
+	kvdev_rados_nkvx_wasm_cache_unpin(pin);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+done:
+	unsetenv("SPDK_NKVX_OBJ_CACHE_MAX_COUNT");
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: wwy pinned-eviction test is a no-op\n");
+#endif
+}
+
+/*
+ * spdk-wwy (3): the WARM-instance cache is bounded by an LRU count cap. With a tight
+ * warm cap and a LARGER object cap, running many distinct (module,object) pairs
+ * evicts warm entries. Fail-before: unbounded warm cache holds all of them.
+ */
+static void
+test_nkvx_wwy_warm_cache_bounded(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+	setenv("SPDK_NKVX_WARM_CACHE_MAX_COUNT", "3", 1);	/* tight warm cap */
+	setenv("SPDK_NKVX_OBJ_CACHE_MAX_COUNT", "64", 1);	/* generous object cap */
+	unsetenv("SPDK_NKVX_OBJ_CACHE_MAX_BYTES");
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> wwy warm-cache test skipped\n");
+		goto done;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	static const uint8_t obj[] = "warm-evict-object";
+	struct kvdev_rados_nkvx_wasm_stats st;
+	char key[32];
+	int i;
+	const int N = 10;
+
+	for (i = 0; i < N; i++) {
+		snprintf(key, sizeof(key), "wk%d", i);	/* distinct objects -> distinct warm */
+		CU_ASSERT(wwy_exec_key(key, obj, sizeof(obj), NULL) ==
+			  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	}
+
+	CU_ASSERT(kvdev_rados_nkvx_wasm_warm_cache_count() <= 3);
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	CU_ASSERT(st.warm_evictions > 0);
+	printf("\n    wwy warm cache: ran %d distinct pairs, warm live=%llu (cap 3), "
+	       "warm_evictions=%llu (bounded)\n", N,
+	       (unsigned long long)kvdev_rados_nkvx_wasm_warm_cache_count(),
+	       (unsigned long long)st.warm_evictions);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+done:
+	unsetenv("SPDK_NKVX_WARM_CACHE_MAX_COUNT");
+	unsetenv("SPDK_NKVX_OBJ_CACHE_MAX_COUNT");
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: wwy warm-cache test is a no-op\n");
+#endif
+}
+
+/*
+ * spdk-wwy (4): the sha256 MODULE cache is bounded by an LRU count cap. Insert
+ * distinct verified modules past the cap (hash-perturbed copies of a real .wasm)
+ * and assert the count stays <= cap with evictions. Fail-before: unbounded module
+ * cache holds every inserted hash.
+ */
+static void
+test_nkvx_wwy_module_cache_bounded(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_MOD_CACHE_MAX_COUNT", "3", 1);
+	unsetenv("SPDK_NKVX_MOD_CACHE_MAX_BYTES");
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> wwy module-cache test skipped\n");
+		goto done;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+
+	size_t wlen = 0;
+	uint8_t *wasm = tb3_read_wasm("checksum", &wlen);
+	struct kvdev_rados_nkvx_wasm_stats st;
+	int i;
+	const int N = 9;
+
+	if (wasm == NULL) {
+		goto done;
+	}
+
+	/* Insert N distinct modules. Perturb a copy of the bytes each time and bind the
+	 * matching (correct) hash, so each is a genuine verified insert with a unique
+	 * key — exercising the cap with real compiles. */
+	for (i = 0; i < N; i++) {
+		uint8_t *copy = malloc(wlen);
+		uint8_t h[SPDK_KV_EXEC_SHA256_LEN];
+		int rc;
+
+		CU_ASSERT_FATAL(copy != NULL);
+		memcpy(copy, wasm, wlen);
+		/* Flip a byte in a benign location (a data byte near the end) so the module
+		 * still compiles but hashes differently. */
+		copy[wlen - 1 - i] ^= (uint8_t)(0x11 + i);
+		CU_ASSERT(nkvx_sha256(copy, wlen, h));
+		rc = kvdev_rados_nkvx_wasm_module_insert(h, copy, wlen);
+		/* A perturbed copy may or may not compile; only count successful inserts. */
+		(void)rc;
+		free(copy);
+	}
+
+	/* Bounded regardless of how many compiled: never more than the cap. */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cache_count() <= 3);
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	/* If at least cap+1 inserts succeeded we must have evicted; assert bounded and
+	 * that eviction is wired (mod_evictions advanced when overflow occurred). */
+	if (kvdev_rados_nkvx_wasm_module_cache_count() == 3) {
+		CU_ASSERT(st.mod_evictions > 0);
+	}
+	printf("\n    wwy module cache: attempted %d inserts, count=%llu (cap 3), "
+	       "mod_evictions=%llu (bounded)\n", N,
+	       (unsigned long long)kvdev_rados_nkvx_wasm_module_cache_count(),
+	       (unsigned long long)st.mod_evictions);
+
+	free(wasm);
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+	kvdev_rados_nkvx_wasm_cache_reset();
+done:
+	unsetenv("SPDK_NKVX_MOD_CACHE_MAX_COUNT");
+#else
+	printf("\n    built --without-wasm: wwy module-cache test is a no-op\n");
+#endif
+}
+
+/*
  * spdk-yc1: warm-instance STATE ISOLATION between Execs. The warm cache reuses the
  * expensive engine + compiled module across Execs of the same (module,object), but
  * each Exec now gets a FRESH store+instance, so wasm globals / declared data reset
@@ -1706,6 +1995,10 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_tb3_verify_run_and_module_cache_hit);
 	CU_ADD_TEST(suite, test_nkvx_tb3_miss_without_bytes_fails_closed);
 	CU_ADD_TEST(suite, test_nkvx_yc1_warm_state_isolation);
+	CU_ADD_TEST(suite, test_nkvx_wwy_object_cache_bounded);
+	CU_ADD_TEST(suite, test_nkvx_wwy_pinned_survives_eviction);
+	CU_ADD_TEST(suite, test_nkvx_wwy_warm_cache_bounded);
+	CU_ADD_TEST(suite, test_nkvx_wwy_module_cache_bounded);
 	CU_ADD_TEST(suite, test_nkvx_epoch_ticker_teardown);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
 

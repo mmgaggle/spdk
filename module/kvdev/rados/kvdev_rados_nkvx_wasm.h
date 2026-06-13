@@ -146,6 +146,12 @@ int kvdev_rados_nkvx_wasm_run(const char *name,
  *     store+instance from those warm artifacts and tears it down afterwards, so
  *     wasm globals / declared data segments reset between Execs and module state
  *     never leaks from one Exec to the next; the costly compile stays warm.
+ *   - All three caches (object, warm, sha256 module) are BOUNDED by an LRU
+ *     eviction policy (spdk-wwy), env-overridable, so they cannot grow without
+ *     bound (critical for 64 MiB partitions). Eviction reuses the pin/unref
+ *     carry-ref machinery: it never frees a PINNED object; it marks it dead and
+ *     defers the free to the last unpin, exactly as invalidation does — so the
+ *     probe->dispatch->run_pinned path is never a use-after-free.
  *
  * \c fill is called with the executor-allocated, page-rounded cache buffer and
  * its capacity; it must write up to \c cap bytes and set \c *out_len to the true
@@ -248,8 +254,23 @@ struct kvdev_rados_nkvx_wasm_stats {
 	uint64_t	warm_hits;
 	const void	*last_mem_base;
 	const void	*last_cache_base;
+	/* Eviction accounting (spdk-wwy): how many entries each bounded cache has
+	 * evicted under its LRU cap. */
+	uint64_t	obj_evictions;
+	uint64_t	warm_evictions;
+	uint64_t	mod_evictions;
 };
 
 void kvdev_rados_nkvx_wasm_get_stats(struct kvdev_rados_nkvx_wasm_stats *out);
+
+/*
+ * Test-only introspection (spdk-wwy eviction proofs). Current LIVE object-cache
+ * entry count, current object-cache bytes (sum of page-rounded backings of all
+ * entries on the list, live + dead-pinned), and current warm-cache entry count.
+ * Return 0 in the stub build.
+ */
+uint64_t kvdev_rados_nkvx_wasm_obj_cache_count(void);
+uint64_t kvdev_rados_nkvx_wasm_obj_cache_bytes(void);
+uint64_t kvdev_rados_nkvx_wasm_warm_cache_count(void);
 
 #endif /* SPDK_KVDEV_RADOS_NKVX_WASM_H */
