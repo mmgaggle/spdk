@@ -140,9 +140,18 @@ int kvdev_rados_nkvx_wasm_run(const char *name,
  *   - The cached buffer backs the module's wasm linear memory ZERO-COPY via the
  *     wasmtime custom MemoryCreator (on-demand strategy, ADR-0013) — no gather /
  *     bounce copy-in. wasmtime_memory_data() aliases the cache buffer.
- *   - The instantiated wasm instance (engine/store/module/instance) is cached
- *     keyed by (module, obj_key) and REUSED on a subsequent Exec of the same
- *     pair (warm instance).
+ *   - The EXPENSIVE artifacts (engine + compiled module) are cached keyed by
+ *     (module, obj_key) and REUSED on a subsequent Exec of the same pair (warm
+ *     hit). For STATE ISOLATION (spdk-yc1) each Exec instantiates a FRESH
+ *     store+instance from those warm artifacts and tears it down afterwards, so
+ *     wasm globals / declared data segments reset between Execs and module state
+ *     never leaks from one Exec to the next; the costly compile stays warm.
+ *   - All three caches (object, warm, sha256 module) are BOUNDED by an LRU
+ *     eviction policy (spdk-wwy), env-overridable, so they cannot grow without
+ *     bound (critical for 64 MiB partitions). Eviction reuses the pin/unref
+ *     carry-ref machinery: it never frees a PINNED object; it marks it dead and
+ *     defers the free to the last unpin, exactly as invalidation does — so the
+ *     probe->dispatch->run_pinned path is never a use-after-free.
  *
  * \c fill is called with the executor-allocated, page-rounded cache buffer and
  * its capacity; it must write up to \c cap bytes and set \c *out_len to the true
@@ -221,6 +230,15 @@ int kvdev_rados_nkvx_wasm_run_pinned(const char *name,
 void kvdev_rados_nkvx_wasm_cache_invalidate(const char *obj_key);
 
 /*
+ * Tear down process-wide wasm runtime resources owned by the executor (spdk-0k1):
+ * stop and JOIN the background epoch ticker thread so it does not outlive the
+ * executor (no 1-thread leak on an executor stop/restart). Idempotent; a no-op in
+ * the stub build and when the ticker was never started. Called from
+ * kvdev_rados_nkvx_stop. A later executor restart lazily re-creates a fresh ticker.
+ */
+void kvdev_rados_nkvx_wasm_runtime_teardown(void);
+
+/*
  * Test-only introspection counters (TB4 acceptance proof). Defined unconditionally
  * so the unit test links them in both --with-wasm and --without-wasm builds.
  *   - cold_fills:        number of times a fill callback actually ran (cold fill).
@@ -236,8 +254,23 @@ struct kvdev_rados_nkvx_wasm_stats {
 	uint64_t	warm_hits;
 	const void	*last_mem_base;
 	const void	*last_cache_base;
+	/* Eviction accounting (spdk-wwy): how many entries each bounded cache has
+	 * evicted under its LRU cap. */
+	uint64_t	obj_evictions;
+	uint64_t	warm_evictions;
+	uint64_t	mod_evictions;
 };
 
 void kvdev_rados_nkvx_wasm_get_stats(struct kvdev_rados_nkvx_wasm_stats *out);
+
+/*
+ * Test-only introspection (spdk-wwy eviction proofs). Current LIVE object-cache
+ * entry count, current object-cache bytes (sum of page-rounded backings of all
+ * entries on the list, live + dead-pinned), and current warm-cache entry count.
+ * Return 0 in the stub build.
+ */
+uint64_t kvdev_rados_nkvx_wasm_obj_cache_count(void);
+uint64_t kvdev_rados_nkvx_wasm_obj_cache_bytes(void);
+uint64_t kvdev_rados_nkvx_wasm_warm_cache_count(void);
 
 #endif /* SPDK_KVDEV_RADOS_NKVX_WASM_H */

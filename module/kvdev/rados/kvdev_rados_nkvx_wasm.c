@@ -307,16 +307,26 @@ nkvx_wasm_api(void)
  * On-demand (ADR-0013) means at most one engine is live at a time on the single
  * executor worker, so the ticker tracks a single "current engine" pointer under a
  * mutex. nkvx_wasm_epoch_register()/_unregister() bracket each run; the thread is
- * started once (lazily) and runs for process lifetime (it is a cheap sleeper and
- * there is no teardown hook on this path). If a second engine ever overlapped,
+ * started once (lazily) on the first armed run. If a second engine ever overlapped,
  * the register call would simply replace the pointer — acceptable because each
  * run also has its own fuel ceiling as a second, independent guard.
+ *
+ * TEARDOWN (spdk-0k1): the ticker is NOT a process-lifetime leak. Executor stop
+ * (kvdev_rados_nkvx_stop -> kvdev_rados_nkvx_wasm_runtime_teardown) calls
+ * nkvx_wasm_epoch_stop(), which signals the thread to exit and JOINS it, clearing
+ * \c started so a later executor (re)start lazily re-creates a fresh ticker — no
+ * leaked thread on restart, no double-start. The loop waits on the condvar with a
+ * tick-interval timeout (instead of a bare nanosleep) so stop is observed promptly
+ * and the thread never touches an engine after stop (the join completes before the
+ * caller tears any engine down). The warm-path epoch arming (spdk-ii0 D3) is
+ * unaffected: register lazily restarts the ticker after a stop/restart.
  */
 static struct {
 	pthread_mutex_t		mutex;
 	pthread_cond_t		cond;
 	pthread_t		tid;
 	bool			started;
+	bool			stop;		/* set by nkvx_wasm_epoch_stop to exit */
 	wasm_engine_t		*engine;	/* engine to tick, or NULL when idle */
 	const struct nkvx_wasm_api *api;
 } g_epoch = {
@@ -329,23 +339,35 @@ nkvx_wasm_epoch_thread(void *arg)
 {
 	(void)arg;
 
-	for (;;) {
+	pthread_mutex_lock(&g_epoch.mutex);
+	while (!g_epoch.stop) {
 		struct timespec ts;
 
-		/* Sleep one tick interval (NKVX_WASM_EPOCH_TICK_NS). nanosleep is
-		 * fine here; this thread does nothing else. */
-		ts.tv_sec = (time_t)(NKVX_WASM_EPOCH_TICK_NS / 1000000000ull);
-		ts.tv_nsec = (long)(NKVX_WASM_EPOCH_TICK_NS % 1000000000ull);
-		nanosleep(&ts, NULL);
+		/* Wait up to one tick interval, but wake immediately on stop. Using
+		 * the condvar (vs a bare nanosleep) makes teardown prompt and bounds
+		 * the join latency to at most one tick. clock_gettime + timedwait is
+		 * the portable cancellable sleep. */
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_nsec += (long)(NKVX_WASM_EPOCH_TICK_NS % 1000000000ull);
+		ts.tv_sec += (time_t)(NKVX_WASM_EPOCH_TICK_NS / 1000000000ull);
+		if (ts.tv_nsec >= 1000000000L) {
+			ts.tv_nsec -= 1000000000L;
+			ts.tv_sec += 1;
+		}
+		pthread_cond_timedwait(&g_epoch.cond, &g_epoch.mutex, &ts);
 
-		pthread_mutex_lock(&g_epoch.mutex);
+		if (g_epoch.stop) {
+			break;
+		}
 		if (g_epoch.engine != NULL && g_epoch.api != NULL) {
 			/* Bump the epoch of the in-flight run's engine. A run that has
-			 * set an epoch deadline traps once its tick budget elapses. */
+			 * set an epoch deadline traps once its tick budget elapses.
+			 * Held under the mutex, so a concurrent _unregister (which also
+			 * takes the mutex) can never let us touch a torn-down engine. */
 			g_epoch.api->engine_increment_epoch(g_epoch.engine);
 		}
-		pthread_mutex_unlock(&g_epoch.mutex);
 	}
+	pthread_mutex_unlock(&g_epoch.mutex);
 	return NULL;
 }
 
@@ -355,6 +377,7 @@ nkvx_wasm_epoch_register(const struct nkvx_wasm_api *api, wasm_engine_t *engine)
 {
 	pthread_mutex_lock(&g_epoch.mutex);
 	if (!g_epoch.started) {
+		g_epoch.stop = false;
 		if (pthread_create(&g_epoch.tid, NULL, nkvx_wasm_epoch_thread, NULL) == 0) {
 			g_epoch.started = true;
 		} else {
@@ -376,6 +399,55 @@ nkvx_wasm_epoch_unregister(wasm_engine_t *engine)
 		g_epoch.engine = NULL;
 	}
 	pthread_mutex_unlock(&g_epoch.mutex);
+}
+
+/*
+ * Stop and JOIN the epoch ticker thread (spdk-0k1). Called from the executor
+ * teardown path. Idempotent: a no-op when the ticker was never started. Clears
+ * \c started so a later executor restart re-creates a fresh ticker (no leak, no
+ * double-start). The join guarantees the thread is gone before the caller deletes
+ * any engine, so the ticker never advances a stale/freed engine after stop. The
+ * engine pointer is cleared first so a wakeup-before-stop tick is a safe no-op.
+ */
+static void
+nkvx_wasm_epoch_stop(void)
+{
+	pthread_t tid;
+	bool joinable;
+
+	pthread_mutex_lock(&g_epoch.mutex);
+	joinable = g_epoch.started;
+	if (joinable) {
+		g_epoch.engine = NULL;
+		g_epoch.api = NULL;
+		g_epoch.stop = true;
+		tid = g_epoch.tid;
+		pthread_cond_broadcast(&g_epoch.cond);
+	}
+	pthread_mutex_unlock(&g_epoch.mutex);
+
+	if (joinable) {
+		pthread_join(tid, NULL);
+		pthread_mutex_lock(&g_epoch.mutex);
+		g_epoch.started = false;
+		g_epoch.stop = false;
+		pthread_mutex_unlock(&g_epoch.mutex);
+	}
+}
+
+/*
+ * Tear down process-wide wasm runtime resources owned by the executor (spdk-0k1).
+ * Currently: stop+join the epoch ticker thread. Called from kvdev_rados_nkvx_stop
+ * so the ticker does not outlive the executor (no 1-thread leak on a restart). The
+ * dlopen'd libwasmtime handle and the compiled-module/object caches are
+ * deliberately NOT dropped here (the caches have their own reset entry points and
+ * may legitimately survive an executor cycle); this hook is specifically the
+ * thread-lifetime teardown the ticker needs.
+ */
+void
+kvdev_rados_nkvx_wasm_runtime_teardown(void)
+{
+	nkvx_wasm_epoch_stop();
 }
 
 /* Parse a uint64 env override; returns def when unset/empty/unparseable. */
@@ -622,9 +694,24 @@ struct nkvx_module_entry {
 	STAILQ_ENTRY(nkvx_module_entry)	link;
 };
 
+/*
+ * EVICTION (spdk-wwy): the sha256 module cache is bounded by an LRU policy too
+ * (count + serialized bytes), env-overridable. A module entry has NO external pin
+ * (a lookup COPIES the blob out under the mutex and deserializes without holding
+ * it, so eviction can never free a blob in use), so this is a plain LRU drop —
+ * MRU at the tail, evict from the head. Re-running an evicted module simply
+ * re-verifies+recompiles from the fetched bytes on the next miss.
+ */
+#define NKVX_MOD_CACHE_MAX_COUNT_DEFAULT	128ull
+#define NKVX_MOD_CACHE_MAX_BYTES_DEFAULT	(256ull * 1024ull * 1024ull)	/* 256 MiB */
+#define NKVX_ENV_MOD_CACHE_MAX_COUNT		"SPDK_NKVX_MOD_CACHE_MAX_COUNT"
+#define NKVX_ENV_MOD_CACHE_MAX_BYTES		"SPDK_NKVX_MOD_CACHE_MAX_BYTES"
+
 static struct {
 	pthread_mutex_t				mutex;
 	STAILQ_HEAD(, nkvx_module_entry)	modules;
+	uint64_t				count;
+	uint64_t				bytes;
 	bool					inited;
 } g_modcache = {
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -635,11 +722,14 @@ nkvx_modcache_init_once(void)
 {
 	if (!g_modcache.inited) {
 		STAILQ_INIT(&g_modcache.modules);
+		g_modcache.count = 0;
+		g_modcache.bytes = 0;
 		g_modcache.inited = true;
 	}
 }
 
-/* Find a cached compiled module by hash (mutex held). */
+/* Find a cached compiled module by hash (mutex held). LRU touch on hit is done by
+ * the caller where it has write intent; lookup itself is read-only. */
 static struct nkvx_module_entry *
 nkvx_modcache_lookup(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN])
 {
@@ -651,6 +741,35 @@ nkvx_modcache_lookup(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN])
 		}
 	}
 	return NULL;
+}
+
+/* Enforce the module-cache caps (mutex held): evict LRU entries from the head past
+ * the count/byte caps. Plain LRU (no pins). Call AFTER inserting the new entry. */
+static void
+nkvx_modcache_enforce_caps(void)
+{
+	uint64_t max_count = nkvx_wasm_env_u64(NKVX_ENV_MOD_CACHE_MAX_COUNT,
+					       NKVX_MOD_CACHE_MAX_COUNT_DEFAULT);
+	uint64_t max_bytes = nkvx_wasm_env_u64(NKVX_ENV_MOD_CACHE_MAX_BYTES,
+					       NKVX_MOD_CACHE_MAX_BYTES_DEFAULT);
+
+	if (max_count == 0 && max_bytes == 0) {
+		return;
+	}
+	while ((max_count != 0 && g_modcache.count > max_count) ||
+	       (max_bytes != 0 && g_modcache.bytes > max_bytes)) {
+		struct nkvx_module_entry *e = STAILQ_FIRST(&g_modcache.modules);
+
+		if (e == NULL) {
+			break;
+		}
+		STAILQ_REMOVE_HEAD(&g_modcache.modules, link);
+		g_modcache.count--;
+		g_modcache.bytes -= e->serialized_len;
+		free(e->serialized);
+		free(e);
+		g_nkvx_wasm_stats.mod_evictions++;
+	}
 }
 
 bool
@@ -770,7 +889,12 @@ kvdev_rados_nkvx_wasm_module_insert(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN
 		status = SPDK_KVDEV_IO_STATUS_SUCCESS;
 		goto out;
 	}
-	STAILQ_INSERT_TAIL(&g_modcache.modules, e, link);
+	STAILQ_INSERT_TAIL(&g_modcache.modules, e, link);	/* MRU at tail */
+	g_modcache.count++;
+	g_modcache.bytes += e->serialized_len;
+	/* Bound the module cache (spdk-wwy): evict LRU entries past the cap. The
+	 * just-inserted MRU entry is at the tail, so it is never the victim. */
+	nkvx_modcache_enforce_caps();
 	pthread_mutex_unlock(&g_modcache.mutex);
 	e = NULL;	/* owned by the cache now */
 	status = SPDK_KVDEV_IO_STATUS_SUCCESS;
@@ -801,20 +925,19 @@ kvdev_rados_nkvx_wasm_module_cache_reset(void)
 		free(e->serialized);
 		free(e);
 	}
+	g_modcache.count = 0;
+	g_modcache.bytes = 0;
 	pthread_mutex_unlock(&g_modcache.mutex);
 }
 
 uint64_t
 kvdev_rados_nkvx_wasm_module_cache_count(void)
 {
-	struct nkvx_module_entry *e;
-	uint64_t n = 0;
+	uint64_t n;
 
 	pthread_mutex_lock(&g_modcache.mutex);
 	nkvx_modcache_init_once();
-	STAILQ_FOREACH(e, &g_modcache.modules, link) {
-		n++;
-	}
+	n = g_modcache.count;
 	pthread_mutex_unlock(&g_modcache.mutex);
 	return n;
 }
@@ -853,6 +976,9 @@ nkvx_module_obtain(const struct nkvx_wasm_api *api, wasm_engine_t *engine,
 		}
 		memcpy(blob, e->serialized, e->serialized_len);
 		blob_len = e->serialized_len;
+		/* LRU touch: a reused module is hot — move it to the tail (mutex held). */
+		STAILQ_REMOVE(&g_modcache.modules, e, nkvx_module_entry, link);
+		STAILQ_INSERT_TAIL(&g_modcache.modules, e, link);
 	}
 	pthread_mutex_unlock(&g_modcache.mutex);
 
@@ -928,28 +1054,67 @@ struct nkvx_obj_entry {
 };
 
 /*
- * A warm wasm instance, keyed by (module, obj_key). Holds the whole on-demand
- * tower (engine/store/module/instance) so a repeat Exec of the same pair skips
- * re-instantiation. Pinned to the object entry whose buffer backs its memory.
+ * A warm wasm engine+compiled-module, keyed by (module, obj_key). Caches the
+ * EXPENSIVE artifacts — the engine (with the per-object zero-copy MemoryCreator
+ * wired into its config) and the compiled module — so a repeat Exec of the same
+ * pair skips engine creation + module compile/deserialize. Pinned to the object
+ * entry whose buffer backs its memory.
+ *
+ * STATE ISOLATION (spdk-yc1): the per-Exec STORE + INSTANCE are deliberately NOT
+ * cached. Each Exec instantiates a fresh store+instance from the warm engine +
+ * compiled module and deletes the store when done. Re-instantiation resets every
+ * wasm GLOBAL to its declared init and RE-RUNS the module's data-segment
+ * initializers, so module state never leaks from one Exec to the next. The
+ * expensive compile/engine stay warm (instantiation is cheap relative to compile),
+ * so this keeps the warm-cache perf win while making each Exec start from a clean
+ * instance. A warm HIT still means "engine+compiled module reused" (warm_hits
+ * increments); only the cheap, isolation-critical instance is rebuilt per run.
  */
 struct nkvx_warm_entry {
 	char			module[64];
 	char			obj_key[256];
 	wasm_engine_t		*engine;
-	wasmtime_store_t	*store;
-	wasmtime_context_t	*ctx;
 	wasmtime_module_t	*module_h;
-	wasmtime_instance_t	instance;
-	wasmtime_extern_t	mem_ext;	/* exported "memory" */
-	wasmtime_extern_t	fn_ext;		/* exported <module> */
 	struct nkvx_obj_entry	*obj;		/* backing object (zero-copy alias) */
 	STAILQ_ENTRY(nkvx_warm_entry) link;
 };
+
+/*
+ * EVICTION (spdk-wwy). The object + warm caches are bounded by an LRU policy so
+ * they cannot grow without bound (important for 64 MiB partitions — a handful of
+ * objects would otherwise pin gigabytes). Each list is kept in LRU order:
+ * most-recently-USED at the TAIL, least-recently-used at the HEAD; a touch on
+ * access re-links the entry to the tail. On insert past the cap we evict from the
+ * head.
+ *
+ * RACE SAFETY (spdk-ii0 D2 carry-ref): eviction MUST reuse the existing pin/unref
+ * machinery — it must NOT free a PINNED object entry (a probe-hit Exec carries a
+ * pin from cache_pin through to the worker run, and a warm entry pins the object it
+ * aliases). Evicting an object therefore (1) tears down ALL its warm entries first
+ * (each drops its object pin), then (2) marks the object dead and runs it through
+ * nkvx_obj_unref: an unpinned object is removed+freed immediately, a still-pinned
+ * one stays dead-on-list and is freed by the LAST unpin — exactly as invalidation
+ * does. A dead object is invisible to nkvx_obj_lookup, so the probe→dispatch path
+ * is unaffected (it already pins; a pinned entry is never freed under it). No
+ * use-after-free, no eviction of in-use bytes.
+ *
+ * Caps are env-overridable so tests and tuning can drive them; 0 disables a cap.
+ */
+#define NKVX_OBJ_CACHE_MAX_COUNT_DEFAULT	256ull
+#define NKVX_OBJ_CACHE_MAX_BYTES_DEFAULT	(512ull * 1024ull * 1024ull)	/* 512 MiB */
+#define NKVX_WARM_CACHE_MAX_COUNT_DEFAULT	256ull
+
+#define NKVX_ENV_OBJ_CACHE_MAX_COUNT	"SPDK_NKVX_OBJ_CACHE_MAX_COUNT"
+#define NKVX_ENV_OBJ_CACHE_MAX_BYTES	"SPDK_NKVX_OBJ_CACHE_MAX_BYTES"
+#define NKVX_ENV_WARM_CACHE_MAX_COUNT	"SPDK_NKVX_WARM_CACHE_MAX_COUNT"
 
 static struct {
 	pthread_mutex_t				mutex;
 	STAILQ_HEAD(, nkvx_obj_entry)		objects;
 	STAILQ_HEAD(, nkvx_warm_entry)		warm;
+	uint64_t				obj_count;	/* LIVE+dead objects on list */
+	uint64_t				obj_bytes;	/* sum of mem_cap on list */
+	uint64_t				warm_count;
 	bool					inited;
 } g_cache = {
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
@@ -961,6 +1126,9 @@ nkvx_cache_init_once(void)
 	if (!g_cache.inited) {
 		STAILQ_INIT(&g_cache.objects);
 		STAILQ_INIT(&g_cache.warm);
+		g_cache.obj_count = 0;
+		g_cache.obj_bytes = 0;
+		g_cache.warm_count = 0;
 		g_cache.inited = true;
 	}
 }
@@ -999,11 +1167,41 @@ nkvx_obj_free(struct nkvx_obj_entry *o)
 	free(o);
 }
 
+/* Link an object onto the cache list as MOST-recently-used (tail) and account it
+ * (mutex held). */
+static void
+nkvx_obj_list_add(struct nkvx_obj_entry *o)
+{
+	STAILQ_INSERT_TAIL(&g_cache.objects, o, link);
+	g_cache.obj_count++;
+	g_cache.obj_bytes += o->mem_cap;
+}
+
+/* Unlink an object from the cache list and un-account it (mutex held). Does not
+ * free. */
+static void
+nkvx_obj_list_remove(struct nkvx_obj_entry *o)
+{
+	STAILQ_REMOVE(&g_cache.objects, o, nkvx_obj_entry, link);
+	assert(g_cache.obj_count > 0);
+	g_cache.obj_count--;
+	g_cache.obj_bytes -= o->mem_cap;
+}
+
+/* LRU touch: move a live object to the tail (most-recently-used) so eviction takes
+ * the genuinely-coldest entry from the head (mutex held). */
+static void
+nkvx_obj_touch(struct nkvx_obj_entry *o)
+{
+	STAILQ_REMOVE(&g_cache.objects, o, nkvx_obj_entry, link);
+	STAILQ_INSERT_TAIL(&g_cache.objects, o, link);
+}
+
 /* Drop one pin on an object entry (mutex held). When the last pin drops and the
- * entry is dead (invalidated), free it now — this is the carry-ref guarantee that
- * an in-flight Exec which pinned a version before a Store can finish over that
- * version without a use-after-free, while the entry is already invisible to new
- * Execs. */
+ * entry is dead (invalidated OR evicted), free it now — this is the carry-ref
+ * guarantee that an in-flight Exec which pinned a version before a Store/eviction
+ * can finish over that version without a use-after-free, while the entry is already
+ * invisible to new Execs. */
 static void
 nkvx_obj_unref(struct nkvx_obj_entry *o)
 {
@@ -1013,9 +1211,38 @@ nkvx_obj_unref(struct nkvx_obj_entry *o)
 		/* A dead entry stays ON the objects list (invisible to lookup via the
 		 * dead flag) until its last pin drops, so cache_reset can always find
 		 * and free it. Remove + free it now that no pin remains. */
-		STAILQ_REMOVE(&g_cache.objects, o, nkvx_obj_entry, link);
+		nkvx_obj_list_remove(o);
 		nkvx_obj_free(o);
 	}
+}
+
+/* Tear down a warm entry: unlink + un-account it, free the wasm artifacts, and
+ * drop the pin it held on its backing object (mutex held). The object unref may
+ * free a dead/evicted object once its last pin drops (carry-ref). */
+static void
+nkvx_warm_destroy(const struct nkvx_wasm_api *api, struct nkvx_warm_entry *w)
+{
+	struct nkvx_obj_entry *obj = w->obj;
+
+	STAILQ_REMOVE(&g_cache.warm, w, nkvx_warm_entry, link);
+	assert(g_cache.warm_count > 0);
+	g_cache.warm_count--;
+	if (api != NULL) {
+		nkvx_warm_free(api, w);
+	} else {
+		free(w);
+	}
+	if (obj != NULL) {
+		nkvx_obj_unref(obj);
+	}
+}
+
+/* LRU touch a warm entry to the tail (mutex held). */
+static void
+nkvx_warm_touch(struct nkvx_warm_entry *w)
+{
+	STAILQ_REMOVE(&g_cache.warm, w, nkvx_warm_entry, link);
+	STAILQ_INSERT_TAIL(&g_cache.warm, w, link);
 }
 
 /*
@@ -1037,17 +1264,7 @@ nkvx_cache_invalidate_locked(const struct nkvx_wasm_api *api, const char *obj_ke
 	 * so tearing the warm entry down (and unref'ing its object) drops that pin. */
 	STAILQ_FOREACH_SAFE(w, &g_cache.warm, link, wtmp) {
 		if (strcmp(w->obj_key, obj_key) == 0) {
-			struct nkvx_obj_entry *obj = w->obj;
-
-			STAILQ_REMOVE(&g_cache.warm, w, nkvx_warm_entry, link);
-			if (api != NULL) {
-				nkvx_warm_free(api, w);
-			} else {
-				free(w);
-			}
-			if (obj != NULL) {
-				nkvx_obj_unref(obj);
-			}
+			nkvx_warm_destroy(api, w);
 		}
 	}
 
@@ -1060,6 +1277,106 @@ nkvx_cache_invalidate_locked(const struct nkvx_wasm_api *api, const char *obj_ke
 			o->refcount++;
 			nkvx_obj_unref(o);
 		}
+	}
+}
+
+/*
+ * Evict ONE object entry e (mutex held), race-safely. First tear down ALL warm
+ * entries that pin e (dropping their pins), then mark e dead and run it through the
+ * single unref path: an unpinned e is removed+freed now, a still-pinned e (a
+ * probe-hit Exec carries a pin) stays dead-on-list and is freed by its last unpin.
+ * NEVER frees pinned bytes — same carry-ref discipline as invalidation. The caller
+ * must have selected e from the LRU head among LIVE entries.
+ */
+static void
+nkvx_obj_evict_locked(const struct nkvx_wasm_api *api, struct nkvx_obj_entry *e)
+{
+	struct nkvx_warm_entry *w, *wtmp;
+
+	STAILQ_FOREACH_SAFE(w, &g_cache.warm, link, wtmp) {
+		if (w->obj == e) {
+			nkvx_warm_destroy(api, w);
+		}
+	}
+	e->dead = true;
+	e->refcount++;
+	nkvx_obj_unref(e);	/* freed now if unpinned; deferred to last unpin if pinned */
+	g_nkvx_wasm_stats.obj_evictions++;
+}
+
+/*
+ * Enforce the object-cache caps (mutex held): while the LIVE object count or live
+ * bytes exceed the (env-overridable) caps, evict the least-recently-used LIVE
+ * object from the head. Dead entries are awaiting their last unpin and are skipped
+ * (they neither serve lookups nor can be re-evicted). A live-but-PINNED LRU entry
+ * is evicted safely (marked dead, freed on last unpin); we still advance past it so
+ * a fully-pinned cache cannot loop forever. Call AFTER inserting the new entry.
+ */
+static void
+nkvx_obj_cache_enforce_caps(const struct nkvx_wasm_api *api)
+{
+	uint64_t max_count = nkvx_wasm_env_u64(NKVX_ENV_OBJ_CACHE_MAX_COUNT,
+					       NKVX_OBJ_CACHE_MAX_COUNT_DEFAULT);
+	uint64_t max_bytes = nkvx_wasm_env_u64(NKVX_ENV_OBJ_CACHE_MAX_BYTES,
+					       NKVX_OBJ_CACHE_MAX_BYTES_DEFAULT);
+	struct nkvx_obj_entry *o, *otmp;
+
+	if (max_count == 0 && max_bytes == 0) {
+		return;		/* caps disabled */
+	}
+
+	/* Count only LIVE entries against the count cap (dead ones are transient). */
+	for (;;) {
+		uint64_t live = 0;
+		struct nkvx_obj_entry *victim = NULL;
+
+		STAILQ_FOREACH(o, &g_cache.objects, link) {
+			if (!o->dead) {
+				live++;
+				if (victim == NULL) {
+					victim = o;	/* LRU live = head-most live */
+				}
+			}
+		}
+		bool over_count = (max_count != 0 && live > max_count);
+		bool over_bytes = (max_bytes != 0 && g_cache.obj_bytes > max_bytes);
+
+		if (!over_count && !over_bytes) {
+			break;
+		}
+		if (victim == NULL) {
+			break;		/* nothing live to evict */
+		}
+		(void)otmp;
+		nkvx_obj_evict_locked(api, victim);
+		/* Guard against a pathological all-pinned set: if obj_bytes did not drop
+		 * (victim was pinned, deferred free) and it was the only live entry, stop. */
+		if (live == 1) {
+			break;
+		}
+	}
+}
+
+/* Enforce the warm-cache count cap (mutex held): evict LRU warm entries from the
+ * head. A warm entry holds no external pin (only the object pin it drops on
+ * destroy), so this is a plain LRU drop — no carry-ref needed. Call AFTER insert. */
+static void
+nkvx_warm_cache_enforce_caps(const struct nkvx_wasm_api *api)
+{
+	uint64_t max_count = nkvx_wasm_env_u64(NKVX_ENV_WARM_CACHE_MAX_COUNT,
+					       NKVX_WARM_CACHE_MAX_COUNT_DEFAULT);
+
+	if (max_count == 0) {
+		return;
+	}
+	while (g_cache.warm_count > max_count) {
+		struct nkvx_warm_entry *w = STAILQ_FIRST(&g_cache.warm);
+
+		if (w == NULL) {
+			break;
+		}
+		nkvx_warm_destroy(api, w);
+		g_nkvx_wasm_stats.warm_evictions++;
 	}
 }
 
@@ -1247,10 +1564,12 @@ nkvx_zc_new_memory(void *env, const wasm_memorytype_t *ty, size_t minimum,
 }
 
 /*
- * Build the on-demand tower (engine/store/module/instance) for a (module, object)
- * with the cached object's buffer wired in zero-copy via the MemoryCreator, then
- * cache it warm. On success *out_warm points at the cached warm entry (owned by
- * the cache). Caps are applied per-run by the caller, not here.
+ * Build and cache the WARM artifacts (engine + compiled module) for a
+ * (module, object), with the cached object's buffer wired in zero-copy via the
+ * MemoryCreator on the engine config. The per-Exec store + instance are NOT built
+ * here (state isolation, spdk-yc1) — they are created fresh on every run in
+ * nkvx_run_on_object_locked. On success *out_warm points at the cached warm entry
+ * (owned by the cache). Caps are applied per-run by the caller, not here.
  */
 static int
 nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
@@ -1262,13 +1581,8 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	size_t wasm_len = 0;
 	wasm_config_t *config = NULL;
 	wasm_engine_t *engine = NULL;
-	wasmtime_store_t *store = NULL;
-	wasmtime_context_t *ctx = NULL;
 	wasmtime_module_t *module_h = NULL;
 	wasmtime_error_t *err = NULL;
-	wasm_trap_t *trap = NULL;
-	wasmtime_instance_t instance;
-	wasmtime_extern_t mem_ext, fn_ext;
 	struct nkvx_warm_entry *w = NULL;
 	struct nkvx_zc_ctx *zc = NULL;
 	wasmtime_memory_creator_t creator;
@@ -1340,11 +1654,6 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	if (engine == NULL) {
 		goto out;
 	}
-	store = api->store_new(engine, NULL, NULL);
-	if (store == NULL) {
-		goto out;
-	}
-	ctx = api->store_context(store);
 
 	if (mod != NULL) {
 		/* VERIFIED path (ADR-0010): deserialize the sha256-cached compiled module
@@ -1364,27 +1673,6 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 			goto out;
 		}
 	}
-	err = api->instance_new(ctx, module_h, NULL, 0, &instance, &trap);
-	if (err != NULL) {
-		nkvx_wasm_log_error(api, "instance_new", err);
-		goto out;
-	}
-	if (trap != NULL) {
-		SPDK_ERRLOG("nkvx/wasm: zero-copy instantiation trapped\n");
-		api->trap_delete(trap);
-		goto out;
-	}
-	if (!api->instance_export_get(ctx, &instance, "memory", strlen("memory"), &mem_ext) ||
-	    mem_ext.kind != WASMTIME_EXTERN_MEMORY) {
-		SPDK_ERRLOG("nkvx/wasm: module '%s' has no exported 'memory'\n", module);
-		goto out;
-	}
-	if (!api->instance_export_get(ctx, &instance, module, strlen(module), &fn_ext) ||
-	    fn_ext.kind != WASMTIME_EXTERN_FUNC) {
-		SPDK_ERRLOG("nkvx/wasm: module '%s' has no exported function '%s'\n",
-			    module, module);
-		goto out;
-	}
 
 	w = calloc(1, sizeof(*w));
 	if (w == NULL) {
@@ -1393,33 +1681,30 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	snprintf(w->module, sizeof(w->module), "%s", module);
 	snprintf(w->obj_key, sizeof(w->obj_key), "%s", obj->obj_key);
 	w->engine = engine;
-	w->store = store;
-	w->ctx = ctx;
 	w->module_h = module_h;
-	w->instance = instance;
-	w->mem_ext = mem_ext;
-	w->fn_ext = fn_ext;
 	w->obj = obj;
-	/* The warm instance aliases obj->mem zero-copy: pin the object so an
-	 * invalidation cannot free the buffer out from under this warm instance
-	 * (spdk-ii0 D2). The pin is dropped when the warm entry is torn down. */
+	/* The warm engine's MemoryCreator aliases obj->mem zero-copy on every
+	 * instantiation: pin the object so an invalidation cannot free the buffer out
+	 * from under this warm entry (spdk-ii0 D2). The pin is dropped when the warm
+	 * entry is torn down. */
 	obj->refcount++;
 
-	STAILQ_INSERT_TAIL(&g_cache.warm, w, link);
+	STAILQ_INSERT_TAIL(&g_cache.warm, w, link);	/* MRU at tail */
+	g_cache.warm_count++;
 	*out_warm = w;
+
+	/* Bound the warm cache (spdk-wwy): evict LRU warm entries past the cap. The
+	 * just-inserted MRU entry is at the tail, so it is never the eviction victim. */
+	nkvx_warm_cache_enforce_caps(api);
 
 	/* Ownership transferred to the warm entry; do not tear down below. */
 	engine = NULL;
-	store = NULL;
 	module_h = NULL;
 	rc = 0;
 
 out:
 	if (module_h != NULL) {
 		api->module_delete(module_h);
-	}
-	if (store != NULL) {
-		api->store_delete(store);
 	}
 	if (engine != NULL) {
 		api->engine_delete(engine);
@@ -1435,9 +1720,6 @@ nkvx_warm_free(const struct nkvx_wasm_api *api, struct nkvx_warm_entry *w)
 	if (w->module_h != NULL) {
 		api->module_delete(w->module_h);
 	}
-	if (w->store != NULL) {
-		api->store_delete(w->store);
-	}
 	if (w->engine != NULL) {
 		api->engine_delete(w->engine);
 	}
@@ -1445,11 +1727,24 @@ nkvx_warm_free(const struct nkvx_wasm_api *api, struct nkvx_warm_entry *w)
 }
 
 /*
- * Run module `name` against object entry `obj` (mutex held). Builds or reuses a
- * warm instance bound to THIS object, applies the per-invocation caps, calls the
- * module, and extracts the result. Returns an SPDK_KVDEV_IO_STATUS_*. Shared by
- * the key-based run_cached (cold-fill path) and the pinned run (probe-skip path)
- * so both arm identical caps and zero-copy bookkeeping.
+ * Run module `name` against object entry `obj` (mutex held). Builds or reuses the
+ * WARM engine+compiled module bound to THIS object, then instantiates a FRESH
+ * store+instance for THIS Exec (state isolation, spdk-yc1), applies the
+ * per-invocation caps, calls the module, extracts the result, and deletes the
+ * store. Returns an SPDK_KVDEV_IO_STATUS_*. Shared by the key-based run_cached
+ * (cold-fill path) and the pinned run (probe-skip path) so both arm identical caps
+ * and zero-copy bookkeeping.
+ *
+ * STATE ISOLATION (spdk-yc1): the per-Exec store+instance are created here and torn
+ * down before return. Re-instantiating resets every wasm GLOBAL to its declared
+ * init and re-runs the module's data-segment initializers, so globals/scratch from
+ * a prior Exec of the same (module,object) never leak into this one. The expensive
+ * compile + engine stay warm (see nkvx_warm_entry), so the warm-cache perf win is
+ * preserved while each Exec starts from a clean instance. Note the OBJECT region of
+ * linear memory is the cached object buffer (zero-copy or private fallback) and is
+ * intentionally the same bytes across Execs of the SAME object — that is the
+ * object's own content, not cross-Exec state; only the module's instance state
+ * (globals, declared data segments) is reset.
  */
 static int
 nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
@@ -1461,15 +1756,21 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 	struct nkvx_wasm_caps caps;
 	uint8_t *mem_base;
 	size_t mem_size;
+	wasmtime_store_t *store = NULL;
+	wasmtime_context_t *ctx;
+	wasmtime_instance_t instance;
+	wasmtime_extern_t mem_ext, fn_ext;
 	wasmtime_error_t *err = NULL;
 	wasm_trap_t *trap = NULL;
+	bool epoch_armed = false;
 	wasmtime_val_t args[2], results[1];
 	int status = SPDK_KVDEV_IO_STATUS_FAILED;
 
-	/* ---- warm-instance cache, keyed by (module, object) ----------------- */
+	/* ---- warm engine + compiled-module cache, keyed by (module, object) -- */
 	warm = nkvx_warm_lookup(name, obj);
 	if (warm != NULL) {
 		g_nkvx_wasm_stats.warm_hits++;
+		nkvx_warm_touch(warm);		/* LRU: a reused warm entry is hot */
 	} else {
 		if (nkvx_warm_build(api, name, mod, obj, &warm) != 0) {
 			SPDK_ERRLOG("nkvx/wasm: warm build failed for '%s'/'%s'\n", name, obj->obj_key);
@@ -1477,27 +1778,53 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 		}
 	}
 
-	/* ---- zero-copy proof: linear memory aliases the cache buffer -------- */
-	mem_base = api->memory_data(warm->ctx, &warm->mem_ext.of.memory);
-	mem_size = api->memory_data_size(warm->ctx, &warm->mem_ext.of.memory);
-	g_nkvx_wasm_stats.last_mem_base = mem_base;
-	g_nkvx_wasm_stats.last_cache_base = obj->mem;
-
 	/*
-	 * Per-invocation caps (TB2) on the warm store before the call (spdk-ii0 D3):
-	 * arm fuel AND the memory limiter AND the epoch deadline, matching run() so the
-	 * warm/cached path is contained against compute-, memory-, and wall-clock
-	 * runaways exactly like the cold path. Caps source: the binding's caps word
-	 * (TB3) when a verified \c mod is present; otherwise defaults (legacy tests).
+	 * FRESH per-Exec store + instance (spdk-yc1). The warm engine carries the
+	 * zero-copy MemoryCreator on its config, so this instantiation re-aliases the
+	 * cached object buffer (zero-copy) while resetting all module globals/data.
 	 */
+	store = api->store_new(warm->engine, NULL, NULL);
+	if (store == NULL) {
+		SPDK_ERRLOG("nkvx/wasm: store_new failed for '%s'\n", name);
+		return SPDK_KVDEV_IO_STATUS_FAILED;
+	}
+	ctx = api->store_context(store);
+
 	nkvx_wasm_caps_load(&caps, mod != NULL ? mod->caps : 0);
 
-	/* MEMORY CAP: bound linear memory so a memory.grow past the cap fails and the
-	 * module is contained (never OOMing the target), exactly as run() does. */
+	/* MEMORY CAP belt-and-suspenders on the warm path (the real bound is
+	 * nkvx_zc_grow refusing growth past the backing; see spdk-90x). */
 	if (caps.max_memory_bytes > 0) {
-		api->store_limiter(warm->store, (int64_t)caps.max_memory_bytes,
-				   -1, -1, -1, -1);
+		api->store_limiter(store, (int64_t)caps.max_memory_bytes, -1, -1, -1, -1);
 	}
+
+	err = api->instance_new(ctx, warm->module_h, NULL, 0, &instance, &trap);
+	if (err != NULL) {
+		nkvx_wasm_log_error(api, "instance_new (warm)", err);
+		goto out;
+	}
+	if (trap != NULL) {
+		SPDK_ERRLOG("nkvx/wasm: warm instantiation trapped\n");
+		api->trap_delete(trap);
+		trap = NULL;
+		goto out;
+	}
+	if (!api->instance_export_get(ctx, &instance, "memory", strlen("memory"), &mem_ext) ||
+	    mem_ext.kind != WASMTIME_EXTERN_MEMORY) {
+		SPDK_ERRLOG("nkvx/wasm: module '%s' has no exported 'memory'\n", name);
+		goto out;
+	}
+	if (!api->instance_export_get(ctx, &instance, name, strlen(name), &fn_ext) ||
+	    fn_ext.kind != WASMTIME_EXTERN_FUNC) {
+		SPDK_ERRLOG("nkvx/wasm: module '%s' has no exported function '%s'\n", name, name);
+		goto out;
+	}
+
+	/* ---- zero-copy proof: linear memory aliases the cache buffer -------- */
+	mem_base = api->memory_data(ctx, &mem_ext.of.memory);
+	mem_size = api->memory_data_size(ctx, &mem_ext.of.memory);
+	g_nkvx_wasm_stats.last_mem_base = mem_base;
+	g_nkvx_wasm_stats.last_cache_base = obj->mem;
 
 	/*
 	 * The warm engine ALWAYS has the fuel feature enabled (see nkvx_warm_build),
@@ -1507,10 +1834,10 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 	{
 		uint64_t fuel = caps.fuel_ceiling > 0 ? caps.fuel_ceiling : UINT64_MAX;
 
-		err = api->context_set_fuel(warm->ctx, fuel);
+		err = api->context_set_fuel(ctx, fuel);
 		if (err != NULL) {
 			nkvx_wasm_log_error(api, "context_set_fuel", err);
-			return SPDK_KVDEV_IO_STATUS_FAILED;
+			goto out;
 		}
 	}
 
@@ -1526,41 +1853,44 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 	 * never trips an unset deadline. The ticker is disarmed right after the call,
 	 * before the mutex is dropped, so it never advances a stale/reused engine. */
 	if (caps.epoch_deadline_ticks > 0) {
-		api->context_set_epoch_deadline(warm->ctx, caps.epoch_deadline_ticks);
+		api->context_set_epoch_deadline(ctx, caps.epoch_deadline_ticks);
 		nkvx_wasm_epoch_register(api, warm->engine);
+		epoch_armed = true;
 	} else {
-		api->context_set_epoch_deadline(warm->ctx, UINT64_MAX);
+		api->context_set_epoch_deadline(ctx, UINT64_MAX);
 	}
 
 	args[0].kind = WASMTIME_I32;
 	args[0].of.i32 = (int32_t)WASM_OBJ_OFF;
 	args[1].kind = WASMTIME_I32;
 	args[1].of.i32 = (int32_t)obj->obj_len;
-	err = api->func_call(warm->ctx, &warm->fn_ext.of.func, args, 2, results, 1, &trap);
+	err = api->func_call(ctx, &fn_ext.of.func, args, 2, results, 1, &trap);
 
-	/* Disarm the ticker as soon as the call returns (the engine is reused, not
-	 * deleted, so we only need to stop it pointing at this engine). Only armed
-	 * when the epoch cap was active this call. */
-	if (caps.epoch_deadline_ticks > 0) {
+	/* Disarm the ticker as soon as the call returns; the engine is reused (not
+	 * deleted), so we only need to stop it pointing at this engine. */
+	if (epoch_armed) {
 		nkvx_wasm_epoch_unregister(warm->engine);
+		epoch_armed = false;
 	}
 
 	if (err != NULL) {
 		nkvx_wasm_log_error(api, "func_call", err);
-		return SPDK_KVDEV_IO_STATUS_FAILED;
+		goto out;
 	}
 	if (trap != NULL) {
 		bool cap = nkvx_wasm_trap_is_cap(api, trap);
 
 		api->trap_delete(trap);
+		trap = NULL;
 		/* Log parity with the plain run() path so a cap kill on the cached path
 		 * is equally observable (a contained abort, never a crash). */
 		SPDK_ERRLOG("nkvx/wasm: module '%s' trapped during execution (%s)\n",
 			    name, cap ? "RESOURCE CAP — aborted" : "fault");
-		return cap ? SPDK_KVDEV_IO_STATUS_ABORTED : SPDK_KVDEV_IO_STATUS_FAILED;
+		status = cap ? SPDK_KVDEV_IO_STATUS_ABORTED : SPDK_KVDEV_IO_STATUS_FAILED;
+		goto out;
 	}
 	if (results[0].kind != WASMTIME_I32) {
-		return SPDK_KVDEV_IO_STATUS_FAILED;
+		goto out;
 	}
 
 	{
@@ -1568,7 +1898,7 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 		uint32_t copy;
 
 		if ((size_t)WASM_RES_OFF + produced > mem_size) {
-			return SPDK_KVDEV_IO_STATUS_FAILED;
+			goto out;
 		}
 		*result_len = produced;
 		copy = (uint32_t)spdk_min(produced, out_len);
@@ -1578,6 +1908,19 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 		status = (produced > out_len) ?
 			 SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL :
 			 SPDK_KVDEV_IO_STATUS_SUCCESS;
+	}
+
+out:
+	/* Disarm the ticker before deleting the store/instance if a goto skipped the
+	 * normal disarm (e.g. context_set_fuel failed after arming — cannot happen as
+	 * arming is after, but keep it defensive against future reorders). */
+	if (epoch_armed) {
+		nkvx_wasm_epoch_unregister(warm->engine);
+	}
+	/* Tear down the per-Exec store+instance so the NEXT Exec starts clean (resets
+	 * globals + data segments). The warm engine + compiled module survive. */
+	if (store != NULL) {
+		api->store_delete(store);
 	}
 	return status;
 }
@@ -1609,8 +1952,10 @@ kvdev_rados_nkvx_wasm_run_cached(const char *name,
 	/* ---- content-addressed object cache (cold-fill-once) ---------------- */
 	obj = nkvx_obj_lookup(obj_key);
 	if (obj != NULL && obj->filled) {
-		/* HIT: served locally, NO librados refetch (fill not called). */
+		/* HIT: served locally, NO librados refetch (fill not called). LRU touch
+		 * so a frequently-used object is not evicted as if it were cold. */
 		g_nkvx_wasm_stats.content_hits++;
+		nkvx_obj_touch(obj);
 	} else {
 		/* MISS: allocate the page-rounded backing and cold-fill ONCE. The
 		 * object bytes live at WASM_OBJ_OFF so the same .wasm ABI applies. */
@@ -1648,7 +1993,12 @@ kvdev_rados_nkvx_wasm_run_cached(const char *name,
 		obj->obj_len = got;
 		obj->filled = true;
 		g_nkvx_wasm_stats.cold_fills++;
-		STAILQ_INSERT_TAIL(&g_cache.objects, obj, link);
+		nkvx_obj_list_add(obj);		/* MRU at tail + account bytes/count */
+		/* Bound the object cache (spdk-wwy): evict LRU LIVE objects past the cap.
+		 * The just-filled object is MRU (tail), so it is never the victim. Eviction
+		 * tears down the victim's warm entries and defers any pinned free. Done
+		 * before the run so this Exec's warm build observes the post-eviction set. */
+		nkvx_obj_cache_enforce_caps(api);
 	}
 
 	status = nkvx_run_on_object_locked(api, name, mod, obj, out, out_len, result_len);
@@ -1705,19 +2055,9 @@ kvdev_rados_nkvx_wasm_cache_reset(void)
 
 		/* Tear down every warm instance and drop the pin it held on its object
 		 * (a dead object that hits refcount 0 here is removed + freed by the
-		 * unref). With api==NULL (runtime gone) we can only free the wrapper. */
+		 * unref). nkvx_warm_destroy keeps warm_count consistent. */
 		while ((w = STAILQ_FIRST(&g_cache.warm)) != NULL) {
-			struct nkvx_obj_entry *obj = w->obj;
-
-			STAILQ_REMOVE_HEAD(&g_cache.warm, link);
-			if (api != NULL) {
-				nkvx_warm_free(api, w);
-			} else {
-				free(w);
-			}
-			if (obj != NULL) {
-				nkvx_obj_unref(obj);
-			}
+			nkvx_warm_destroy(api, w);
 		}
 	}
 	{
@@ -1725,14 +2065,58 @@ kvdev_rados_nkvx_wasm_cache_reset(void)
 
 		/* Free whatever objects remain on the list (live, or dead entries whose
 		 * pins all dropped above). A dead entry still pinned by an in-flight Exec
-		 * cannot exist at a clean reset point. */
+		 * cannot exist at a clean reset point. nkvx_obj_list_remove keeps the
+		 * count/bytes accounting consistent. */
 		while ((o = STAILQ_FIRST(&g_cache.objects)) != NULL) {
-			STAILQ_REMOVE_HEAD(&g_cache.objects, link);
+			nkvx_obj_list_remove(o);
 			nkvx_obj_free(o);
 		}
 	}
 	memset(&g_nkvx_wasm_stats, 0, sizeof(g_nkvx_wasm_stats));
 	pthread_mutex_unlock(&g_cache.mutex);
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_obj_cache_count(void)
+{
+	uint64_t live = 0;
+	struct nkvx_obj_entry *o;
+
+	pthread_mutex_lock(&g_cache.mutex);
+	nkvx_cache_init_once();
+	/* Report LIVE entries (dead-pinned entries are transient and invisible to
+	 * lookups), matching what the cap counts. */
+	STAILQ_FOREACH(o, &g_cache.objects, link) {
+		if (!o->dead) {
+			live++;
+		}
+	}
+	pthread_mutex_unlock(&g_cache.mutex);
+	return live;
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_obj_cache_bytes(void)
+{
+	uint64_t bytes;
+
+	pthread_mutex_lock(&g_cache.mutex);
+	nkvx_cache_init_once();
+	bytes = g_cache.obj_bytes;
+	pthread_mutex_unlock(&g_cache.mutex);
+	return bytes;
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_warm_cache_count(void)
+{
+	uint64_t n;
+
+	pthread_mutex_lock(&g_cache.mutex);
+	nkvx_cache_init_once();
+	n = g_cache.warm_count;
+	pthread_mutex_unlock(&g_cache.mutex);
+	return n;
 }
 
 bool
@@ -1762,6 +2146,12 @@ kvdev_rados_nkvx_wasm_cache_has(const char *obj_key)
  * serves exactly the version that existed at probe time — a correct linearization
  * (ordered before the concurrent Store) — while subsequent Execs miss the dead
  * entry and cold-fill fresh, so no stale value is ever served to a later Exec.
+ *
+ * EVICTION SAFETY (spdk-wwy): the same pin protects against LRU EVICTION. An
+ * evictor that selects this entry as the LRU victim marks it dead and defers the
+ * free to the last unpin (nkvx_obj_evict_locked, identical carry-ref to
+ * invalidation), so a probe-hit that pinned here is never freed under the
+ * dispatch->run_pinned path — no use-after-free on the probe-then-evicted race.
  */
 void *
 kvdev_rados_nkvx_wasm_cache_pin(const char *obj_key)
@@ -2187,6 +2577,30 @@ kvdev_rados_nkvx_wasm_cache_invalidate(const char *obj_key)
 {
 	(void)obj_key;
 	/* No cache in the stub build. */
+}
+
+void
+kvdev_rados_nkvx_wasm_runtime_teardown(void)
+{
+	/* No epoch ticker / runtime in the stub build. */
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_obj_cache_count(void)
+{
+	return 0;
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_obj_cache_bytes(void)
+{
+	return 0;
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_warm_cache_count(void)
+{
+	return 0;
 }
 
 #endif /* SPDK_CONFIG_WASM */

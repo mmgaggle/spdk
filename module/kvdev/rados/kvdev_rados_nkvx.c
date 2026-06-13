@@ -306,6 +306,13 @@ kvdev_rados_nkvx_stop(void)
 
 	pthread_join(g_nkvx.tid, NULL);
 
+	/* Tear down process-wide wasm runtime resources owned by the executor
+	 * (spdk-0k1): stop+join the epoch ticker so it does not outlive the executor
+	 * (no 1-thread leak on a stop/restart). Done after the worker join so no
+	 * in-flight run can still be arming the ticker. A later restart re-creates
+	 * the ticker lazily on the first capped run. */
+	kvdev_rados_nkvx_wasm_runtime_teardown();
+
 	pthread_mutex_lock(&g_nkvx.mutex);
 	g_nkvx.running = false;
 	pthread_mutex_unlock(&g_nkvx.mutex);

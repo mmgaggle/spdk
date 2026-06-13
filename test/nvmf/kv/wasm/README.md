@@ -111,6 +111,45 @@ clang --target=wasm32 -nostdlib -O2 \
   -o pageprobe.wasm pageprobe.c
 ```
 
+## statefulglobal.wasm (warm-instance state isolation, spdk-yc1)
+
+Deliberately STATEFUL: keeps a mutable counter (declared init 0) and each run
+reports the value it observed BEFORE incrementing it. Run twice warm against the
+same `(module, object)`, the second run MUST also observe 0 — because the executor
+re-instantiates a fresh store+instance per Exec (resetting wasm globals + declared
+data segments) while keeping the expensive engine + compiled module warm. Reusing
+the same instance would let the second run observe 1 (state leak). Exercised by
+`test_nkvx_yc1_warm_state_isolation`. (Declares 2 pages, so on a small object it
+uses the private-fallback memory; the zero-copy alias is proven by other modules.)
+Source: `statefulglobal.c`.
+
+```sh
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=statefulglobal \
+  -Wl,--initial-memory=131072 -Wl,--export-memory \
+  -o statefulglobal.wasm statefulglobal.c
+```
+
+## growcap.wasm (store-limiter cap proof, spdk-90x)
+
+Grows a FIXED, BOUNDED number of pages (1024 = 64 MiB) then returns SUCCESS.
+Unlike `overalloc` (unbounded growth), the bounded ceiling makes `growcap` a clean
+fail-before/after probe for the wasmtime store memory LIMITER on the NON-custom-
+memory plain `run()` path (where the limiter — not `nkvx_zc_grow` — is the real
+bound): under a tight cap (e.g. 1 MiB) a `memory.grow` is refused before the target
+and the module traps (contained); with the limiter disabled the bounded grows all
+succeed and it returns SUCCESS without OOMing the target. Exercised by
+`test_nkvx_store_limiter_bounds_plain_path`. (The warm/cached path is bounded by
+`nkvx_zc_grow` instead; the store_limiter is belt-and-suspenders there — see the
+mechanism note on `test_nkvx_d3_warm_memory_cap_contained`.) Source: `growcap.c`.
+
+```sh
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=growcap \
+  -Wl,--initial-memory=65536 -Wl,--export-memory \
+  -o growcap.wasm growcap.c
+```
+
 ## libwasmtime.so (runtime dependency)
 
 wasmtime is loaded at runtime via `dlopen` (NOT linked into SPDK). The executor
