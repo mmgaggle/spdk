@@ -81,6 +81,36 @@ clang --target=wasm32 -nostdlib -O2 \
   -o oob.wasm oob.c
 ```
 
+## slackwrite.wasm / pageprobe.wasm (sandbox-semantics regression, spdk-ii0 D1)
+
+A module that declares fewer pages than the (possibly larger) object backing must
+not be able to reach the slack between its declared size and the backing. Before
+the D1 fix the custom zero-copy linear memory reported the FULL object backing as
+its size, so a small module run against a big object could read/write that slack
+without trapping (contained to the object buffer, but a violation of normal
+linear-memory semantics). The fix caps the REPORTED size to the module's declared,
+page-rounded minimum while keeping the full backing as the allocation (so the
+alias stays zero-copy and `memory.grow` can still extend up to the backing).
+
+* `slackwrite.wasm` declares one page and writes at offset `70000` — past its own
+  page but inside a 2-page backing. After the fix this MUST trap.
+* `pageprobe.wasm` declares one page and writes IN-BOUNDS (offset `1000`) against
+  the same 2-page backing — it must still succeed and stay zero-copy.
+
+Exercised by `test_nkvx_d1_declared_size_caps_slack`. Sources: `slackwrite.c`,
+`pageprobe.c`.
+
+```sh
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=slackwrite \
+  -Wl,--initial-memory=65536 -Wl,--export-memory \
+  -o slackwrite.wasm slackwrite.c
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=pageprobe \
+  -Wl,--initial-memory=65536 -Wl,--export-memory \
+  -o pageprobe.wasm pageprobe.c
+```
+
 ## libwasmtime.so (runtime dependency)
 
 wasmtime is loaded at runtime via `dlopen` (NOT linked into SPDK). The executor

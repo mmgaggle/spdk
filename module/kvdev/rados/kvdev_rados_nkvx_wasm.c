@@ -127,8 +127,11 @@ struct nkvx_wasm_api {
 	 * (which relies on a large guarded reservation) would leave out-of-bounds
 	 * guest accesses uncaught. Setting reservation=0 and guard=0 forces DYNAMIC
 	 * (explicit) bounds checks, so every access is checked against the memory's
-	 * current length and OOB always traps. may_move=false keeps the backing
-	 * fixed (we refuse grow on an immutable zero-copy object anyway).
+	 * current REPORTED length and OOB always traps. may_move=false keeps the
+	 * backing fixed (we refuse grow on an immutable zero-copy object anyway).
+	 * Note the reported length is the module's declared minimum, not the object
+	 * backing (spdk-ii0 D1, see nkvx_zc_new_memory), so the slack between a
+	 * small module and a larger backing is unreachable too.
 	 */
 	void (*config_memory_reservation_set)(wasm_config_t *, uint64_t);
 	void (*config_memory_guard_size_set)(wasm_config_t *, uint64_t);
@@ -671,13 +674,23 @@ nkvx_zc_finalize(void *env)
 
 /*
  * new_memory: wasmtime asks for a fresh linear memory for the on-demand instance.
- * We return the cached object's buffer as the backing (zero-copy). Safety does
- * NOT depend on the reserved/guard sizes here: the engine config forces dynamic
- * bounds checks (reservation=0, guard=0), so every guest access is checked
- * against the memory length and an out-of-bounds access traps even though our
- * buffer has no guard page. Growth beyond the backing is refused by nkvx_zc_grow.
- * (This is the empirical validation ADR-0013 flagged: see the oob.wasm
- * regression test, which traps on an access past the declared memory.)
+ * We return the cached object's buffer as the backing (zero-copy).
+ *
+ * Two safety properties combine to make this equivalent to a normal wasm linear
+ * memory (OOB always traps):
+ *   1. The engine config forces DYNAMIC bounds checks (reservation=0, guard=0),
+ *      so every guest access is checked against the memory's REPORTED length even
+ *      though our buffer has no guard page.
+ *   2. The reported length (byte_size) is the module's own declared, page-rounded
+ *      minimum -- NOT the (possibly larger) object backing (spdk-ii0 D1). So a
+ *      module that declares fewer pages than the backing holds cannot reach the
+ *      slack: an access past its declared minimum traps, exactly as it would
+ *      against a real linear memory of that size. The full backing is still the
+ *      allocation (byte_capacity) so the alias stays zero-copy and memory.grow
+ *      may extend the reported length up to the backing (nkvx_zc_grow).
+ * Growth beyond the backing is refused by nkvx_zc_grow. (See the oob.wasm and
+ * the slackwrite.wasm regression tests, which trap on an access past the declared
+ * memory.)
  */
 struct nkvx_zc_ctx {
 	uint8_t		*base;
@@ -704,14 +717,23 @@ nkvx_zc_new_memory(void *env, const wasm_memorytype_t *ty, size_t minimum,
 	}
 
 	if (minimum <= cctx->cap) {
-		/* Common path: the object-sized backing already covers the module's
-		 * declared minimum -> alias it ZERO-COPY (no copy-in). Present at least
-		 * the module's declared minimum as the committed size. */
-		if (cctx->size < minimum) {
-			cctx->size = minimum;
-		}
+		/*
+		 * Common path: the object-sized backing already covers the module's
+		 * declared minimum -> alias it ZERO-COPY (no copy-in).
+		 *
+		 * SANDBOX SEMANTICS (spdk-ii0 D1): the REPORTED size (byte_size, what
+		 * wasmtime dynamic-bounds-checks every guest access against) MUST be the
+		 * module's declared, page-rounded minimum -- NOT the full object backing.
+		 * If we reported the whole backing, a module that declared e.g. 1 page
+		 * could read/write the slack between its declared size and a larger
+		 * object backing without trapping (contained to the object's own buffer,
+		 * but a violation of "OOB always traps"). We therefore set m->size =
+		 * minimum (already page-rounded by wasmtime) while keeping the full
+		 * backing as m->cap so the alias stays zero-copy and memory.grow can
+		 * still extend up to the backing (nkvx_zc_grow). An access past the
+		 * declared minimum now traps. */
 		m->base = cctx->base;
-		m->size = cctx->size;
+		m->size = minimum;
 		m->cap = cctx->cap;
 		m->owned = false;
 	} else {

@@ -734,6 +734,85 @@ test_nkvx_tb4_oob_traps(void)
 }
 
 /*
+ * SANDBOX-SEMANTICS regression (spdk-ii0 D1): a module declaring ONE page run
+ * against a LARGER (2-page) object backing must NOT be able to reach the slack
+ * between its declared size and the backing. The reviewer's CASE-A:
+ *
+ *   - slackwrite.wasm declares 1 page and writes at offset 70000 (past 65536 but
+ *     inside the 2-page backing). Before the fix the custom memory reported the
+ *     full backing as its size, so this slack write SUCCEEDED (escape of the
+ *     module's declared bounds). After the fix the reported size is capped to the
+ *     module's page-rounded minimum (1 page), so the access is OOB and MUST trap
+ *     -> contained (FAILED/ABORTED), never SUCCESS.
+ *   - pageprobe.wasm declares 1 page and writes IN-BOUNDS (offset 1000) against
+ *     the SAME 2-page backing: it must still SUCCEED and still be ZERO-COPY
+ *     (mem_base == cache_base) -- proving the cap does not break legitimate
+ *     in-bounds access or the zero-copy alias.
+ *
+ * A ~70000-byte object forces the 2-page page-rounded backing for both modules.
+ */
+static void
+test_nkvx_d1_declared_size_caps_slack(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB4 D1 slack test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	/* A ~70 KiB object -> page-rounded backing of 2 pages (131072), bigger than
+	 * the single page these modules declare. */
+	static uint8_t bigobj[70000];
+	struct fake_fill fill_oob = { .bytes = bigobj, .len = sizeof(bigobj), .calls = 0 };
+	struct fake_fill fill_ok  = { .bytes = bigobj, .len = sizeof(bigobj), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	int rc;
+	struct kvdev_rados_nkvx_wasm_stats st;
+
+	memset(bigobj, 0x5A, sizeof(bigobj));
+
+	/* CASE-A out-of-bounds half: write into the slack (offset 70000) MUST trap. */
+	memset(out, 0xAB, sizeof(out));
+	rc = kvdev_rados_nkvx_wasm_run_cached("slackwrite", "d1_oob", sizeof(bigobj),
+					      fake_cold_fill, &fill_oob,
+					      out, sizeof(out), &rlen);
+	CU_ASSERT(rc != SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_FAILED ||
+		  rc == SPDK_KVDEV_IO_STATUS_ABORTED);
+	printf("\n    D1 slack write @70000 (1-page module, 2-page backing): status=%d (trapped)\n", rc);
+
+	/* CASE-A in-bounds half: write at offset 1000 (in-bounds) MUST succeed AND
+	 * still be zero-copy (linear memory aliases the cached object buffer). */
+	memset(out, 0, sizeof(out));
+	rlen = 0;
+	rc = kvdev_rados_nkvx_wasm_run_cached("pageprobe", "d1_ok", sizeof(bigobj),
+					      fake_cold_fill, &fill_ok,
+					      out, sizeof(out), &rlen);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(rlen == sizeof(uint64_t));
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	CU_ASSERT(st.last_mem_base != NULL);
+	CU_ASSERT(st.last_mem_base == st.last_cache_base);	/* still zero-copy */
+	printf("    D1 in-bounds write @1000 (1-page module, 2-page backing): SUCCESS, "
+	       "zero-copy mem_base=%p cache_base=%p (alias=%s)\n",
+	       st.last_mem_base, st.last_cache_base,
+	       st.last_mem_base == st.last_cache_base ? "YES" : "NO");
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: TB4 D1 slack test is a no-op\n");
+#endif
+}
+
+/*
  * Fail-soft: --without-wasm or libwasmtime.so absent -> run_cached returns
  * NOT_SUPPORTED and NEVER invokes the fill callback (the executor cannot run the
  * module, so it must not cold-fill). Deterministic in both build modes.
@@ -883,6 +962,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_tb4_distinct_object_is_miss);
 	CU_ADD_TEST(suite, test_nkvx_tb4_multipage_module_private);
 	CU_ADD_TEST(suite, test_nkvx_tb4_oob_traps);
+	CU_ADD_TEST(suite, test_nkvx_d1_declared_size_caps_slack);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cached_failsoft);
 	CU_ADD_TEST(suite, test_nkvx_tb4_dispatch_wires_cache);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
