@@ -1481,6 +1481,22 @@ nvmf_rpc_item_to_kv_exec_binding(const struct rpc_nvmf_kv_exec_allow *item,
 				 uint8_t sha_buf[SPDK_KV_EXEC_SHA256_LEN],
 				 char *cls_buf, size_t cls_buf_len)
 {
+	/* The structured KV Exec allow fields are generated from schema/schema.json
+	 * (runtime/module_namespace/module_key/sha256 as optional strings, caps as an
+	 * optional uint64). Lock the types the consumer below relies on to the
+	 * schema-generated struct so a future schema regression fails at build time
+	 * with a clear message instead of silently changing decode/copy semantics. */
+	SPDK_STATIC_ASSERT(sizeof(((struct rpc_nvmf_kv_exec_allow *)0)->runtime) == sizeof(char *),
+			   "rpc_nvmf_kv_exec_allow.runtime must be a string (char *)");
+	SPDK_STATIC_ASSERT(sizeof(((struct rpc_nvmf_kv_exec_allow *)0)->module_namespace) == sizeof(char *),
+			   "rpc_nvmf_kv_exec_allow.module_namespace must be a string (char *)");
+	SPDK_STATIC_ASSERT(sizeof(((struct rpc_nvmf_kv_exec_allow *)0)->module_key) == sizeof(char *),
+			   "rpc_nvmf_kv_exec_allow.module_key must be a string (char *)");
+	SPDK_STATIC_ASSERT(sizeof(((struct rpc_nvmf_kv_exec_allow *)0)->sha256) == sizeof(char *),
+			   "rpc_nvmf_kv_exec_allow.sha256 must be a string (char *)");
+	SPDK_STATIC_ASSERT(sizeof(((struct rpc_nvmf_kv_exec_allow *)0)->caps) == sizeof(uint64_t),
+			   "rpc_nvmf_kv_exec_allow.caps must be a uint64_t");
+
 	bool has_structured = item->runtime || item->module_namespace ||
 			      item->module_key || item->sha256 || item->caps;
 
