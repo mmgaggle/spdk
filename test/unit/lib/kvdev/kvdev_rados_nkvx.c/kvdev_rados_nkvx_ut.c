@@ -67,7 +67,7 @@ dispatch_and_wait(const char *module, const void *obj, size_t obj_len,
 	set_thread(0);
 	/* NULL obj_key + NULL pin: these dispatch-level tests use the plain-copy path;
 	 * the TB4 cache/zero-copy path is exercised directly via _wasm_run_cached. */
-	rc = kvdev_rados_nkvx_dispatch(module, NULL, NULL, obj, obj_len, out, out_cap,
+	rc = kvdev_rados_nkvx_dispatch(module, NULL, NULL, NULL, obj, obj_len, out, out_cap,
 				       nkvx_done, r);
 	CU_ASSERT(rc == 0);
 	set_thread(INVALID_THREAD);
@@ -462,7 +462,7 @@ nkvx_wasm_runtime_available(void)
 	int rc;
 
 	kvdev_rados_nkvx_wasm_get_stats(&before);
-	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", "__probe__", 1,
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "__probe__", 1,
 					      fake_cold_fill, &f, out, sizeof(out), &rlen);
 	(void)before;
 	(void)after;
@@ -511,7 +511,7 @@ test_nkvx_tb4_cache_zerocopy_warm(void)
 
 	/* ---- 1st Exec: COLD FILL ---- */
 	memset(out, 0, sizeof(out));
-	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", "objK", obj_len,
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "objK", obj_len,
 					      fake_cold_fill, &fill,
 					      out, sizeof(out), &rlen);
 	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);
@@ -534,7 +534,7 @@ test_nkvx_tb4_cache_zerocopy_warm(void)
 	/* ---- 2nd Exec of the SAME (module,object) ---- */
 	memset(out, 0, sizeof(out));
 	got = 0;
-	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", "objK", obj_len,
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "objK", obj_len,
 					      fake_cold_fill, &fill,
 					      out, sizeof(out), &rlen);
 	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);
@@ -592,7 +592,7 @@ test_nkvx_tb4_distinct_object_is_miss(void)
 	struct kvdev_rados_nkvx_wasm_stats st;
 
 	memset(out, 0, sizeof(out));
-	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "A", sizeof(a),
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "A", sizeof(a),
 			fake_cold_fill, &fa, out, sizeof(out), &rlen) ==
 		  SPDK_KVDEV_IO_STATUS_SUCCESS);
 	memcpy(&ga, out, sizeof(ga));
@@ -600,7 +600,7 @@ test_nkvx_tb4_distinct_object_is_miss(void)
 	base_a = st.last_cache_base;
 
 	memset(out, 0, sizeof(out));
-	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "B", sizeof(b),
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "B", sizeof(b),
 			fake_cold_fill, &fb, out, sizeof(out), &rlen) ==
 		  SPDK_KVDEV_IO_STATUS_SUCCESS);
 	memcpy(&gb, out, sizeof(gb));
@@ -661,7 +661,7 @@ test_nkvx_tb4_multipage_module_private(void)
 	int rc;
 	struct kvdev_rados_nkvx_wasm_stats st;
 
-	rc = kvdev_rados_nkvx_wasm_run_cached("bytecount", "mpK", sizeof(obj),
+	rc = kvdev_rados_nkvx_wasm_run_cached("bytecount", NULL, "mpK", sizeof(obj),
 					      fake_cold_fill, &fill, out, sizeof(out), &rlen);
 	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);   /* runs despite 2-page need */
 	CU_ASSERT(rlen == sizeof(uint64_t));
@@ -715,7 +715,7 @@ test_nkvx_tb4_oob_traps(void)
 	int rc;
 
 	memset(out, 0xAB, sizeof(out));
-	rc = kvdev_rados_nkvx_wasm_run_cached("oob", "oobK", sizeof(obj),
+	rc = kvdev_rados_nkvx_wasm_run_cached("oob", NULL, "oobK", sizeof(obj),
 					      fake_cold_fill, &fill,
 					      out, sizeof(out), &rlen);
 	/* The OOB store MUST be caught: a contained failure, never SUCCESS. */
@@ -779,7 +779,7 @@ test_nkvx_d1_declared_size_caps_slack(void)
 
 	/* CASE-A out-of-bounds half: write into the slack (offset 70000) MUST trap. */
 	memset(out, 0xAB, sizeof(out));
-	rc = kvdev_rados_nkvx_wasm_run_cached("slackwrite", "d1_oob", sizeof(bigobj),
+	rc = kvdev_rados_nkvx_wasm_run_cached("slackwrite", NULL, "d1_oob", sizeof(bigobj),
 					      fake_cold_fill, &fill_oob,
 					      out, sizeof(out), &rlen);
 	CU_ASSERT(rc != SPDK_KVDEV_IO_STATUS_SUCCESS);
@@ -791,7 +791,7 @@ test_nkvx_d1_declared_size_caps_slack(void)
 	 * still be zero-copy (linear memory aliases the cached object buffer). */
 	memset(out, 0, sizeof(out));
 	rlen = 0;
-	rc = kvdev_rados_nkvx_wasm_run_cached("pageprobe", "d1_ok", sizeof(bigobj),
+	rc = kvdev_rados_nkvx_wasm_run_cached("pageprobe", NULL, "d1_ok", sizeof(bigobj),
 					      fake_cold_fill, &fill_ok,
 					      out, sizeof(out), &rlen);
 	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);
@@ -853,7 +853,7 @@ test_nkvx_d2_invalidate_on_mutation(void)
 
 	/* Exec(k): cold-fill v0. */
 	memset(out, 0, sizeof(out));
-	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "k", sizeof(v0),
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "k", sizeof(v0),
 			fake_cold_fill, &f0, out, sizeof(out), &rlen) ==
 		  SPDK_KVDEV_IO_STATUS_SUCCESS);
 	memcpy(&got, out, sizeof(got));
@@ -868,7 +868,7 @@ test_nkvx_d2_invalidate_on_mutation(void)
 	/* Exec(k) again with the NEW bytes: must cold-fill AGAIN and reflect v1. */
 	memset(out, 0, sizeof(out));
 	got = 0;
-	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "k", sizeof(v1),
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "k", sizeof(v1),
 			fake_cold_fill, &f1, out, sizeof(out), &rlen) ==
 		  SPDK_KVDEV_IO_STATUS_SUCCESS);
 	memcpy(&got, out, sizeof(got));
@@ -886,7 +886,7 @@ test_nkvx_d2_invalidate_on_mutation(void)
 	kvdev_rados_nkvx_wasm_cache_invalidate("k");
 	struct fake_fill f2 = { .bytes = v1, .len = sizeof(v1), .calls = 0 };
 	memset(out, 0, sizeof(out));
-	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "k", sizeof(v1),
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "k", sizeof(v1),
 			fake_cold_fill, &f2, out, sizeof(out), &rlen) ==
 		  SPDK_KVDEV_IO_STATUS_SUCCESS);
 	CU_ASSERT(f2.calls == 1);		/* fresh cold-fill, not a hit */
@@ -937,7 +937,7 @@ test_nkvx_d2_pin_survives_invalidate(void)
 
 	/* Exec(k): cold-fill v0 so the entry exists to pin. */
 	memset(out, 0, sizeof(out));
-	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "pk", sizeof(v0),
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "pk", sizeof(v0),
 			fake_cold_fill, &f0, out, sizeof(out), &rlen) ==
 		  SPDK_KVDEV_IO_STATUS_SUCCESS);
 
@@ -952,7 +952,7 @@ test_nkvx_d2_pin_survives_invalidate(void)
 	/* The worker runs the PINNED version: still v0, no use-after-free. */
 	memset(out, 0, sizeof(out));
 	got = 0;
-	CU_ASSERT(kvdev_rados_nkvx_wasm_run_pinned("checksum", pin, out, sizeof(out), &rlen) ==
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_pinned("checksum", NULL, pin, out, sizeof(out), &rlen) ==
 		  SPDK_KVDEV_IO_STATUS_SUCCESS);
 	memcpy(&got, out, sizeof(got));
 	CU_ASSERT(got == expected_checksum(v0, sizeof(v0)));	/* the pinned version */
@@ -962,7 +962,7 @@ test_nkvx_d2_pin_survives_invalidate(void)
 	 * pinned entry is invisible to new lookups, so no stale hit. */
 	memset(out, 0, sizeof(out));
 	got = 0;
-	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "pk", sizeof(v1),
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "pk", sizeof(v1),
 			fake_cold_fill, &f1, out, sizeof(out), &rlen) ==
 		  SPDK_KVDEV_IO_STATUS_SUCCESS);
 	memcpy(&got, out, sizeof(got));
@@ -1015,7 +1015,7 @@ test_nkvx_d3_warm_memory_cap_contained(void)
 	int rc;
 
 	memset(out, 0, sizeof(out));
-	rc = kvdev_rados_nkvx_wasm_run_cached("overalloc", "d3memK", sizeof(obj),
+	rc = kvdev_rados_nkvx_wasm_run_cached("overalloc", NULL, "d3memK", sizeof(obj),
 					      fake_cold_fill, &fill, out, sizeof(out), &rlen);
 	/* Contained by the WARM-path memory limiter: a clean failure, not an OOM. */
 	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_ABORTED ||
@@ -1052,7 +1052,7 @@ test_nkvx_d3_warm_epoch_cap_contained(void)
 	int rc;
 
 	memset(out, 0, sizeof(out));
-	rc = kvdev_rados_nkvx_wasm_run_cached("walltime_runaway", "d3epK", sizeof(obj),
+	rc = kvdev_rados_nkvx_wasm_run_cached("walltime_runaway", NULL, "d3epK", sizeof(obj),
 					      fake_cold_fill, &fill, out, sizeof(out), &rlen);
 	/* Stopped by the warm-path EPOCH deadline (fuel was disabled) -> ABORTED. */
 	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_ABORTED);
@@ -1088,7 +1088,7 @@ test_nkvx_tb4_cached_failsoft(void)
 		return;
 	}
 #endif
-	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", "objK", 1,
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "objK", 1,
 					      fake_cold_fill, &f, out, sizeof(out), &rlen);
 	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED);
 	CU_ASSERT(f.calls == 0);	/* no cold fill when the runtime can't run it */
@@ -1129,7 +1129,7 @@ test_nkvx_tb4_dispatch_wires_cache(void)
 	memset(&r, 0, sizeof(r));
 	memset(out, 0, sizeof(out));
 	set_thread(0);
-	CU_ASSERT(kvdev_rados_nkvx_dispatch("wasm:checksum", "oidZ", NULL, obj, obj_len,
+	CU_ASSERT(kvdev_rados_nkvx_dispatch("wasm:checksum", NULL, "oidZ", NULL, obj, obj_len,
 					    out, sizeof(out), nkvx_done, &r) == 0);
 	set_thread(INVALID_THREAD);
 	for (int i = 0; i < 100000 && !r.completed; i++) {
@@ -1148,7 +1148,7 @@ test_nkvx_tb4_dispatch_wires_cache(void)
 	memset(&r, 0, sizeof(r));
 	memset(out, 0, sizeof(out));
 	set_thread(0);
-	CU_ASSERT(kvdev_rados_nkvx_dispatch("wasm:checksum", "oidZ", NULL, obj, obj_len,
+	CU_ASSERT(kvdev_rados_nkvx_dispatch("wasm:checksum", NULL, "oidZ", NULL, obj, obj_len,
 					    out, sizeof(out), nkvx_done, &r) == 0);
 	set_thread(INVALID_THREAD);
 	for (int i = 0; i < 100000 && !r.completed; i++) {
@@ -1176,6 +1176,236 @@ test_nkvx_tb4_dispatch_wires_cache(void)
 #endif
 }
 
+/* ==========================================================================
+ * TB3 (spdk-fbm / ADR-0010): the content-addressed module cache + the SHA-256
+ * integrity GATE. These exercise the executor's verified-module path directly
+ * (the sha256 cache + kvdev_rados_nkvx_wasm_module_insert + the verified run_cached
+ * path), with a FAKE cold-fill standing in for the librados DATA read. The MODULE
+ * bytes are the real checked-in .wasm files, hashed at runtime so the tests are
+ * self-contained. The reactor-side deny-by-default gate (a wasm op with no valid
+ * sha256 rejected before any fetch) lives in kvdev_rados.c:kvdev_rados_exec and is
+ * covered by the live e2e + code review; here we prove the executor's hash gate,
+ * which is the load-bearing "never run unverified bytes" enforcement point.
+ *
+ * Graceful-degradation aware: when the runtime is unavailable these skip, like the
+ * other wasm tests.
+ * ========================================================================== */
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+
+/* Read a checked-in <name>.wasm into a malloc'd buffer; CU_FAIL + return NULL on
+ * error. Caller frees. */
+static uint8_t *
+tb3_read_wasm(const char *name, size_t *out_len)
+{
+	char path[1024];
+	uint8_t *buf;
+
+	snprintf(path, sizeof(path), "%s/%s.wasm", NKVX_UT_WASM_DIR, name);
+	buf = nkvx_wasm_read_file(path, out_len);
+	if (buf == NULL) {
+		CU_FAIL("could not read test .wasm module");
+	}
+	return buf;
+}
+
+/* SHA-256 of (buf,len) into out[32] using the same primitive as the executor. */
+static void
+tb3_sha256(const void *buf, size_t len, uint8_t out[SPDK_KV_EXEC_SHA256_LEN])
+{
+	CU_ASSERT(nkvx_sha256(buf, len, out));
+}
+#endif /* SPDK_CONFIG_WASM && NKVX_UT_WASM_DIR */
+
+/*
+ * TB3 (a) deny-by-default / hash GATE — sha256 MISMATCH is rejected and the module
+ * is NEVER compiled, cached, or run; the FAIL-BEFORE is shown by flipping one byte
+ * of the bound hash to flip the verdict from SUCCESS to INVALID.
+ */
+static void
+test_nkvx_tb3_hash_mismatch_rejected(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB3 hash-mismatch test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+
+	size_t wlen = 0;
+	uint8_t *wasm = tb3_read_wasm("checksum", &wlen);
+	uint8_t good[SPDK_KV_EXEC_SHA256_LEN], bad[SPDK_KV_EXEC_SHA256_LEN];
+	int rc;
+
+	if (wasm == NULL) {
+		return;
+	}
+	tb3_sha256(wasm, wlen, good);
+
+	/* The CORRECT hash verifies + compiles + caches: the baseline that the
+	 * mismatch must differ from (fail-before / fail-after pair). */
+	rc = kvdev_rados_nkvx_wasm_module_insert(good, wasm, wlen);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cached(good));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cache_count() == 1);
+
+	/* Now TAMPER: flip one byte of the bound hash. The SAME bytes must now be
+	 * REJECTED (INVALID), never compiled/cached. The verdict flipped solely on the
+	 * hash -> the gate is load-bearing. */
+	memcpy(bad, good, sizeof(bad));
+	bad[0] ^= 0x01;
+	rc = kvdev_rados_nkvx_wasm_module_insert(bad, wasm, wlen);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_INVALID);
+	CU_ASSERT(!kvdev_rados_nkvx_wasm_module_cached(bad));	/* never cached */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cache_count() == 1);	/* still just the good one */
+
+	/* Equivalently: tampering the BYTES (not the hash) is also rejected — the
+	 * module's content no longer matches its bound hash. */
+	wasm[wlen / 2] ^= 0xFF;
+	rc = kvdev_rados_nkvx_wasm_module_insert(good, wasm, wlen);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_INVALID);
+	printf("\n    TB3 hash gate: correct hash -> SUCCESS+cached; flipped hash/bytes -> INVALID, "
+	       "never compiled (cache_count stays 1)\n");
+
+	free(wasm);
+	kvdev_rados_nkvx_wasm_cache_reset();
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+#else
+	printf("\n    built --without-wasm: TB3 hash-mismatch test is a no-op\n");
+#endif
+}
+
+/*
+ * TB3 (c) successful fetch+verify+compile+run, and (d) module-cache HIT on the 2nd
+ * Exec of the SAME hash (no recompile). The DATA object is served via the fake
+ * cold-fill; the MODULE comes via the verified \c mod (bytes on the 1st Exec,
+ * NULL/cached on the 2nd). The module cache count proves exactly one compile.
+ */
+static void
+test_nkvx_tb3_verify_run_and_module_cache_hit(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB3 verify+run test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+
+	size_t wlen = 0;
+	uint8_t *wasm = tb3_read_wasm("checksum", &wlen);
+	struct kvdev_rados_nkvx_module mod;
+	static const uint8_t obj[] = "tb3-verified-run-object";
+	struct fake_fill fill = { .bytes = obj, .len = sizeof(obj), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	uint64_t got = 0;
+	int rc;
+
+	if (wasm == NULL) {
+		return;
+	}
+	memset(&mod, 0, sizeof(mod));
+	tb3_sha256(wasm, wlen, mod.sha256);
+	mod.bytes = wasm;		/* 1st Exec: fetched bytes supplied (cache miss) */
+	mod.bytes_len = wlen;
+	mod.caps = 0;			/* defaults tier */
+
+	/* 1st Exec: module verified + compiled + cached, then run over the data obj. */
+	memset(out, 0, sizeof(out));
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", &mod, "tb3objA", sizeof(obj),
+					      fake_cold_fill, &fill, out, sizeof(out), &rlen);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(rlen == sizeof(uint64_t));
+	memcpy(&got, out, sizeof(got));
+	CU_ASSERT(got == expected_checksum(obj, sizeof(obj)));	/* correct verified run */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cache_count() == 1);	/* compiled once */
+
+	/* 2nd Exec of the SAME hash on a DIFFERENT data object: the module is a CACHE
+	 * HIT — mod.bytes is NULL (no refetch needed) and no recompile happens. */
+	static const uint8_t obj2[] = "tb3-second-object-different";
+	struct fake_fill fill2 = { .bytes = obj2, .len = sizeof(obj2), .calls = 0 };
+	struct kvdev_rados_nkvx_module mod_hit;
+
+	memset(&mod_hit, 0, sizeof(mod_hit));
+	memcpy(mod_hit.sha256, mod.sha256, sizeof(mod_hit.sha256));
+	mod_hit.bytes = NULL;		/* prove the cached compiled module is used */
+	mod_hit.bytes_len = 0;
+
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cached(mod_hit.sha256));	/* reactor probe would HIT */
+	memset(out, 0, sizeof(out));
+	got = 0;
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", &mod_hit, "tb3objB", sizeof(obj2),
+					      fake_cold_fill, &fill2, out, sizeof(out), &rlen);
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&got, out, sizeof(got));
+	CU_ASSERT(got == expected_checksum(obj2, sizeof(obj2)));
+	/* HIT proof: still exactly one compiled module — no recompile on the 2nd Exec
+	 * even though it carried NO module bytes. */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cache_count() == 1);
+	printf("\n    TB3 verify+run: 1st Exec compiled+ran (checksum ok); 2nd Exec of same hash "
+	       "served from module cache (count=1, bytes=NULL, no recompile)\n");
+
+	free(wasm);
+	kvdev_rados_nkvx_wasm_cache_reset();
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: TB3 verify+run test is a no-op\n");
+#endif
+}
+
+/*
+ * TB3 (b) a module-cache MISS with NO fetched bytes is a clean failure, never a run
+ * of unverified/absent bytes. This is the executor-side guard for the reactor's
+ * "fetch the module on a miss" contract: if a run reaches the executor on a miss
+ * without the bytes, it fails closed.
+ */
+static void
+test_nkvx_tb3_miss_without_bytes_fails_closed(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB3 fail-closed test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+
+	struct kvdev_rados_nkvx_module mod;
+	static const uint8_t obj[] = "x";
+	struct fake_fill fill = { .bytes = obj, .len = sizeof(obj), .calls = 0 };
+	uint8_t out[16];
+	uint32_t rlen = 0;
+	int rc;
+
+	memset(&mod, 0, sizeof(mod));
+	/* A plausible-but-uncached hash with NO bytes: nothing to verify/compile. */
+	memset(mod.sha256, 0xAB, sizeof(mod.sha256));
+	mod.bytes = NULL;
+	mod.bytes_len = 0;
+
+	CU_ASSERT(!kvdev_rados_nkvx_wasm_module_cached(mod.sha256));
+	rc = kvdev_rados_nkvx_wasm_run_cached("checksum", &mod, "tb3missK", sizeof(obj),
+					      fake_cold_fill, &fill, out, sizeof(out), &rlen);
+	CU_ASSERT(rc != SPDK_KVDEV_IO_STATUS_SUCCESS);	/* failed closed, nothing run */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cache_count() == 0);
+	printf("\n    TB3 fail-closed: module-cache miss with no bytes -> status=%d (no run, count=0)\n",
+	       rc);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+#else
+	printf("\n    built --without-wasm: TB3 fail-closed test is a no-op\n");
+#endif
+}
+
 static void
 test_nkvx_dispatch_without_thread_fails(void)
 {
@@ -1186,7 +1416,7 @@ test_nkvx_dispatch_without_thread_fails(void)
 
 	/* Off any SPDK thread there is no origin to complete on -> -EINVAL. */
 	set_thread(INVALID_THREAD);
-	rc = kvdev_rados_nkvx_dispatch(KVDEV_RADOS_NKVX_MODULE_IDENTITY, NULL, NULL, "x", 1,
+	rc = kvdev_rados_nkvx_dispatch(KVDEV_RADOS_NKVX_MODULE_IDENTITY, NULL, NULL, NULL, "x", 1,
 				       out, sizeof(out), nkvx_done, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
@@ -1223,6 +1453,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_d3_warm_epoch_cap_contained);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cached_failsoft);
 	CU_ADD_TEST(suite, test_nkvx_tb4_dispatch_wires_cache);
+	CU_ADD_TEST(suite, test_nkvx_tb3_hash_mismatch_rejected);
+	CU_ADD_TEST(suite, test_nkvx_tb3_verify_run_and_module_cache_hit);
+	CU_ADD_TEST(suite, test_nkvx_tb3_miss_without_bytes_fails_closed);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
 
 	/* One SPDK thread stands in for the reactor; the executor worker is a real
