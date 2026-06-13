@@ -55,11 +55,20 @@ int kvdev_rados_nkvx_wasm_run(const char *name,
 			      void *out, uint32_t out_len, uint32_t *result_len);
 
 /*
- * TB4 (spdk-ii0 / ADR-0013): content-addressed object cache + zero-copy DMA into
- * wasm linear memory, with a warm-instance cache keyed by (module, object).
+ * TB4 (spdk-ii0 / ADR-0013): IDENTITY(oid)-addressed object cache with
+ * invalidation-on-write + zero-copy DMA into wasm linear memory, with a
+ * warm-instance cache keyed by (module, object).
+ *
+ * NOTE on naming: this is an IDENTITY cache keyed by the object id (oid =
+ * hex(key)), NOT a content-addressed (content-hashed) cache. There is no content
+ * verification; coherence with a mutated value is maintained by INVALIDATING the
+ * entry on every value-mutating op (Store/Delete) via
+ * kvdev_rados_nkvx_wasm_cache_invalidate (spdk-ii0 D2). Historical comments and
+ * counters may still say "content" for the cache-hit counter; read it as
+ * "identity-cache hit".
  *
  * The executor owns the object store; it never calls librados. Cold fill is
- * inverted into a CALLBACK the executor invokes ONLY on a content-cache miss:
+ * inverted into a CALLBACK the executor invokes ONLY on a cache miss:
  *
  *   - On a miss the executor allocates the cache slot, calls \c fill to populate
  *     it from RADOS (cold fill), and keeps the buffer content-addressed by
@@ -107,19 +116,47 @@ int kvdev_rados_nkvx_wasm_run_cached(const char *name,
 				     kvdev_rados_nkvx_fill_fn fill, void *fill_arg,
 				     void *out, uint32_t out_len, uint32_t *result_len);
 
-/* Drop the entire content + warm-instance cache (test teardown / shutdown). */
+/* Drop the entire object + warm-instance cache (test teardown / shutdown). */
 void kvdev_rados_nkvx_wasm_cache_reset(void);
 
 /*
- * Probe whether \c obj_key is already present (filled) in the content-addressed
- * object cache. The caller (kvdev_rados) uses this BEFORE issuing a librados read
- * so a cache hit skips the read entirely and dispatches straight to the executor
- * (the cold-fill callback stays the ONLY librados touch -- spdk-ii0 B2). Returns
- * false in the stub build (no cache). NOTE: only race-free while the cache does
- * not evict (TB4 cache is currently unbounded); an evicting cache must re-probe
- * or carry the bytes through the dispatch on a probe-hit-then-evicted race.
+ * Probe whether \c obj_key is already present (filled) in the identity-addressed
+ * object cache. Stateless boolean probe; prefer kvdev_rados_nkvx_wasm_cache_pin
+ * on the datapath where the bytes will be read later (it is race-safe against a
+ * concurrent invalidation). Returns false in the stub build (no cache).
  */
 bool kvdev_rados_nkvx_wasm_cache_has(const char *obj_key);
+
+/*
+ * Probe-and-PIN (spdk-ii0 D2): if \c obj_key is present and filled, take a
+ * reference on its buffer and return an opaque handle (non-NULL); else return
+ * NULL. The pin makes the probe -> later-read sequence race-safe: a Store/Delete
+ * invalidation between the pin and the eventual run cannot free the buffer, and
+ * the in-flight Exec serves exactly the pinned version while subsequent Execs
+ * miss the invalidated entry and cold-fill fresh (no stale read). The caller MUST
+ * release the handle with kvdev_rados_nkvx_wasm_cache_unpin. Returns NULL in the
+ * stub build.
+ */
+void *kvdev_rados_nkvx_wasm_cache_pin(const char *obj_key);
+
+/* Release a handle from kvdev_rados_nkvx_wasm_cache_pin (NULL-safe). */
+void kvdev_rados_nkvx_wasm_cache_unpin(void *handle);
+
+/*
+ * Run module \c name against a PINNED object (the handle from cache_pin), serving
+ * exactly that version with NO librados refetch and NO cold fill. Same status
+ * contract as run_cached. The caller still owns the pin and must unpin after.
+ */
+int kvdev_rados_nkvx_wasm_run_pinned(const char *name, void *pin,
+				     void *out, uint32_t out_len, uint32_t *result_len);
+
+/*
+ * Invalidate every cache entry (object + warm instances) for \c obj_key. MUST be
+ * called from every value-mutating datapath op (Store, Delete, ...) so a later
+ * Exec cannot serve stale cached bytes (spdk-ii0 D2). No-op in the stub build and
+ * for an unknown key.
+ */
+void kvdev_rados_nkvx_wasm_cache_invalidate(const char *obj_key);
 
 /*
  * Test-only introspection counters (TB4 acceptance proof). Defined unconditionally

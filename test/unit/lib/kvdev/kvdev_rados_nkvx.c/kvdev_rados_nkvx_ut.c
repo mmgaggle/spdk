@@ -65,9 +65,9 @@ dispatch_and_wait(const char *module, const void *obj, size_t obj_len,
 	memset(r, 0, sizeof(*r));
 
 	set_thread(0);
-	/* NULL obj_key: these dispatch-level tests use the plain-copy path; the TB4
-	 * cache/zero-copy path is exercised directly via _wasm_run_cached below. */
-	rc = kvdev_rados_nkvx_dispatch(module, NULL, obj, obj_len, out, out_cap,
+	/* NULL obj_key + NULL pin: these dispatch-level tests use the plain-copy path;
+	 * the TB4 cache/zero-copy path is exercised directly via _wasm_run_cached. */
+	rc = kvdev_rados_nkvx_dispatch(module, NULL, NULL, obj, obj_len, out, out_cap,
 				       nkvx_done, r);
 	CU_ASSERT(rc == 0);
 	set_thread(INVALID_THREAD);
@@ -813,6 +813,174 @@ test_nkvx_d1_declared_size_caps_slack(void)
 }
 
 /*
+ * INTEGRITY / STALENESS regression (spdk-ii0 D2): the identity cache must be
+ * INVALIDATED on a value mutation, or an Exec after a Store/Delete serves stale
+ * cached bytes. This drives the invalidation API the datapath (kvdev_rados.c)
+ * calls from Store/Delete:
+ *
+ *   Exec(k)         -> cold-fill v0 (cold_fills==1), correct checksum over v0.
+ *   invalidate(k)   -> stands in for Store(k, v1) / the datapath cache_invalidate.
+ *   Exec(k, v1)     -> MUST cold-fill AGAIN (cold_fills==2) and return a checksum
+ *                      over the NEW bytes v1 -- NOT a stale hit on v0.
+ *   invalidate(k)   -> stands in for Delete(k).
+ *   <lookup misses> -> a subsequent Exec is a fresh cold-fill, never a stale hit.
+ *
+ * Fail-before: without the invalidate call the 2nd Exec is a content HIT
+ * (cold_fills stays 1) and returns the v0 checksum -- demonstrably stale.
+ */
+static void
+test_nkvx_d2_invalidate_on_mutation(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB4 D2 invalidate test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	static const uint8_t v0[] = "value-VERSION-0";
+	static const uint8_t v1[] = "value-VERSION-ONE-different-length";
+	struct fake_fill f0 = { .bytes = v0, .len = sizeof(v0), .calls = 0 };
+	struct fake_fill f1 = { .bytes = v1, .len = sizeof(v1), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	uint64_t got = 0;
+	struct kvdev_rados_nkvx_wasm_stats st;
+
+	/* Exec(k): cold-fill v0. */
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "k", sizeof(v0),
+			fake_cold_fill, &f0, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&got, out, sizeof(got));
+	CU_ASSERT(got == expected_checksum(v0, sizeof(v0)));
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	CU_ASSERT(st.cold_fills == 1);
+	CU_ASSERT(f0.calls == 1);
+
+	/* Store(k, v1): the datapath invalidates the cache here. */
+	kvdev_rados_nkvx_wasm_cache_invalidate("k");
+
+	/* Exec(k) again with the NEW bytes: must cold-fill AGAIN and reflect v1. */
+	memset(out, 0, sizeof(out));
+	got = 0;
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "k", sizeof(v1),
+			fake_cold_fill, &f1, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&got, out, sizeof(got));
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	/* The load-bearing assertions: a FRESH cold-fill and the NEW checksum. */
+	CU_ASSERT(st.cold_fills == 2);
+	CU_ASSERT(f1.calls == 1);
+	CU_ASSERT(got == expected_checksum(v1, sizeof(v1)));
+	CU_ASSERT(got != expected_checksum(v0, sizeof(v0)));	/* not stale */
+	printf("\n    D2 Store-then-Exec: cold_fills=%llu new_checksum=0x%llx (fresh, not stale)\n",
+	       (unsigned long long)st.cold_fills, (unsigned long long)got);
+
+	/* Delete(k): invalidate again. A subsequent Exec must be a fresh cold-fill
+	 * (a miss), proving the entry is truly gone -- never a stale hit. */
+	kvdev_rados_nkvx_wasm_cache_invalidate("k");
+	struct fake_fill f2 = { .bytes = v1, .len = sizeof(v1), .calls = 0 };
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "k", sizeof(v1),
+			fake_cold_fill, &f2, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(f2.calls == 1);		/* fresh cold-fill, not a hit */
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	CU_ASSERT(st.cold_fills == 3);
+	printf("    D2 Delete-then-Exec: cold_fills=%llu (miss -> fresh cold-fill, not stale)\n",
+	       (unsigned long long)st.cold_fills);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: TB4 D2 invalidate test is a no-op\n");
+#endif
+}
+
+/*
+ * D2 race-safety (carry-ref): a probe-hit that PINS an object stays valid through
+ * a concurrent invalidation -- the pinned version is served (no use-after-free),
+ * while a NEW Exec after the invalidation misses and cold-fills fresh. This
+ * mirrors the datapath cache_pin -> dispatch -> (Store invalidates) -> worker
+ * run_pinned sequence, exercised here without threads (run_cached/run_pinned hold
+ * the cache mutex, so the only real race window is probe->run, modelled below).
+ */
+static void
+test_nkvx_d2_pin_survives_invalidate(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB4 D2 pin test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	static const uint8_t v0[] = "pinned-version-0";
+	static const uint8_t v1[] = "fresh-version-1-after-store";
+	struct fake_fill f0 = { .bytes = v0, .len = sizeof(v0), .calls = 0 };
+	struct fake_fill f1 = { .bytes = v1, .len = sizeof(v1), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	uint64_t got = 0;
+	void *pin;
+	struct kvdev_rados_nkvx_wasm_stats st;
+
+	/* Exec(k): cold-fill v0 so the entry exists to pin. */
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "pk", sizeof(v0),
+			fake_cold_fill, &f0, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+
+	/* Datapath probe-hit: PIN the v0 entry (carry-ref through dispatch). */
+	pin = kvdev_rados_nkvx_wasm_cache_pin("pk");
+	CU_ASSERT(pin != NULL);
+
+	/* Concurrent Store(k, v1): invalidate while the pin is outstanding. The
+	 * pinned buffer must survive (deferred free); new lookups miss it. */
+	kvdev_rados_nkvx_wasm_cache_invalidate("pk");
+
+	/* The worker runs the PINNED version: still v0, no use-after-free. */
+	memset(out, 0, sizeof(out));
+	got = 0;
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_pinned("checksum", pin, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&got, out, sizeof(got));
+	CU_ASSERT(got == expected_checksum(v0, sizeof(v0)));	/* the pinned version */
+	kvdev_rados_nkvx_wasm_cache_unpin(pin);
+
+	/* A NEW Exec(k) after the invalidation MISSES and cold-fills v1 -- the dead
+	 * pinned entry is invisible to new lookups, so no stale hit. */
+	memset(out, 0, sizeof(out));
+	got = 0;
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", "pk", sizeof(v1),
+			fake_cold_fill, &f1, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&got, out, sizeof(got));
+	CU_ASSERT(f1.calls == 1);				/* fresh cold-fill */
+	CU_ASSERT(got == expected_checksum(v1, sizeof(v1)));	/* new version */
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	printf("\n    D2 pin-survives-invalidate: pinned served v0, new Exec cold-filled v1 "
+	       "(cold_fills=%llu, no UAF, no stale)\n", (unsigned long long)st.cold_fills);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: TB4 D2 pin test is a no-op\n");
+#endif
+}
+
+/*
  * Fail-soft: --without-wasm or libwasmtime.so absent -> run_cached returns
  * NOT_SUPPORTED and NEVER invokes the fill callback (the executor cannot run the
  * module, so it must not cold-fill). Deterministic in both build modes.
@@ -875,7 +1043,7 @@ test_nkvx_tb4_dispatch_wires_cache(void)
 	memset(&r, 0, sizeof(r));
 	memset(out, 0, sizeof(out));
 	set_thread(0);
-	CU_ASSERT(kvdev_rados_nkvx_dispatch("wasm:checksum", "oidZ", obj, obj_len,
+	CU_ASSERT(kvdev_rados_nkvx_dispatch("wasm:checksum", "oidZ", NULL, obj, obj_len,
 					    out, sizeof(out), nkvx_done, &r) == 0);
 	set_thread(INVALID_THREAD);
 	for (int i = 0; i < 100000 && !r.completed; i++) {
@@ -894,7 +1062,7 @@ test_nkvx_tb4_dispatch_wires_cache(void)
 	memset(&r, 0, sizeof(r));
 	memset(out, 0, sizeof(out));
 	set_thread(0);
-	CU_ASSERT(kvdev_rados_nkvx_dispatch("wasm:checksum", "oidZ", obj, obj_len,
+	CU_ASSERT(kvdev_rados_nkvx_dispatch("wasm:checksum", "oidZ", NULL, obj, obj_len,
 					    out, sizeof(out), nkvx_done, &r) == 0);
 	set_thread(INVALID_THREAD);
 	for (int i = 0; i < 100000 && !r.completed; i++) {
@@ -932,7 +1100,7 @@ test_nkvx_dispatch_without_thread_fails(void)
 
 	/* Off any SPDK thread there is no origin to complete on -> -EINVAL. */
 	set_thread(INVALID_THREAD);
-	rc = kvdev_rados_nkvx_dispatch(KVDEV_RADOS_NKVX_MODULE_IDENTITY, NULL, "x", 1,
+	rc = kvdev_rados_nkvx_dispatch(KVDEV_RADOS_NKVX_MODULE_IDENTITY, NULL, NULL, "x", 1,
 				       out, sizeof(out), nkvx_done, NULL);
 	CU_ASSERT(rc == -EINVAL);
 
@@ -963,6 +1131,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_tb4_multipage_module_private);
 	CU_ADD_TEST(suite, test_nkvx_tb4_oob_traps);
 	CU_ADD_TEST(suite, test_nkvx_d1_declared_size_caps_slack);
+	CU_ADD_TEST(suite, test_nkvx_d2_invalidate_on_mutation);
+	CU_ADD_TEST(suite, test_nkvx_d2_pin_survives_invalidate);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cached_failsoft);
 	CU_ADD_TEST(suite, test_nkvx_tb4_dispatch_wires_cache);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
