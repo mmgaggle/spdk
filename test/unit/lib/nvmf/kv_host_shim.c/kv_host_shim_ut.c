@@ -35,6 +35,27 @@
  *   - test_reconnect_stale_completion_two_deep: same, two orphans deep -- B's
  *                                  orphan lands inside C's armed window; the
  *                                  distinct per-op tokens keep C clean.
+ *   - test_sustained_failure_ring_wrap: the case that RETURNED-TO-GO the fixed
+ *                                  64-slot ring. Time out 64 ops (so the old ring
+ *                                  maps op #1 and op #65 to the SAME slot), then
+ *                                  fire op #1's long-outstanding orphan inside op
+ *                                  #65's armed window. The old ring's slot reuse
+ *                                  overwrites op #1's stored token with #65's ->
+ *                                  false match -> #65 corrupted with 0x08 (rc 8).
+ *                                  The per-op HEAP ctx has no slot reuse, so op
+ *                                  #1's distinct immutable token != #65's -> the
+ *                                  orphan is discarded and #65 returns 0. FAILS on
+ *                                  ec1d9e5c7, PASSES with the heap fix. Also
+ *                                  asserts every ctx is freed (incl. the 63
+ *                                  remaining orphans flushed at qpair free).
+ *   - test_no_ctx_leak:            per-op ctx ownership end to end -- success,
+ *                                  submit-failure, timeout and transport-failure
+ *                                  each free their ctx exactly once (allocs ==
+ *                                  frees), the timeout/transport orphans freed
+ *                                  when flushed at qpair free (close).
+ *
+ * A malloc/free interpose (counters) confirms zero ctx leaks; the whole suite is
+ * additionally valgrind-clean (0 errors, 0 bytes in use at exit).
  *
  * The mocked clock (spdk_get_ticks / spdk_get_ticks_hz from test_env.c) lets
  * the timeout test jump past the deadline instantly, so the suite never waits
@@ -45,9 +66,56 @@
 #include "spdk_internal/cunit.h"
 #include "common/lib/test_env.c"
 
+/*
+ * Per-op ctx leak accounting. The shim heap-allocates ONE struct kv_op_ctx per
+ * submitted op (in arm_op) and frees it exactly once -- in io_complete() when
+ * the op's single callback fires (real completion or orphan abort), or on the
+ * submit-failure path. To prove that holds even across many timed-out ops plus
+ * close (where free_io_qpair aborts all outstanding orphans), we interpose
+ * malloc/free with counters BEFORE including the shim, so the shim's bare
+ * malloc()/free() route through them. Tests assert g_ctx_allocs == g_ctx_frees.
+ *
+ * The shim uses bare malloc/free in exactly two places: the per-op ctx
+ * (arm_op/io_complete/submit-fail) and the shim struct itself in
+ * open()/close(). The op-path tests drive a static g_sh (never open/close it),
+ * so every counted alloc/free here is a per-op ctx -- giving an exact ctx leak
+ * check. (The dedicated close test below frees orphans WITHOUT freeing g_sh, so
+ * it likewise only counts ctxs.)
+ */
+static long g_ctx_allocs;
+static long g_ctx_frees;
+
+static inline void *
+ut_counting_malloc(size_t n)
+{
+	void *p = malloc(n);
+
+	if (p != NULL) {
+		g_ctx_allocs++;
+	}
+	return p;
+}
+
+static inline void
+ut_counting_free(void *p)
+{
+	if (p != NULL) {
+		g_ctx_frees++;
+	}
+	free(p);
+}
+
+/* Route the shim's bare malloc/free (used only for the per-op ctx in the op
+ * paths under test) through the counting wrappers. Scoped to the shim include. */
+#define malloc(n) ut_counting_malloc(n)
+#define free(p)   ut_counting_free(p)
+
 /* Pull in the shim under test so its static poll_to_completion()/
  * ensure_connected() are exercised directly. */
 #include "nvmf/kv_shim/kv_host_shim.c"
+
+#undef malloc
+#undef free
 
 /* ---- Stubs for the SPDK NVMe calls the shim references (only the ones the
  * op paths under test touch need real behaviour; the rest are no-op stubs). */
@@ -64,7 +132,6 @@ DEFINE_STUB(spdk_nvme_detach, int, (struct spdk_nvme_ctrlr *ctrlr), 0);
 DEFINE_STUB(spdk_nvme_ctrlr_alloc_io_qpair, struct spdk_nvme_qpair *,
 	    (struct spdk_nvme_ctrlr *ctrlr,
 	     const struct spdk_nvme_io_qpair_opts *opts, size_t opts_size), NULL);
-DEFINE_STUB(spdk_nvme_ctrlr_free_io_qpair, int, (struct spdk_nvme_qpair *qpair), 0);
 DEFINE_STUB(spdk_nvme_ctrlr_get_first_active_ns, uint32_t,
 	    (struct spdk_nvme_ctrlr *ctrlr), 0);
 DEFINE_STUB(spdk_nvme_ctrlr_get_next_active_ns, uint32_t,
@@ -124,6 +191,78 @@ static int g_stale_fire_after = -1;
  */
 static int g_stale_default_delay;
 
+/*
+ * When true, the single-orphan auto-firing timing (g_stale_cb / g_stale_fire_after)
+ * is DISABLED, so disconnect only appends to the multi-orphan registry and the
+ * test drives orphan firing explicitly via ut_fire_orphan(). Used by the
+ * sustained-failure/wrap test, which needs precise control over which orphan
+ * fires when, with no spurious auto-fire double-freeing a ctx.
+ */
+static bool g_stale_manual_only;
+
+/*
+ * Manual orphan-fire schedule for the sustained-failure/wrap test. When
+ * g_manual_fire_idx >= 0, fire registry orphan g_manual_fire_idx after
+ * g_manual_fire_after MORE process_completions calls, and hold off the armed
+ * op's own success until then -- so the chosen orphan lands squarely inside the
+ * armed op's poll window. One-shot.
+ */
+static int g_manual_fire_idx = -1;
+static int g_manual_fire_after;
+
+/*
+ * Registry of ALL outstanding orphan trackers (vfio-user leaves an arbitrary
+ * number of them outstanding under sustained failure -- they are aborted only
+ * when the io qpair is freed/deleted). Every disconnect of an in-flight op
+ * appends that op's (cb, cb_arg) here, in ADDITION to the single-orphan
+ * g_stale_cb timing used by the interleave tests. The sustained-failure/wrap
+ * test uses this registry to (a) hold 65+ simultaneous orphans -- which the OLD
+ * 64-slot ring could not disambiguate -- and (b) fire a CHOSEN orphan (the very
+ * first) while a much-later op is armed. spdk_nvme_ctrlr_free_io_qpair() flushes
+ * the whole registry, modeling abort_trackers at close so the ctx leak check can
+ * confirm every orphan's ctx is freed.
+ */
+#define UT_MAX_ORPHANS 256
+static spdk_nvme_cmd_cb g_orphan_cb[UT_MAX_ORPHANS];
+static void *g_orphan_cb_arg[UT_MAX_ORPHANS];
+static int g_orphan_count;
+
+/* Fire orphan slot `idx` with an ABORTED (0x08) status and a bogus cdw0, exactly
+ * as the transport would when the abort eventually surfaces. One-shot: the slot
+ * is cleared so it cannot fire (or be flushed) twice. */
+static void
+ut_fire_orphan(int idx)
+{
+	struct spdk_nvme_cpl acpl = {};
+
+	if (idx < 0 || idx >= g_orphan_count || g_orphan_cb[idx] == NULL) {
+		return;
+	}
+	acpl.status.sct = SPDK_NVME_SCT_GENERIC;
+	acpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;	/* 0x08 */
+	acpl.cdw0 = 0xdeadbeef;	/* wrong cdw0, to catch slot corruption */
+	g_orphan_cb[idx](g_orphan_cb_arg[idx], &acpl);
+	g_orphan_cb[idx] = NULL;
+	g_orphan_cb_arg[idx] = NULL;
+}
+
+/* Remove an orphan from the registry by cb_arg WITHOUT firing it -- used when the
+ * single-orphan auto-timing path (g_stale_cb) has already fired and freed it, so
+ * the close-time flush does not fire/free that same (now dangling) ctx twice. */
+static void
+ut_forget_orphan(void *cb_arg)
+{
+	int i;
+
+	for (i = 0; i < g_orphan_count; i++) {
+		if (g_orphan_cb_arg[i] == cb_arg) {
+			g_orphan_cb[i] = NULL;
+			g_orphan_cb_arg[i] = NULL;
+			return;
+		}
+	}
+}
+
 void
 spdk_nvme_ctrlr_disconnect_io_qpair(struct spdk_nvme_qpair *qpair)
 {
@@ -134,19 +273,49 @@ spdk_nvme_ctrlr_disconnect_io_qpair(struct spdk_nvme_qpair *qpair)
 	 * vfio-user). It becomes an orphan that the transport fires at some later
 	 * poll. By default schedule it g_stale_default_delay polls out, which the
 	 * interleave test sets to land past the drain and inside op B's armed
-	 * window.
+	 * window. Also append it to the multi-orphan registry so the sustained-
+	 * failure test can hold many at once and fire/flush a chosen one.
 	 */
 	if (g_op_in_flight) {
-		g_stale_cb = g_saved_cb;
-		g_stale_cb_arg = g_saved_cb_arg;
+		if (g_orphan_count < UT_MAX_ORPHANS) {
+			g_orphan_cb[g_orphan_count] = g_saved_cb;
+			g_orphan_cb_arg[g_orphan_count] = g_saved_cb_arg;
+			g_orphan_count++;
+		}
+		if (!g_stale_manual_only) {
+			g_stale_cb = g_saved_cb;
+			g_stale_cb_arg = g_saved_cb_arg;
+			g_stale_fire_after = g_stale_default_delay;
+		}
 		/* Move the tracker from "in flight" to "orphan, pending". Clear the
 		 * saved cb so it fires exactly once, as the orphan, not again as a
 		 * fresh success. */
 		g_saved_cb = NULL;
 		g_saved_cb_arg = NULL;
 		g_op_in_flight = false;
-		g_stale_fire_after = g_stale_default_delay;
 	}
+}
+
+/*
+ * Model spdk_nvme_ctrlr_free_io_qpair -> nvme_pcie_qpair_abort_trackers: on
+ * qpair free/delete, EVERY still-outstanding orphan's callback fires exactly
+ * once (with an aborted status). The shim's io_complete() frees each one's ctx.
+ * Returns 0 like the real call.
+ */
+int
+spdk_nvme_ctrlr_free_io_qpair(struct spdk_nvme_qpair *qpair)
+{
+	int i;
+
+	for (i = 0; i < g_orphan_count; i++) {
+		ut_fire_orphan(i);
+	}
+	g_orphan_count = 0;
+	/* Also drop any single-orphan timing state so it can't double-fire. */
+	g_stale_cb = NULL;
+	g_stale_cb_arg = NULL;
+	g_stale_fire_after = -1;
+	return 0;
 }
 
 int
@@ -221,6 +390,25 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 	struct spdk_nvme_cpl cpl = {};
 
 	/*
+	 * Manual orphan schedule (sustained-failure/wrap test). Fire a CHOSEN
+	 * registry orphan after g_manual_fire_after polls, holding off the armed
+	 * op's success so the orphan lands inside the armed op's poll window.
+	 */
+	if (g_manual_fire_idx >= 0) {
+		if (g_manual_fire_after == 0) {
+			int idx = g_manual_fire_idx;
+
+			g_manual_fire_idx = -1;
+			ut_fire_orphan(idx);
+			return 1;
+		}
+		g_manual_fire_after--;
+		if (g_poll_mode == POLL_COMPLETE_SUCCESS) {
+			return 0;	/* armed op stays in flight; orphan fires soon */
+		}
+	}
+
+	/*
 	 * Faithful orphan timing: an outstanding tracker left by a disconnected op
 	 * fires its aborted callback at an ARBITRARY later poll (g_stale_fire_after
 	 * polls after the disconnect), NOT necessarily on the first poll. The
@@ -237,6 +425,10 @@ spdk_nvme_qpair_process_completions(struct spdk_nvme_qpair *qpair,
 			acpl.status.sc = SPDK_NVME_SC_ABORTED_SQ_DELETION;	/* 0x08 */
 			acpl.cdw0 = 0xdeadbeef;	/* wrong cdw0, to catch slot corruption */
 			g_stale_fire_after = -1;
+			/* This same orphan is also tracked in the registry; drop it
+			 * there first so the close-time flush won't fire/free the
+			 * (about-to-be-freed) ctx a second time. */
+			ut_forget_orphan(g_stale_cb_arg);
 			g_stale_cb(g_stale_cb_arg, &acpl);
 			g_stale_cb = NULL;
 			g_stale_cb_arg = NULL;
@@ -291,6 +483,17 @@ static struct kv_host_shim g_sh;
 static void
 reset_state(void)
 {
+	/*
+	 * Flush any orphans the PREVIOUS test left outstanding, modeling the
+	 * qpair free at kv_host_shim_close(): each fires io_complete() once, which
+	 * frees its per-op ctx. Tests that deliberately time out an op (and do not
+	 * themselves close) would otherwise leak that op's ctx; flushing here keeps
+	 * the whole suite valgrind-clean and proves the close-time abort path frees
+	 * every ctx. Safe on the first call (registry empty). Must run BEFORE the
+	 * memset below, while g_sh.armed_op_id still reflects the prior test (so the
+	 * flushed orphans are correctly discarded, not recorded). */
+	spdk_nvme_ctrlr_free_io_qpair(g_sh.qpair);
+
 	memset(&g_sh, 0, sizeof(g_sh));
 	g_sh.ctrlr = (struct spdk_nvme_ctrlr *)0x1;
 	g_sh.ns = (struct spdk_nvme_ns *)0x2;
@@ -304,9 +507,17 @@ reset_state(void)
 	g_stale_cb_arg = NULL;
 	g_stale_fire_after = -1;
 	g_stale_default_delay = 0;
+	g_stale_manual_only = false;
+	g_manual_fire_idx = -1;
+	g_manual_fire_after = 0;
 	g_op_in_flight = false;
 	g_submit_rc = 0;
 	g_poll_mode = POLL_COMPLETE_SUCCESS;
+	memset(g_orphan_cb, 0, sizeof(g_orphan_cb));
+	memset(g_orphan_cb_arg, 0, sizeof(g_orphan_cb_arg));
+	g_orphan_count = 0;
+	g_ctx_allocs = 0;
+	g_ctx_frees = 0;
 	MOCK_SET(spdk_get_ticks, 0);
 }
 
@@ -553,6 +764,133 @@ test_reconnect_stale_completion_two_deep(void)
 	CU_ASSERT(g_sh.armed_op_id == 0);
 }
 
+/*
+ * SUSTAINED-FAILURE / RING-WRAP regression (the case the reviewer used to
+ * RETURN-TO-GO the fixed 64-slot ring).
+ *
+ * The old fix stored each op's identity token in a slot of a fixed
+ * KV_HOST_SHIM_OP_RING (64) ring, indexed by op_id & 63. Under sustained
+ * failure, MANY ops time out and leave their trackers outstanding
+ * simultaneously (vfio-user aborts them only at qpair free). After 64 ops the
+ * ring WRAPS: op #65 reuses op #1's slot and OVERWRITES its stored op_id. When
+ * op #1's long-outstanding orphan finally fires, it reads back the slot's op_id
+ * -- now #65's (== armed_op_id) -- a FALSE identity match, and the orphan's
+ * aborted 0x08 status corrupts the armed op #65.
+ *
+ * This test reproduces exactly that: time out 64 ops (ids 1..64; the old ring
+ * maps op #1 and op #65 to the SAME slot 1), then arm op #65 (a fresh SUCCESS
+ * op) and fire op #1's orphan inside op #65's armed poll window. With the
+ * per-op heap ctx (this fix) op #1's ctx is a DISTINCT allocation whose op_id is
+ * immutably 1 != 65, so the orphan is discarded and op #65 returns its own
+ * SUCCESS. With the old ring fix (ec1d9e5c7) the slot aliasing makes op #65
+ * return 8. Also asserts every per-op ctx is freed (no leak) including after the
+ * remaining 63 orphans are flushed at qpair free (close).
+ */
+static void
+test_sustained_failure_ring_wrap(void)
+{
+	int rc;
+	int i;
+	const int N_TIMEOUTS = 64;	/* ids 1..64; op #65 wraps onto op #1's slot */
+
+	reset_state();
+	g_stale_manual_only = true;	/* we drive orphan firing explicitly */
+
+	/* 1. Time out N_TIMEOUTS ops. Each leaves its tracker outstanding (appended
+	 * to the orphan registry) and flags qpair_failed so the next op reconnects.
+	 * The OLD ring would, by op #65, have wrapped op #1's slot. */
+	for (i = 0; i < N_TIMEOUTS; i++) {
+		g_poll_mode = POLL_HANG;
+		g_reconnect_rc = 0;
+		MOCK_SET(spdk_get_ticks, 0);
+		rc = kv_host_shim_store(&g_sh, "x", 1, "v", 1);
+		CU_ASSERT(rc == -ETIMEDOUT);
+	}
+	CU_ASSERT(g_orphan_count == N_TIMEOUTS);
+	CU_ASSERT(g_sh.next_op_id == (uint64_t)N_TIMEOUTS);	/* next op is #65 */
+	CU_ASSERT(g_orphan_cb[0] != NULL);	/* op #1's orphan still outstanding */
+
+	/* 2. Op #65 reconnects, arms a fresh token (id 65; old ring slot 65&63 == 1,
+	 * the SAME slot op #1 used), and submits a SUCCESS op. During its armed poll
+	 * we fire op #1's orphan (registry idx 0) carrying 0x08 / 0xdeadbeef. */
+	g_poll_mode = POLL_COMPLETE_SUCCESS;
+	g_reconnect_rc = 0;
+	g_manual_fire_idx = 0;		/* op #1's orphan */
+	g_manual_fire_after = 3;	/* lands past the drain, inside #65's poll */
+	MOCK_SET(spdk_get_ticks, 0);
+	rc = kv_host_shim_store(&g_sh, "Z", 1, "v", 1);
+
+	/* The armed op #65 must return ITS OWN result (0), NOT op #1's orphan 0x08.
+	 * On the OLD ring (ec1d9e5c7) the slot aliasing records 0x08 -> rc == 8. */
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_sh.last_sc == SPDK_NVME_SC_SUCCESS);
+	CU_ASSERT(g_sh.last_cdw0 != 0xdeadbeef);	/* not op #1's bogus cdw0 */
+	CU_ASSERT(g_sh.armed_op_id == 0);
+	/* op #1's orphan was fired+freed; one fewer outstanding. */
+	CU_ASSERT(g_orphan_cb[0] == NULL);
+
+	/* 3. Close-time flush: free the io qpair, which aborts ALL remaining
+	 * outstanding orphans (the 63 still-pending timed-out ops). Each fires
+	 * io_complete() once -> frees its ctx. Models kv_host_shim_close()'s
+	 * free_io_qpair-before-free(sh) ordering without freeing the static g_sh. */
+	spdk_nvme_ctrlr_free_io_qpair(g_sh.qpair);
+
+	/* LEAK CHECK: every per-op ctx ever allocated has now been freed exactly
+	 * once -- the 64 timed-out ops' orphans (1 fired manually + 63 at flush) and
+	 * op #65's own completion. No ctx leaks across unbounded orphans + close. */
+	CU_ASSERT(g_ctx_allocs == N_TIMEOUTS + 1);	/* 64 timeouts + op #65 */
+	CU_ASSERT(g_ctx_frees == g_ctx_allocs);
+}
+
+/*
+ * Dedicated ctx-leak check for the routine paths: success, timeout, transport
+ * failure, and submit-failure must each free their per-op ctx exactly once
+ * (allocs == frees), with the timeout/transport orphans freed when flushed at
+ * qpair free. Guards the per-op heap ownership model end to end.
+ */
+static void
+test_no_ctx_leak(void)
+{
+	int rc;
+
+	/* Success: ctx freed in io_complete on the real completion. */
+	reset_state();
+	rc = kv_host_shim_store(&g_sh, "k", 1, "v", 1);
+	CU_ASSERT(rc == 0);
+	CU_ASSERT(g_ctx_allocs == 1);
+	CU_ASSERT(g_ctx_frees == 1);
+
+	/* Submit failure: request never queued -> submit path frees the ctx. */
+	reset_state();
+	g_submit_rc = -EIO;
+	rc = kv_host_shim_store(&g_sh, "k", 1, "v", 1);
+	CU_ASSERT(rc == -EIO);
+	CU_ASSERT(g_ctx_allocs == 1);
+	CU_ASSERT(g_ctx_frees == 1);	/* freed on the submit-fail path */
+
+	/* Timeout: ctx stays alive as an orphan until flushed at qpair free. */
+	reset_state();
+	g_stale_manual_only = true;
+	g_poll_mode = POLL_HANG;
+	rc = kv_host_shim_store(&g_sh, "k", 1, "v", 1);
+	CU_ASSERT(rc == -ETIMEDOUT);
+	CU_ASSERT(g_ctx_allocs == 1);
+	CU_ASSERT(g_ctx_frees == 0);	/* orphan ctx not yet freed */
+	spdk_nvme_ctrlr_free_io_qpair(g_sh.qpair);	/* abort_trackers -> free */
+	CU_ASSERT(g_ctx_frees == 1);
+
+	/* Transport failure: same -- orphan ctx freed at qpair free. */
+	reset_state();
+	g_stale_manual_only = true;
+	g_poll_mode = POLL_TRANSPORT_FAIL;
+	rc = kv_host_shim_store(&g_sh, "k", 1, "v", 1);
+	CU_ASSERT(rc == -ENXIO);
+	CU_ASSERT(g_ctx_allocs == 1);
+	CU_ASSERT(g_ctx_frees == 0);
+	spdk_nvme_ctrlr_free_io_qpair(g_sh.qpair);
+	CU_ASSERT(g_ctx_frees == 1);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -569,6 +907,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_reconnect_after_failure);
 	CU_ADD_TEST(suite, test_reconnect_stale_completion_interleave);
 	CU_ADD_TEST(suite, test_reconnect_stale_completion_two_deep);
+	CU_ADD_TEST(suite, test_sustained_failure_ring_wrap);
+	CU_ADD_TEST(suite, test_no_ctx_leak);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

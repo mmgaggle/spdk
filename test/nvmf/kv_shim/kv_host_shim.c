@@ -18,35 +18,29 @@
 
 #include "kv_host_shim.h"
 
-/*
- * Size of the per-op identity-token context ring (see struct kv_host_shim).
- *
- * The shim is strictly synchronous: at most one op is armed at a time, and an
- * orphaned tracker from a timed-out/failed op is at most ONE generation old (it
- * fires during the immediately following op's poll). A ring of this many
- * slots therefore guarantees an orphan's slot is not reused (its stored op_id
- * not overwritten) for far longer than any orphan can survive, so a late orphan
- * callback always reads back its OWN (stale) op_id and is rejected. Must be a
- * power of two so the index masks cheaply.
- */
-#define KV_HOST_SHIM_OP_RING 64u
-
 struct kv_host_shim;
 
 /*
- * Per-op identity-token context. One of these is handed to the transport as the
- * completion cb_arg for each submitted op. It carries a back-pointer to the
- * shim and the op's unique monotonically-increasing token (op_id).
+ * Per-op identity context. ONE of these is heap-allocated per submitted op in
+ * arm_op() and handed to the transport as that op's completion cb_arg. It
+ * carries a back-pointer to the shim and the op's unique, monotonically
+ * increasing token (op_id).
  *
- * LIFETIME: these contexts live in a fixed ring embedded in struct kv_host_shim
- * (op_ctx[]). They are NEVER freed individually -- only when the whole shim is
- * freed in kv_host_shim_close(). A late orphan callback can therefore fire
- * arbitrarily later (even after the op that submitted it has returned) and STILL
- * safely dereference its context: the memory outlives the orphan because it is
- * owned by the shim, and the slot's op_id is not overwritten until the ring
- * wraps KV_HOST_SHIM_OP_RING ops later (which an at-most-one-generation-old
- * orphan never reaches). So io_complete() never touches freed memory and never
- * reads a slot whose op_id has been recycled out from under the orphan.
+ * LIFETIME (no slot reuse, robust to UNBOUNDED outstanding orphans):
+ *   - Each submitted request's completion callback (io_complete) fires EXACTLY
+ *     ONCE -- either its real completion, or its abort when the io qpair is
+ *     freed/deleted (spdk_nvme_ctrlr_free_io_qpair -> abort_trackers). The ctx
+ *     is freed in io_complete() on that single firing, so it is leak-free and
+ *     never double-freed.
+ *   - If submit FAILS (the request is never queued, so the callback will NEVER
+ *     fire) the submit path frees the ctx instead.
+ *   - Because every ctx is a DISTINCT allocation whose op_id is immutable for
+ *     its whole lifetime, a late orphan callback reads back its OWN op_id from
+ *     memory that no other op can have reused. This is what the old fixed ring
+ *     could not guarantee: under sustained failure N orphans coexist, the ring
+ *     wraps, and a stale slot's op_id gets overwritten by a later op -> a false
+ *     identity match. A per-op heap ctx has no slot reuse and no aliasing, so it
+ *     is correct for an arbitrary number of simultaneous outstanding orphans.
  */
 struct kv_op_ctx {
 	struct kv_host_shim	*sh;
@@ -77,23 +71,27 @@ struct kv_host_shim {
 	 * gated on trtype == PCIE and is skipped for vfio-user. So when an op times
 	 * out or transport-fails, its tracker stays outstanding and its callback
 	 * (an orphan) can fire at an UNBOUNDED later poll -- including DURING the
-	 * NEXT op's poll_to_completion(). A bounded drain on reconnect cannot
-	 * guarantee consuming it.
+	 * NEXT op's poll_to_completion(). Under sustained failure an UNBOUNDED
+	 * number of such orphans can be outstanding at once, all firing only when
+	 * the io qpair is finally freed/deleted. A bounded drain on reconnect
+	 * cannot guarantee consuming any of them.
 	 *
-	 * To make that orphan harmless we give every op a unique token:
+	 * To make those orphans harmless we give every op a unique token carried in
+	 * a PER-OP HEAP context (struct kv_op_ctx), not a recycled ring slot:
 	 *   - next_op_id is a monotonically increasing counter; each op takes the
-	 *     next value as its token before submitting.
+	 *     next value as its token before submitting (start 1; 0 == none).
 	 *   - armed_op_id holds the token of the op currently being polled.
-	 *   - the op's completion cb_arg is a struct kv_op_ctx (from op_ctx[])
-	 *     carrying that token.
+	 *   - the op's completion cb_arg is a freshly malloc'd struct kv_op_ctx
+	 *     carrying that token; its op_id is immutable for the ctx's lifetime.
 	 * io_complete() records a completion ONLY when ctx->op_id == armed_op_id;
 	 * a stale orphan carries an OLD token != armed_op_id and is DISCARDED. So
 	 * an orphan from op A can never be recorded as op B's result, even if it
-	 * fires in the middle of B's armed poll window.
+	 * fires in the middle of B's armed poll window, and even if arbitrarily
+	 * many orphans coexist -- each has its own distinct, never-reused ctx, so
+	 * no slot reuse can ever alias one op's token onto another's memory.
 	 */
 	uint64_t		next_op_id;
 	volatile uint64_t	armed_op_id;
-	struct kv_op_ctx	op_ctx[KV_HOST_SHIM_OP_RING];
 	volatile bool		done;
 	volatile uint8_t	last_sct;
 	volatile uint8_t	last_sc;
@@ -101,20 +99,30 @@ struct kv_host_shim {
 };
 
 /*
- * Arm the next op: allocate a fresh identity token, stamp it into the ring slot
- * that will be used as this op's cb_arg, and publish it as the armed token.
- * Returns the per-op context to hand to the transport as cb_arg.
+ * Arm the next op: allocate a fresh identity token AND a fresh per-op heap
+ * context carrying it, and publish the token as the armed token. Returns the
+ * per-op context to hand to the transport as cb_arg, or NULL on OOM (the caller
+ * must fail the op and NOT submit).
  *
- * The slot index round-robins over the ring. Because the shim is synchronous,
- * the slot being (re)stamped here cannot still hold a live orphan (that would
- * require an orphan to survive KV_HOST_SHIM_OP_RING ops, which cannot happen).
+ * Unlike a ring slot, this allocation is distinct per op and is NEVER reused by
+ * a later op, so its op_id can never be overwritten out from under an orphan: a
+ * late io_complete() always reads back this op's own immutable token. The ctx is
+ * freed exactly once -- in io_complete() when the op's (single) callback fires,
+ * or on the submit-failure path if the request is never queued.
  */
 static struct kv_op_ctx *
 arm_op(struct kv_host_shim *sh)
 {
 	uint64_t id = ++sh->next_op_id;
-	struct kv_op_ctx *ctx = &sh->op_ctx[id & (KV_HOST_SHIM_OP_RING - 1)];
+	struct kv_op_ctx *ctx = malloc(sizeof(*ctx));
 
+	if (ctx == NULL) {
+		/* Roll back the token so next_op_id stays in step with armed ids;
+		 * not strictly required (tokens only need to be unique), but keeps
+		 * the counter tidy. armed_op_id is left unchanged (still 0/none). */
+		sh->next_op_id--;
+		return NULL;
+	}
 	ctx->sh = sh;
 	ctx->op_id = id;
 	sh->done = false;
@@ -166,20 +174,29 @@ io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 	 * closes the vfio-user abort-on-reconnect window: the orphan's tracker is
 	 * NOT aborted by disconnect/reconnect for this transport, so its callback
 	 * may fire at an arbitrary later poll -- even in the middle of the next
-	 * op's armed poll window -- yet it can never be mistaken for that op's
-	 * result because its token differs.
+	 * op's armed poll window, and even if arbitrarily many orphans are
+	 * outstanding -- yet it can never be mistaken for that op's result because
+	 * its token differs.
 	 *
-	 * ctx points into the shim's op_ctx[] ring, which outlives every orphan
-	 * (freed only at kv_host_shim_close()), so this dereference is always safe.
+	 * ctx is a DISTINCT per-op heap allocation whose op_id is immutable for its
+	 * lifetime; no later op reuses it (no ring, no slot recycling), so this
+	 * dereference is always safe and the read-back op_id is unambiguous even
+	 * under unbounded simultaneous orphans.
 	 */
-	if (ctx->op_id != sh->armed_op_id) {
-		return;
+	if (ctx->op_id == sh->armed_op_id) {
+		sh->armed_op_id = 0;	/* consume: the matching completion arrived */
+		sh->last_sct = cpl->status.sct;
+		sh->last_sc = cpl->status.sc;
+		sh->last_cdw0 = cpl->cdw0;
+		sh->done = true;
 	}
-	sh->armed_op_id = 0;	/* consume: the matching completion arrived */
-	sh->last_sct = cpl->status.sct;
-	sh->last_sc = cpl->status.sc;
-	sh->last_cdw0 = cpl->cdw0;
-	sh->done = true;
+	/*
+	 * This op's (single) callback has now fired -- whether as its real
+	 * completion above or as a discarded orphan. A given submitted request's
+	 * cb fires EXACTLY ONCE (real completion or abort on qpair free/delete), so
+	 * freeing the ctx here is correct, leak-free, and never a double free.
+	 */
+	free(ctx);
 }
 
 /*
@@ -455,6 +472,19 @@ kv_host_shim_close(struct kv_host_shim *sh)
 	if (sh == NULL) {
 		return;
 	}
+	/*
+	 * Free the io qpair FIRST, before freeing sh. On vfio-user, outstanding
+	 * orphan trackers (from timed-out/failed ops) are aborted only when the
+	 * qpair is freed/deleted: spdk_nvme_ctrlr_free_io_qpair() ->
+	 * nvme_pcie_qpair_abort_trackers() fires each one's io_complete() exactly
+	 * once. Each such firing frees that orphan's per-op heap ctx (the orphan's
+	 * op_id != armed_op_id, so it is discarded but still freed), so NO ctx
+	 * leaks across an arbitrary number of outstanding orphans. The disarm of
+	 * the last op left armed_op_id == 0 (close is only reached after the final
+	 * op returned, which disarms on every path), so these abort callbacks
+	 * record nothing -- they just free. Doing this before free(sh) guarantees
+	 * no orphan callback dereferences a freed sh.
+	 */
 	if (sh->qpair != NULL) {
 		spdk_nvme_ctrlr_free_io_qpair(sh->qpair);
 	}
@@ -505,13 +535,20 @@ kv_host_shim_store(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 	if (rc != 0) {
 		return rc;
 	}
-	/* Arm a fresh identity token; io_complete() records only the completion
-	 * carrying this token (ctx), dropping any stale orphan from a prior op. */
+	/* Arm a fresh identity token + per-op heap ctx; io_complete() records only
+	 * the completion carrying this token (ctx), dropping any stale orphan from a
+	 * prior op, and frees ctx when this op's callback fires. */
 	ctx = arm_op(sh);
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
 	rc = spdk_nvme_kv_store(sh->ns, sh->qpair, key, key_len, value, value_len,
 				io_complete, ctx, 0);
 	if (rc != 0) {
-		disarm_op(sh);	/* no tracker created; drop the armed token */
+		/* Request never queued -> io_complete will NEVER fire for this ctx,
+		 * so the submit path owns the free here. Disarm the token too. */
+		disarm_op(sh);
+		free(ctx);
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
@@ -535,13 +572,20 @@ kv_host_shim_retrieve(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 	if (rc != 0) {
 		return rc;
 	}
-	/* Arm a fresh identity token; io_complete() records only the completion
-	 * carrying this token (ctx), dropping any stale orphan from a prior op. */
+	/* Arm a fresh identity token + per-op heap ctx; io_complete() records only
+	 * the completion carrying this token (ctx), dropping any stale orphan from a
+	 * prior op, and frees ctx when this op's callback fires. */
 	ctx = arm_op(sh);
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
 	rc = spdk_nvme_kv_retrieve(sh->ns, sh->qpair, key, key_len, value, buf_len,
 				   io_complete, ctx, 0);
 	if (rc != 0) {
-		disarm_op(sh);	/* no tracker created; drop the armed token */
+		/* Request never queued -> io_complete will NEVER fire for this ctx,
+		 * so the submit path owns the free here. Disarm the token too. */
+		disarm_op(sh);
+		free(ctx);
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
@@ -569,12 +613,19 @@ kv_host_shim_exist(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 	if (rc != 0) {
 		return rc;
 	}
-	/* Arm a fresh identity token; io_complete() records only the completion
-	 * carrying this token (ctx), dropping any stale orphan from a prior op. */
+	/* Arm a fresh identity token + per-op heap ctx; io_complete() records only
+	 * the completion carrying this token (ctx), dropping any stale orphan from a
+	 * prior op, and frees ctx when this op's callback fires. */
 	ctx = arm_op(sh);
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
 	rc = spdk_nvme_kv_exist(sh->ns, sh->qpair, key, key_len, io_complete, ctx);
 	if (rc != 0) {
-		disarm_op(sh);	/* no tracker created; drop the armed token */
+		/* Request never queued -> io_complete will NEVER fire for this ctx,
+		 * so the submit path owns the free here. Disarm the token too. */
+		disarm_op(sh);
+		free(ctx);
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
@@ -597,12 +648,19 @@ kv_host_shim_delete(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 	if (rc != 0) {
 		return rc;
 	}
-	/* Arm a fresh identity token; io_complete() records only the completion
-	 * carrying this token (ctx), dropping any stale orphan from a prior op. */
+	/* Arm a fresh identity token + per-op heap ctx; io_complete() records only
+	 * the completion carrying this token (ctx), dropping any stale orphan from a
+	 * prior op, and frees ctx when this op's callback fires. */
 	ctx = arm_op(sh);
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
 	rc = spdk_nvme_kv_delete(sh->ns, sh->qpair, key, key_len, io_complete, ctx);
 	if (rc != 0) {
-		disarm_op(sh);	/* no tracker created; drop the armed token */
+		/* Request never queued -> io_complete will NEVER fire for this ctx,
+		 * so the submit path owns the free here. Disarm the token too. */
+		disarm_op(sh);
+		free(ctx);
 		return rc < 0 ? rc : -rc;
 	}
 	rc = poll_to_completion(sh);
