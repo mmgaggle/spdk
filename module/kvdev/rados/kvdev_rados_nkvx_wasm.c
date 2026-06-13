@@ -788,6 +788,26 @@ kvdev_rados_nkvx_wasm_module_cached(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN
 }
 
 int
+kvdev_rados_nkvx_wasm_module_verify(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN],
+				    const void *bytes, size_t bytes_len)
+{
+	/* The gate (ADR-0010), compile-free: reactor-callable. We still require the
+	 * runtime so a build/host that cannot compile reports the same distinct
+	 * "unavailable" status the inline path used to. */
+	if (nkvx_wasm_api() == NULL) {
+		return SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED;
+	}
+	if (sha256 == NULL || bytes == NULL || bytes_len == 0) {
+		return SPDK_KVDEV_IO_STATUS_INVALID;
+	}
+	if (!nkvx_wasm_verify(bytes, bytes_len, sha256)) {
+		SPDK_ERRLOG("nkvx/wasm: module hash MISMATCH — rejecting (bytes never compiled/run)\n");
+		return SPDK_KVDEV_IO_STATUS_INVALID;
+	}
+	return SPDK_KVDEV_IO_STATUS_SUCCESS;
+}
+
+int
 kvdev_rados_nkvx_wasm_module_insert(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN],
 				    const void *bytes, size_t bytes_len)
 {
@@ -2510,6 +2530,17 @@ kvdev_rados_nkvx_wasm_module_cached(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN
 	(void)sha256;
 	/* No module cache in the stub build: always a miss. */
 	return false;
+}
+
+int
+kvdev_rados_nkvx_wasm_module_verify(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN],
+				    const void *bytes, size_t bytes_len)
+{
+	(void)sha256;
+	(void)bytes;
+	(void)bytes_len;
+	/* --without-wasm: no runtime to compile for; fail-soft, never crash. */
+	return SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED;
 }
 
 int

@@ -73,6 +73,20 @@ struct kvdev_rados_nkvx_module {
 bool kvdev_rados_nkvx_wasm_module_cached(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN]);
 
 /*
+ * The hard ADR-0010 integrity gate IN ISOLATION: hash \c bytes and constant-time
+ * compare against the bound \c sha256, doing NO compile. Reactor-callable and
+ * cheap relative to a Cranelift compile, so the authorization decision (does this
+ * byte stream match the bound hash?) can be made synchronously on the reactor
+ * while the expensive compile is handed off the reactor (spdk-5wi). Returns
+ * SPDK_KVDEV_IO_STATUS_SUCCESS on an exact match, SPDK_KVDEV_IO_STATUS_INVALID on
+ * a mismatch or bad arguments, or SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED when the
+ * runtime is unavailable. A SUCCESS here means the bytes are blessed to compile;
+ * it does NOT cache anything.
+ */
+int kvdev_rados_nkvx_wasm_module_verify(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN],
+					const void *bytes, size_t bytes_len);
+
+/*
  * VERIFY \c bytes against \c sha256 (the hard ADR-0010 gate), and on success
  * compile + insert into the content-addressed module cache (idempotent). Returns
  * SPDK_KVDEV_IO_STATUS_SUCCESS when the module is cached (verified+compiled, or
@@ -80,6 +94,10 @@ bool kvdev_rados_nkvx_wasm_module_cached(const uint8_t sha256[SPDK_KV_EXEC_SHA25
  * compiled), SPDK_KVDEV_IO_STATUS_FAILED on a compile failure, or
  * SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED when the runtime is unavailable. NEVER
  * compiles or caches bytes that fail the hash check.
+ *
+ * This does CPU-heavy compile work; callers on the SPDK reactor MUST run it off
+ * the reactor (see kvdev_rados_nkvx_dispatch_compile). The reactor-side gate is
+ * kvdev_rados_nkvx_wasm_module_verify above.
  */
 int kvdev_rados_nkvx_wasm_module_insert(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN],
 					const void *bytes, size_t bytes_len);

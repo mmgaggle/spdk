@@ -31,7 +31,20 @@
  * Retrieve traffic on the reactor.
  */
 
+/*
+ * A worker job is either a module RUN (the original off-reactor compute) or a
+ * one-time module COMPILE (spdk-5wi): the verified-hash gate stays on the reactor,
+ * but the Cranelift compile of a sha256-cache miss is handed here so it never
+ * head-of-line-blocks the poller. Both kinds share the queue, the origin-thread
+ * hand-back, and the off-reactor-proof tid capture.
+ */
+enum kvdev_rados_nkvx_job_kind {
+	NKVX_JOB_RUN = 0,
+	NKVX_JOB_COMPILE,
+};
+
 struct kvdev_rados_nkvx_job {
+	enum kvdev_rados_nkvx_job_kind	kind;
 	char				module[32];
 	char				obj_key[256];	/* identity key (oid) for the cache */
 	void				*obj_pin;	/* pinned cache handle (spdk-ii0 D2) or NULL */
@@ -53,6 +66,17 @@ struct kvdev_rados_nkvx_job {
 	void				*done_arg;
 	struct spdk_thread		*origin;	/* SPDK thread to complete on */
 	pthread_t			submit_tid;	/* OS thread that submitted (reactor) */
+
+	/*
+	 * NKVX_JOB_COMPILE only (spdk-5wi): the verified module bytes to compile +
+	 * cache. sha256 is copied by value; bytes points at caller-owned memory that
+	 * MUST outlive the job (the io frees it after compiled_fn fires on the
+	 * reactor). compiled_fn is the origin-thread completion.
+	 */
+	uint8_t				compile_sha256[SPDK_KV_EXEC_SHA256_LEN];
+	const void			*compile_bytes;
+	size_t				compile_bytes_len;
+	kvdev_rados_nkvx_compiled_fn	compiled_fn;
 
 	/* Filled in by the worker, read back on the SPDK thread. */
 	int				kvstatus;
@@ -215,14 +239,19 @@ kvdev_rados_nkvx_complete_on_spdk(void *ctx)
 	 */
 	pthread_t reactor_tid = pthread_self();
 
-	SPDK_NOTICELOG("nkvx: off-reactor proof module=%s reactor_tid=0x%lx "
+	SPDK_NOTICELOG("nkvx: off-reactor proof %s=%s reactor_tid=0x%lx "
 		       "run_tid=0x%lx off_reactor=%s\n",
+		       job->kind == NKVX_JOB_COMPILE ? "compile" : "module",
 		       job->module,
 		       (unsigned long)reactor_tid,
 		       (unsigned long)job->run_tid,
 		       pthread_equal(reactor_tid, job->run_tid) ? "NO" : "YES");
 
-	job->done_fn(job->done_arg, job->kvstatus, job->result_len);
+	if (job->kind == NKVX_JOB_COMPILE) {
+		job->compiled_fn(job->done_arg, job->kvstatus);
+	} else {
+		job->done_fn(job->done_arg, job->kvstatus, job->result_len);
+	}
 	free(job);
 }
 
@@ -251,11 +280,20 @@ kvdev_rados_nkvx_worker_main(void *arg)
 		 * against the reactor's thread id as deterministic off-reactor proof. */
 		job->run_tid = pthread_self();
 
-		/* The actual off-reactor compute. */
-		job->kvstatus = kvdev_rados_nkvx_run_module(job->module,
-				job->has_mod ? &job->mod : NULL, job->obj_key,
-				job->obj_pin, job->object, job->object_len, job->out,
-				job->out_len, &job->result_len);
+		/* The actual off-reactor compute. A COMPILE job runs the one-time
+		 * Cranelift compile + cache-insert here (spdk-5wi); the reactor already
+		 * gated the bytes against the bound hash, and module_insert is idempotent
+		 * and self-synchronized (its own modcache mutex), so a concurrent run that
+		 * also misses the same hash races safely into the same cache slot. */
+		if (job->kind == NKVX_JOB_COMPILE) {
+			job->kvstatus = kvdev_rados_nkvx_wasm_module_insert(job->compile_sha256,
+					job->compile_bytes, job->compile_bytes_len);
+		} else {
+			job->kvstatus = kvdev_rados_nkvx_run_module(job->module,
+					job->has_mod ? &job->mod : NULL, job->obj_key,
+					job->obj_pin, job->object, job->object_len, job->out,
+					job->out_len, &job->result_len);
+		}
 
 		/* Hand the result back to the SPDK thread that submitted it; the
 		 * kvdev completion fires there, never on this worker thread. */
@@ -357,6 +395,48 @@ kvdev_rados_nkvx_dispatch(const char *module, const struct kvdev_rados_nkvx_modu
 	job->out = out;
 	job->out_len = out_len;
 	job->done_fn = done_fn;
+	job->done_arg = done_arg;
+	job->origin = origin;
+	job->submit_tid = pthread_self();
+
+	pthread_mutex_lock(&g_nkvx.mutex);
+	if (!g_nkvx.running) {
+		pthread_mutex_unlock(&g_nkvx.mutex);
+		free(job);
+		return -ENODEV;
+	}
+	STAILQ_INSERT_TAIL(&g_nkvx.queue, job, link);
+	pthread_cond_signal(&g_nkvx.cond);
+	pthread_mutex_unlock(&g_nkvx.mutex);
+	return 0;
+}
+
+int
+kvdev_rados_nkvx_dispatch_compile(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN],
+				  const void *bytes, size_t bytes_len,
+				  kvdev_rados_nkvx_compiled_fn done_fn, void *done_arg)
+{
+	struct kvdev_rados_nkvx_job *job;
+	struct spdk_thread *origin = spdk_get_thread();
+
+	if (origin == NULL) {
+		/* Must be dispatched from an SPDK thread so we can hand the completion
+		 * back to it (same contract as kvdev_rados_nkvx_dispatch). */
+		return -EINVAL;
+	}
+	if (sha256 == NULL || bytes == NULL || bytes_len == 0 || done_fn == NULL) {
+		return -EINVAL;
+	}
+
+	job = calloc(1, sizeof(*job));
+	if (job == NULL) {
+		return -ENOMEM;
+	}
+	job->kind = NKVX_JOB_COMPILE;
+	memcpy(job->compile_sha256, sha256, SPDK_KV_EXEC_SHA256_LEN);
+	job->compile_bytes = bytes;		/* caller-owned; must outlive the job */
+	job->compile_bytes_len = bytes_len;
+	job->compiled_fn = done_fn;
 	job->done_arg = done_arg;
 	job->origin = origin;
 	job->submit_tid = pthread_self();

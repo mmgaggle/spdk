@@ -153,6 +153,17 @@ struct kvdev_rados_io {
 	 * in a DIFFERENT pool/namespace (nkvx_mod_ioctx), distinct from the data oid.
 	 */
 	struct kvdev_rados_io_channel	*ch;		/* owning channel (for async continue) */
+	/*
+	 * spdk-5wi: while an io is handed to the off-reactor compile worker it is OFF
+	 * the channel inflight list, so destroy_channel_cb's inflight-drain cannot see
+	 * it. To stop a runtime kvdev delete from freeing the channel ctx_buf (and its
+	 * rdev/ioctx) out from under the compile completion — which re-arms channel I/O
+	 * in start_data_phase — the dispatch takes a REAL spdk_io_channel reference here
+	 * and holds it until the completion (success OR failure) releases it. The held
+	 * ref defers the channel destroy past the in-flight compile, exactly the
+	 * guarantee module_fini already gets by joining the worker first.
+	 */
+	struct spdk_io_channel		*nkvx_compile_ch;
 	struct kvdev_rados_nkvx_module	nkvx_mod;
 	bool				nkvx_has_mod;	/* a verified binding is present */
 	bool				nkvx_in_module_fetch;	/* this aio IS the module read */
@@ -660,17 +671,24 @@ done_free:
  * status and free — the module is NEVER run. librados read state (comp/read_op)
  * is already released by the caller; the module ioctx is destroyed here.
  *
- * NOTE: module_insert does CPU work (compile) on the reactor here. This happens at
- * most ONCE per unique module (a sha256-cache miss); every subsequent Exec of the
- * same hash short-circuits the whole fetch+compile at the reactor-side cache probe
- * in kvdev_rados_nkvx_exec. (Moving the one-time compile fully off-reactor is a
- * possible later refinement; flagged in the deliverable.)
+ * THE COMPILE IS OFF-REACTOR (spdk-5wi): the verified-hash GATE
+ * (kvdev_rados_nkvx_wasm_module_verify) runs here ON THE REACTOR so a wrong/
+ * tampered module is rejected synchronously and never handed to a worker; the
+ * one-time Cranelift compile of a sha256-cache miss is then handed to the executor
+ * worker (kvdev_rados_nkvx_dispatch_compile) so it never head-of-line-blocks the
+ * poller. The fetched bytes (io->nkvx_mod_buf) are kept alive across the dispatch
+ * and freed by the compile completion (kvdev_rados_nkvx_module_compiled); io is
+ * owned by the worker job until then, so the bytes outlive the compile.
  */
+static void
+kvdev_rados_nkvx_module_compiled(void *done_arg, int kvstatus);
+
 static void
 kvdev_rados_nkvx_module_fetched(struct kvdev_rados_io *io, int ret)
 {
 	int status;
-	int insert;
+	int gate;
+	int rc;
 
 	/* Done with the module ioctx regardless of outcome. */
 	if (io->nkvx_mod_ioctx != NULL) {
@@ -696,20 +714,118 @@ kvdev_rados_nkvx_module_fetched(struct kvdev_rados_io *io, int ret)
 	}
 
 	/*
-	 * THE GATE (ADR-0010): verify + compile + cache by hash. A hash MISMATCH
-	 * returns INVALID and the bytes are never compiled or run. We surface that
-	 * distinctly so a tampered/wrong module is observably rejected.
+	 * THE GATE (ADR-0010), ON THE REACTOR: verify the fetched bytes against the
+	 * bound hash. A MISMATCH returns INVALID and the bytes are never compiled or
+	 * run — surfaced distinctly so a tampered/wrong module is observably rejected.
+	 * Only blessed bytes are handed to the off-reactor compiler below.
 	 */
-	insert = kvdev_rados_nkvx_wasm_module_insert(io->nkvx_mod.sha256, io->nkvx_mod_buf,
-						     (size_t)io->nkvx_mod_stat_size);
-	if (insert != SPDK_KVDEV_IO_STATUS_SUCCESS) {
-		SPDK_ERRLOG("nkvx: module '%s' rejected before run (status %d: %s)\n",
-			    io->nkvx_mod_key, insert,
-			    insert == SPDK_KVDEV_IO_STATUS_INVALID ? "HASH MISMATCH" :
-			    insert == SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED ? "runtime unavailable" :
-			    "compile/cache failure");
-		io->cb_fn(io->cb_arg, insert, 0);
+	gate = kvdev_rados_nkvx_wasm_module_verify(io->nkvx_mod.sha256, io->nkvx_mod_buf,
+						  (size_t)io->nkvx_mod_stat_size);
+	if (gate != SPDK_KVDEV_IO_STATUS_SUCCESS) {
+		SPDK_ERRLOG("nkvx: module '%s' rejected before compile (status %d: %s)\n",
+			    io->nkvx_mod_key, gate,
+			    gate == SPDK_KVDEV_IO_STATUS_INVALID ? "HASH MISMATCH" :
+			    gate == SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED ? "runtime unavailable" :
+			    "verify failure");
+		io->cb_fn(io->cb_arg, gate, 0);
 		goto fail_free;
+	}
+
+	/*
+	 * Hand the one-time compile OFF THE REACTOR (spdk-5wi). io->nkvx_mod_buf stays
+	 * alive across the dispatch (the worker only reads it); the compile completion
+	 * frees it. On a queue failure complete + free inline (done_fn will NOT fire).
+	 *
+	 * TEARDOWN RACE FIX (spdk-5wi): take a REAL channel reference for the duration
+	 * of the off-reactor compile. While the worker owns io it is off the channel
+	 * inflight list, so a concurrent runtime kvdev_rados_delete (which, unlike
+	 * module_fini, does NOT stop the worker) would otherwise run
+	 * destroy_channel_cb, free the channel ctx_buf, rdev and ioctx, and leave
+	 * module_compiled -> start_data_phase dereferencing freed io->ch/ch->rdev and
+	 * re-arming I/O on a destroyed channel. Holding spdk_io_channel here defers the
+	 * channel destroy until module_compiled releases the ref, so the channel and
+	 * its ioctx are guaranteed alive when the compile completes. Taken on the
+	 * origin SPDK thread; released on the same thread in the completion.
+	 */
+	io->nkvx_compile_ch = spdk_get_io_channel(io->ch->rdev);
+	if (io->nkvx_compile_ch == NULL) {
+		SPDK_ERRLOG("nkvx: cannot ref channel for compile of '%s'\n", io->nkvx_mod_key);
+		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		goto fail_free;
+	}
+	rc = kvdev_rados_nkvx_dispatch_compile(io->nkvx_mod.sha256, io->nkvx_mod_buf,
+					       (size_t)io->nkvx_mod_stat_size,
+					       kvdev_rados_nkvx_module_compiled, io);
+	if (rc != 0) {
+		SPDK_ERRLOG("nkvx: cannot dispatch compile of '%s': %s\n",
+			    io->nkvx_mod_key, spdk_strerror(-rc));
+		spdk_put_io_channel(io->nkvx_compile_ch);
+		io->nkvx_compile_ch = NULL;
+		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		goto fail_free;
+	}
+	/* The worker now owns io until kvdev_rados_nkvx_module_compiled fires. */
+	return;
+
+fail_free:
+	free(io->nkvx_mod_buf);
+	free(io->nkvx_obj);
+	free(io);
+}
+
+/*
+ * Off-reactor compile completed (spdk-5wi). Runs back ON THE ORIGINATING SPDK
+ * thread via spdk_thread_send_msg, so it is safe to touch io state, free the
+ * fetched bytes, and continue the Exec. The compiled artifact is now cached by
+ * hash; on a compile failure the module is NEVER run.
+ *
+ * Teardown race (channel/modcache vs. an in-flight compile) — TWO distinct paths,
+ * both covered:
+ *
+ *   1. Global shutdown (module_fini): kvdev_rados_nkvx_stop() JOINS the executor
+ *      worker BEFORE any kvdev is deleted, so every dispatched compile has already
+ *      run and queued its completion message to this thread before any channel is
+ *      destroyed.
+ *
+ *   2. Runtime delete (RPC kvdev_rados_delete while the worker is RUNNING): this
+ *      goes straight to spdk_kvdev_unregister -> destruct -> io_device unregister ->
+ *      destroy_channel_cb WITHOUT stopping the worker, so a compile can still be
+ *      in flight. destroy_channel_cb only drains the channel inflight list, and this
+ *      io is OFF that list while the worker owns it (kvdev_rados_io_finish removed it
+ *      before module_fetched ran) — so the drain would NOT wait for it. To stop the
+ *      channel ctx_buf / rdev / ioctx from being freed under this completion (which
+ *      re-arms channel I/O in start_data_phase), module_fetched took a REAL
+ *      spdk_io_channel reference (io->nkvx_compile_ch) before dispatching; it is
+ *      released here on EVERY exit. The held ref defers the io_channel destroy past
+ *      the in-flight compile, giving the runtime-delete path the same guarantee the
+ *      join gives the shutdown path.
+ *
+ * Once the data phase re-inserts a fresh aio onto inflight, the channel-drain waits
+ * on it as before — identical to the inline path this replaced.
+ */
+static void
+kvdev_rados_nkvx_module_compiled(void *done_arg, int kvstatus)
+{
+	struct kvdev_rados_io *io = done_arg;
+	struct spdk_io_channel *compile_ch = io->nkvx_compile_ch;
+
+	/* Release the compile's channel reference on EVERY path below. Defer the
+	 * actual spdk_put_io_channel until after start_data_phase has re-armed I/O
+	 * (and re-inserted onto inflight) so the channel cannot be torn down in the
+	 * window between releasing the ref and start_data_phase touching io->ch. */
+	io->nkvx_compile_ch = NULL;
+
+	if (kvstatus != SPDK_KVDEV_IO_STATUS_SUCCESS) {
+		SPDK_ERRLOG("nkvx: module '%s' compile failed (status %d: %s) -> not run\n",
+			    io->nkvx_mod_key, kvstatus,
+			    kvstatus == SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED ? "runtime unavailable" :
+			    "compile/cache failure");
+		io->cb_fn(io->cb_arg, kvstatus, 0);
+		free(io->nkvx_mod_buf);
+		free(io->nkvx_obj);
+		free(io);
+		spdk_put_io_channel(compile_ch);
+		return;
 	}
 
 	/*
@@ -727,15 +843,19 @@ kvdev_rados_nkvx_module_fetched(struct kvdev_rados_io *io, int ret)
 		SPDK_ERRLOG("nkvx: cannot create completion for data phase\n");
 		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
 		free(io);
+		spdk_put_io_channel(compile_ch);
 		return;
 	}
+	/*
+	 * start_data_phase either re-inserts io onto the channel inflight list (so the
+	 * channel-drain now waits on it) or completes+frees io synchronously. EITHER
+	 * way io->ch has been fully consumed before we release the compile's channel
+	 * ref, so the ref is held across the last dereference of the channel. Release
+	 * it AFTER start_data_phase returns. (compile_ch is a local copy taken before
+	 * io could be freed.)
+	 */
 	kvdev_rados_nkvx_start_data_phase(io);
-	return;
-
-fail_free:
-	free(io->nkvx_mod_buf);
-	free(io->nkvx_obj);
-	free(io);
+	spdk_put_io_channel(compile_ch);
 }
 
 /* Finish one harvested IO: derive status/value_len, fire the cb, free state. */

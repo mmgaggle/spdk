@@ -2146,6 +2146,297 @@ test_nkvx_epoch_ticker_teardown(void)
 #endif
 }
 
+/* ==========================================================================
+ * spdk-5wi: the off-reactor module COMPILE. These drive the NEW path the P2
+ * change introduced — the reactor-side hash GATE (kvdev_rados_nkvx_wasm_module_verify),
+ * the off-reactor compile dispatch (kvdev_rados_nkvx_dispatch_compile ->
+ * NKVX_JOB_COMPILE -> kvdev_rados_nkvx_wasm_module_insert on the worker), and the
+ * origin-thread hand-back. Without these, the green UT proved nothing about the
+ * new concurrency/ownership path (adversarial review finding #2).
+ *
+ * NOTE ON THE CHANNEL-TEARDOWN UAF (finding #1): that race lives in kvdev_rados.c
+ * (the librados channel/io path), which is NOT compiled into this UT (it pulls in
+ * librados). The fix there is a held spdk_io_channel reference taken at
+ * dispatch_compile time and released in module_compiled, so an in-flight compile
+ * cannot outlive its channel. The directly unit-testable surface of the change —
+ * exercised below — is the executor: the gate, the off-reactor compile, and the
+ * worker-join-before-teardown ordering invariant that the kvdev_rados.c teardown
+ * reasoning depends on.
+ * ========================================================================== */
+
+/* Compile-completion sink for kvdev_rados_nkvx_dispatch_compile. */
+struct compile_result {
+	bool		completed;
+	int		kvstatus;
+	pthread_t	complete_tid;	/* OS thread the completion fired on */
+};
+
+static void
+compile_done(void *arg, int kvstatus)
+{
+	struct compile_result *cr = arg;
+
+	cr->kvstatus = kvstatus;
+	cr->complete_tid = pthread_self();
+	cr->completed = true;
+}
+
+/*
+ * spdk-5wi (gate): kvdev_rados_nkvx_wasm_module_verify is the reactor-callable,
+ * COMPILE-FREE hash gate. A correct hash is blessed (SUCCESS) without caching
+ * anything; a flipped hash/byte is rejected INVALID; with the runtime unavailable
+ * (incl. --without-wasm) it is NOT_SUPPORTED. The gate must NOT populate the module
+ * cache — only the off-reactor insert does.
+ */
+static void
+test_nkvx_5wi_verify_gate_is_compile_free(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	if (!nkvx_wasm_runtime_available()) {
+		/* Runtime genuinely unavailable: the gate fails soft, never crashes. */
+		uint8_t any[SPDK_KV_EXEC_SHA256_LEN] = {0};
+		CU_ASSERT(kvdev_rados_nkvx_wasm_module_verify(any, "x", 1) ==
+			  SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED);
+		printf("\n    wasm runtime unavailable -> verify gate NOT_SUPPORTED (fail-soft, ok)\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+
+	size_t wlen = 0;
+	uint8_t *wasm = tb3_read_wasm("checksum", &wlen);
+	uint8_t good[SPDK_KV_EXEC_SHA256_LEN], bad[SPDK_KV_EXEC_SHA256_LEN];
+
+	if (wasm == NULL) {
+		return;
+	}
+	tb3_sha256(wasm, wlen, good);
+
+	/* Correct hash -> blessed, but the gate does NOT compile/cache. */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_verify(good, wasm, wlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(!kvdev_rados_nkvx_wasm_module_cached(good));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cache_count() == 0);
+
+	/* Flipped hash and flipped bytes are both rejected INVALID, never blessed. */
+	memcpy(bad, good, sizeof(bad));
+	bad[0] ^= 0x01;
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_verify(bad, wasm, wlen) ==
+		  SPDK_KVDEV_IO_STATUS_INVALID);
+	wasm[wlen / 2] ^= 0xFF;
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_verify(good, wasm, wlen) ==
+		  SPDK_KVDEV_IO_STATUS_INVALID);
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cache_count() == 0);	/* still nothing cached */
+	printf("\n    5wi verify gate: correct hash -> SUCCESS (no cache); flipped -> INVALID; "
+	       "cache stays empty (compile-free)\n");
+
+	free(wasm);
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+#else
+	uint8_t any[SPDK_KV_EXEC_SHA256_LEN] = {0};
+	/* --without-wasm: the gate stub must report NOT_SUPPORTED, never crash. */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_verify(any, "x", 1) ==
+		  SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED);
+	printf("\n    built --without-wasm: 5wi verify gate is NOT_SUPPORTED stub (ok)\n");
+#endif
+}
+
+/*
+ * spdk-5wi (off-reactor compile): kvdev_rados_nkvx_dispatch_compile hands a VERIFIED
+ * module to the executor worker (NKVX_JOB_COMPILE), which compiles + caches it, and
+ * the completion fires back ON the originating SPDK thread — exactly like the run
+ * dispatch. Proves: (a) the compile actually runs and caches the artifact, (b) the
+ * completion lands on the SPDK thread (not the worker), and (c) a second dispatch of
+ * the same hash is idempotent (the insert is self-synchronized under the modcache
+ * mutex). Bad-args and no-thread rejections are checked too.
+ */
+static void
+test_nkvx_5wi_dispatch_compile_offreactor(void)
+{
+	uint8_t junk[SPDK_KV_EXEC_SHA256_LEN] = {0};
+	struct compile_result cr;
+	pthread_t main_tid = pthread_self();
+	int rc;
+
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+
+	/* Argument validation (no thread / NULLs) — same contract as the run dispatch. */
+	set_thread(INVALID_THREAD);
+	rc = kvdev_rados_nkvx_dispatch_compile(junk, "x", 1, compile_done, &cr);
+	CU_ASSERT(rc == -EINVAL);	/* off any SPDK thread: no origin to complete on */
+	set_thread(0);
+	rc = kvdev_rados_nkvx_dispatch_compile(junk, NULL, 1, compile_done, &cr);
+	CU_ASSERT(rc == -EINVAL);
+	rc = kvdev_rados_nkvx_dispatch_compile(junk, "x", 0, compile_done, &cr);
+	CU_ASSERT(rc == -EINVAL);
+	set_thread(INVALID_THREAD);
+
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> 5wi dispatch_compile run skipped "
+		       "(arg-validation still covered)\n");
+		kvdev_rados_nkvx_stop();
+		return;
+	}
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+
+	size_t wlen = 0;
+	uint8_t *wasm = tb3_read_wasm("checksum", &wlen);
+	uint8_t good[SPDK_KV_EXEC_SHA256_LEN];
+
+	if (wasm == NULL) {
+		kvdev_rados_nkvx_stop();
+		return;
+	}
+	tb3_sha256(wasm, wlen, good);
+
+	/* The reactor-side gate blesses the bytes, THEN we hand the compile off. */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_verify(good, wasm, wlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(!kvdev_rados_nkvx_wasm_module_cached(good));	/* gate cached nothing */
+
+	memset(&cr, 0, sizeof(cr));
+	set_thread(0);
+	rc = kvdev_rados_nkvx_dispatch_compile(good, wasm, wlen, compile_done, &cr);
+	CU_ASSERT(rc == 0);
+	set_thread(INVALID_THREAD);
+
+	/* Pump the SPDK thread until the worker hands the compile completion back. */
+	for (int i = 0; i < 100000 && !cr.completed; i++) {
+		poll_threads();
+		if (!cr.completed) {
+			usleep(100);
+		}
+	}
+	CU_ASSERT(cr.completed);
+	CU_ASSERT(cr.kvstatus == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	/* The artifact is now cached -> the compile really ran on the worker. */
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cached(good));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cache_count() == 1);
+	/* OFF-REACTOR proof: completion fired on the SPDK thread, compile body on the
+	 * worker (a different OS thread). */
+	CU_ASSERT(pthread_equal(cr.complete_tid, main_tid));
+	CU_ASSERT(!pthread_equal(g_nkvx.tid, main_tid));
+	printf("\n    5wi off-reactor compile: dispatched, worker compiled+cached, completion on "
+	       "SPDK thread (worker_tid=0x%lx != spdk_tid=0x%lx)\n",
+	       (unsigned long)g_nkvx.tid, (unsigned long)main_tid);
+
+	/* Idempotent: a SECOND compile of the same hash is safe (modcache mutex), still
+	 * exactly one cache entry. */
+	memset(&cr, 0, sizeof(cr));
+	set_thread(0);
+	rc = kvdev_rados_nkvx_dispatch_compile(good, wasm, wlen, compile_done, &cr);
+	CU_ASSERT(rc == 0);
+	set_thread(INVALID_THREAD);
+	for (int i = 0; i < 100000 && !cr.completed; i++) {
+		poll_threads();
+		if (!cr.completed) {
+			usleep(100);
+		}
+	}
+	CU_ASSERT(cr.completed);
+	CU_ASSERT(cr.kvstatus == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(kvdev_rados_nkvx_wasm_module_cache_count() == 1);
+
+	free(wasm);
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+#else
+	printf("\n    built --without-wasm: 5wi compile-run is a no-op (arg-validation covered)\n");
+#endif
+	kvdev_rados_nkvx_stop();
+}
+
+/*
+ * spdk-5wi (module_fini ordering invariant). The kvdev_rados.c teardown reasoning
+ * for the GLOBAL-shutdown path depends on kvdev_rados_nkvx_stop() JOINING the worker
+ * before any kvdev/channel is destroyed: every dispatched compile has run AND queued
+ * its completion message to the origin thread before teardown proceeds. This drives
+ * that invariant directly: dispatch compiles, then stop WITHOUT first pumping the
+ * completions, and assert that after stop() returns the worker is joined (drained)
+ * and the queued completions are still deliverable to the SPDK thread (no compile is
+ * lost, none runs after the join). With the runtime unavailable the same ordering is
+ * exercised with NOT_SUPPORTED-returning inserts.
+ */
+static void
+test_nkvx_5wi_stop_drains_inflight_compiles(void)
+{
+	struct compile_result cr[4];
+	uint8_t hashes[4][SPDK_KV_EXEC_SHA256_LEN];
+	size_t wlen = 0;
+	uint8_t *wasm = NULL;
+	int i;
+
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	if (nkvx_wasm_runtime_available()) {
+		kvdev_rados_nkvx_wasm_module_cache_reset();
+		wasm = tb3_read_wasm("checksum", &wlen);
+	}
+#endif
+
+	/* Dispatch several compiles. Use the real verified hash when we have the wasm,
+	 * else a junk hash (insert returns NOT_SUPPORTED but the JOB still flows through
+	 * the worker and back — which is what the ordering test cares about). */
+	for (i = 0; i < 4; i++) {
+		memset(&cr[i], 0, sizeof(cr[i]));
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+		if (wasm != NULL) {
+			tb3_sha256(wasm, wlen, hashes[i]);
+		} else
+#endif
+		{
+			memset(hashes[i], (uint8_t)(i + 1), sizeof(hashes[i]));
+		}
+		set_thread(0);
+		CU_ASSERT(kvdev_rados_nkvx_dispatch_compile(hashes[i],
+				wasm != NULL ? (const void *)wasm : (const void *)"x",
+				wasm != NULL ? wlen : 1,
+				compile_done, &cr[i]) == 0);
+		set_thread(INVALID_THREAD);
+	}
+
+	/* STOP without draining first. stop() must JOIN the worker, which only exits
+	 * once its queue is EMPTY (kvdev_rados_nkvx_worker_main loops until stop && empty),
+	 * so every compile has been processed and its completion message enqueued to the
+	 * origin SPDK thread BEFORE stop() returns. This is the exact ordering
+	 * module_fini relies on: no compile can still be running once teardown proceeds. */
+	kvdev_rados_nkvx_stop();
+	CU_ASSERT(!g_nkvx.running);
+
+	/* The completions were queued to the SPDK thread before the join; they are still
+	 * pending and deliver safely now (no compile ran after the join, none was lost). */
+	for (i = 0; i < 100000; i++) {
+		bool all = true;
+		int j;
+
+		poll_threads();
+		for (j = 0; j < 4; j++) {
+			if (!cr[j].completed) {
+				all = false;
+			}
+		}
+		if (all) {
+			break;
+		}
+		usleep(100);
+	}
+	for (i = 0; i < 4; i++) {
+		CU_ASSERT(cr[i].completed);
+		/* Completion fired on the SPDK (main) thread, never the (now-joined) worker. */
+		CU_ASSERT(pthread_equal(cr[i].complete_tid, pthread_self()));
+	}
+	printf("\n    5wi module_fini ordering: stop() joined the worker AFTER draining %d queued "
+	       "compiles; all completions delivered on the SPDK thread post-join\n", 4);
+
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	free(wasm);
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+#endif
+}
+
 static void
 test_nkvx_dispatch_without_thread_fails(void)
 {
@@ -2205,6 +2496,9 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_wwy_warm_cache_bounded);
 	CU_ADD_TEST(suite, test_nkvx_wwy_module_cache_bounded);
 	CU_ADD_TEST(suite, test_nkvx_epoch_ticker_teardown);
+	CU_ADD_TEST(suite, test_nkvx_5wi_verify_gate_is_compile_free);
+	CU_ADD_TEST(suite, test_nkvx_5wi_dispatch_compile_offreactor);
+	CU_ADD_TEST(suite, test_nkvx_5wi_stop_drains_inflight_compiles);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
 
 	/* One SPDK thread stands in for the reactor; the executor worker is a real

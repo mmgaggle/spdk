@@ -114,4 +114,35 @@ int kvdev_rados_nkvx_dispatch(const char *module, const struct kvdev_rados_nkvx_
 			      void *out, uint32_t out_len,
 			      kvdev_rados_nkvx_done_fn done_fn, void *done_arg);
 
+/*
+ * Compile-completion callback for kvdev_rados_nkvx_dispatch_compile. Invoked ON
+ * the originating SPDK thread with the module-insert status (an
+ * SPDK_KVDEV_IO_STATUS_* code: SUCCESS once the compiled artifact is cached,
+ * FAILED/NOT_SUPPORTED on a compile/runtime failure).
+ */
+typedef void (*kvdev_rados_nkvx_compiled_fn)(void *done_arg, int kvstatus);
+
+/*
+ * Dispatch the one-time Cranelift compile of a VERIFIED module OFF the SPDK
+ * reactor (spdk-5wi). The reactor side has ALREADY run the integrity gate
+ * (kvdev_rados_nkvx_wasm_module_verify) so the bytes are blessed; this hands the
+ * compile to the executor worker — which calls kvdev_rados_nkvx_wasm_module_insert
+ * (verify is idempotent there) to compile + cache the artifact by hash — so the
+ * compile never head-of-line-blocks the poller. The result is handed back with
+ * done_fn ON the originating SPDK thread, exactly like the run dispatch.
+ *
+ * \param sha256      bound content hash; copied by value.
+ * \param bytes       the verified .wasm bytes. Caller-owned; MUST remain valid
+ *                    until done_fn fires (the worker only reads them).
+ * \param bytes_len   length of \c bytes.
+ * \param done_fn     completion, invoked ON the originating SPDK thread.
+ * \param done_arg    opaque context for \c done_fn.
+ *
+ * Returns 0 if the job was queued (done_fn will fire later), or negative errno if
+ * it could not be queued (done_fn will NOT fire).
+ */
+int kvdev_rados_nkvx_dispatch_compile(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN],
+				      const void *bytes, size_t bytes_len,
+				      kvdev_rados_nkvx_compiled_fn done_fn, void *done_arg);
+
 #endif /* SPDK_KVDEV_RADOS_NKVX_H */
