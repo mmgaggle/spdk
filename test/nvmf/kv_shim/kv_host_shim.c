@@ -27,6 +27,12 @@ struct kv_host_shim {
 	uint32_t		kvkml;	/* max key length */
 	/* Whether this shim owns the SPDK env (called spdk_env_init). */
 	bool			owns_env;
+	/*
+	 * Set when poll_to_completion() disconnected the qpair after a timeout
+	 * or transport failure. The next op reconnects it via ensure_connected()
+	 * before submitting, or fails fast if the target is still down.
+	 */
+	bool			qpair_failed;
 	/* Per-op completion state. */
 	volatile bool		done;
 	volatile uint8_t	last_sct;
@@ -61,13 +67,90 @@ io_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 	sh->done = true;
 }
 
-/* Poll the qpair until the in-flight command completes. */
-static void
+/*
+ * Per-op completion budget. Bounds how long an in-flight KV command may run
+ * before poll_to_completion() gives up and reports -ETIMEDOUT.
+ *
+ * Rationale: poll_to_completion() previously busy-looped FOREVER. If the NVMe
+ * controller/target died mid-op (e.g. the target was hard-killed during a
+ * Store/Retrieve/Exist/Delete), the call hung forever, stalling the in-process
+ * NIXL plugin data path. This mirrors the bounded-wait pattern in
+ * test/nvmf/kv/kv_host.c (wait_for_completion_timeout). A healthy in-memory or
+ * vfio-user KV op is sub-millisecond; 20s is generous headroom for a slow
+ * round-trip (e.g. a RADOS-backed kvdev) while still bounding a dead/wedged
+ * target to seconds, not forever. A transport-layer qpair failure (-ENXIO from
+ * spdk_nvme_qpair_process_completions, the usual signal of a dead target) is
+ * detected immediately and does NOT wait for the full deadline.
+ */
+#define KV_HOST_SHIM_OP_TIMEOUT_S 20u
+
+/*
+ * Poll the qpair until the in-flight command completes, the qpair fails at the
+ * transport layer, or the timeout expires.
+ *
+ * Returns 0 on completion (sh->done set; the caller reads status_to_rc()).
+ * Returns a negated errno otherwise:
+ *   -ENXIO     the qpair failed at the transport layer (dead/removed target)
+ *   -ETIMEDOUT the command did not complete within KV_HOST_SHIM_OP_TIMEOUT_S
+ *
+ * On any error path the outstanding request is aborted by disconnecting the
+ * qpair (which completes/cancels every in-flight command on it). This prevents
+ * a late completion from later firing into io_complete() and corrupting the
+ * status of the NEXT op, since the shim reuses a single in-flight slot. The
+ * shim is flagged for reconnect so the next op transparently reconnects the
+ * qpair (see ensure_connected()).
+ */
+static int
 poll_to_completion(struct kv_host_shim *sh)
 {
+	uint64_t deadline;
+
+	deadline = spdk_get_ticks() +
+		   (uint64_t)KV_HOST_SHIM_OP_TIMEOUT_S * spdk_get_ticks_hz();
+
 	while (!sh->done) {
-		spdk_nvme_qpair_process_completions(sh->qpair, 0);
+		int32_t n = spdk_nvme_qpair_process_completions(sh->qpair, 0);
+
+		if (n < 0) {
+			/* Transport-level failure (e.g. -ENXIO: qpair failed). The
+			 * target is gone; abort the op and report the error. */
+			spdk_nvme_ctrlr_disconnect_io_qpair(sh->qpair);
+			sh->qpair_failed = true;
+			return n;
+		}
+		if (!sh->done && spdk_get_ticks() >= deadline) {
+			/* Bounded backstop: the op never completed (target hung
+			 * but not yet transport-failed). Abort the outstanding
+			 * request by disconnecting the qpair so a late completion
+			 * cannot corrupt the next op. */
+			spdk_nvme_ctrlr_disconnect_io_qpair(sh->qpair);
+			sh->qpair_failed = true;
+			return -ETIMEDOUT;
+		}
 	}
+	return 0;
+}
+
+/*
+ * Reconnect the qpair if a prior op timed out / saw a transport failure and
+ * disconnected it. Called before submitting each op. Returns 0 if the qpair is
+ * usable, or a negated errno if it could not be reconnected (the target is
+ * still down) so the op fails fast rather than submitting onto a dead qpair.
+ */
+static int
+ensure_connected(struct kv_host_shim *sh)
+{
+	int rc;
+
+	if (!sh->qpair_failed) {
+		return 0;
+	}
+	rc = spdk_nvme_ctrlr_reconnect_io_qpair(sh->qpair);
+	if (rc != 0) {
+		return rc < 0 ? rc : -rc;
+	}
+	sh->qpair_failed = false;
+	return 0;
 }
 
 /*
@@ -249,13 +332,20 @@ kv_host_shim_store(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 	if (sh == NULL) {
 		return -EINVAL;
 	}
+	rc = ensure_connected(sh);
+	if (rc != 0) {
+		return rc;
+	}
 	sh->done = false;
 	rc = spdk_nvme_kv_store(sh->ns, sh->qpair, key, key_len, value, value_len,
 				io_complete, sh, 0);
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;
 	}
-	poll_to_completion(sh);
+	rc = poll_to_completion(sh);
+	if (rc != 0) {
+		return rc;
+	}
 	return status_to_rc(sh);
 }
 
@@ -268,13 +358,20 @@ kv_host_shim_retrieve(struct kv_host_shim *sh, const void *key, uint8_t key_len,
 	if (sh == NULL) {
 		return -EINVAL;
 	}
+	rc = ensure_connected(sh);
+	if (rc != 0) {
+		return rc;
+	}
 	sh->done = false;
 	rc = spdk_nvme_kv_retrieve(sh->ns, sh->qpair, key, key_len, value, buf_len,
 				   io_complete, sh, 0);
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;
 	}
-	poll_to_completion(sh);
+	rc = poll_to_completion(sh);
+	if (rc != 0) {
+		return rc;
+	}
 	rc = status_to_rc(sh);
 	/* On SUCCESS, cdw0 carries the device's TRUE value length. */
 	if (rc == 0 && value_len_out != NULL) {
@@ -291,12 +388,19 @@ kv_host_shim_exist(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 	if (sh == NULL) {
 		return -EINVAL;
 	}
+	rc = ensure_connected(sh);
+	if (rc != 0) {
+		return rc;
+	}
 	sh->done = false;
 	rc = spdk_nvme_kv_exist(sh->ns, sh->qpair, key, key_len, io_complete, sh);
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;
 	}
-	poll_to_completion(sh);
+	rc = poll_to_completion(sh);
+	if (rc != 0) {
+		return rc;
+	}
 	return status_to_rc(sh);
 }
 
@@ -308,11 +412,18 @@ kv_host_shim_delete(struct kv_host_shim *sh, const void *key, uint8_t key_len)
 	if (sh == NULL) {
 		return -EINVAL;
 	}
+	rc = ensure_connected(sh);
+	if (rc != 0) {
+		return rc;
+	}
 	sh->done = false;
 	rc = spdk_nvme_kv_delete(sh->ns, sh->qpair, key, key_len, io_complete, sh);
 	if (rc != 0) {
 		return rc < 0 ? rc : -rc;
 	}
-	poll_to_completion(sh);
+	rc = poll_to_completion(sh);
+	if (rc != 0) {
+		return rc;
+	}
 	return status_to_rc(sh);
 }

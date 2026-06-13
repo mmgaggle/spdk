@@ -29,6 +29,12 @@
  *      negated errno (-EIO).
  *   -  a NEGATED errno for submit-/transport-level errors (e.g. the negated
  *      return of the underlying spdk_nvme_kv_* submit call, or -EIO).
+ *      Specifically, an op is BOUNDED: if it does not complete within the
+ *      shim's per-op timeout it returns -ETIMEDOUT, and a qpair that fails at
+ *      the transport layer (dead/removed target) returns -ENXIO -- the call
+ *      never hangs forever. On either path the outstanding request is aborted
+ *      and the qpair is transparently reconnected before the next op (or that
+ *      next op fails fast with the reconnect error if the target stays down).
  */
 
 #ifndef KV_HOST_SHIM_H
