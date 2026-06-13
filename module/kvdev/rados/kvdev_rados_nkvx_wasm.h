@@ -54,4 +54,128 @@ int kvdev_rados_nkvx_wasm_run(const char *name,
 			      const void *object, size_t object_len,
 			      void *out, uint32_t out_len, uint32_t *result_len);
 
+/*
+ * TB4 (spdk-ii0 / ADR-0013): IDENTITY(oid)-addressed object cache with
+ * invalidation-on-write + zero-copy DMA into wasm linear memory, with a
+ * warm-instance cache keyed by (module, object).
+ *
+ * NOTE on naming: this is an IDENTITY cache keyed by the object id (oid =
+ * hex(key)), NOT a content-addressed (content-hashed) cache. There is no content
+ * verification; coherence with a mutated value is maintained by INVALIDATING the
+ * entry on every value-mutating op (Store/Delete) via
+ * kvdev_rados_nkvx_wasm_cache_invalidate (spdk-ii0 D2). Historical comments and
+ * counters may still say "content" for the cache-hit counter; read it as
+ * "identity-cache hit".
+ *
+ * The executor owns the object store; it never calls librados. Cold fill is
+ * inverted into a CALLBACK the executor invokes ONLY on a cache miss:
+ *
+ *   - On a miss the executor allocates the cache slot, calls \c fill to populate
+ *     it from RADOS (cold fill), and keeps the buffer content-addressed by
+ *     \c obj_key. The fill callback is the ONLY time librados is touched.
+ *   - On a HIT (same \c obj_key seen before) the cached buffer is reused and
+ *     \c fill is NEVER called — no librados refetch. This is the load-bearing
+ *     property TB4 proves (a fake fill that counts invocations asserts 0 on the
+ *     2nd Exec).
+ *   - The cached buffer backs the module's wasm linear memory ZERO-COPY via the
+ *     wasmtime custom MemoryCreator (on-demand strategy, ADR-0013) — no gather /
+ *     bounce copy-in. wasmtime_memory_data() aliases the cache buffer.
+ *   - The instantiated wasm instance (engine/store/module/instance) is cached
+ *     keyed by (module, obj_key) and REUSED on a subsequent Exec of the same
+ *     pair (warm instance).
+ *
+ * \c fill is called with the executor-allocated, page-rounded cache buffer and
+ * its capacity; it must write up to \c cap bytes and set \c *out_len to the true
+ * object length (<= cap). It returns 0 on success or negative errno on a fill
+ * failure (the slot is then discarded; nothing is cached).
+ */
+typedef int (*kvdev_rados_nkvx_fill_fn)(void *buf, size_t cap, size_t *out_len,
+					void *fill_arg);
+
+/*
+ * Run module \c name against the object identified by \c obj_key, cold-filling it
+ * via \c fill on a cache miss and serving it locally (zero-copy) on a hit.
+ *
+ * \param name        wasm module name (after "nkvx:wasm:"), e.g. "checksum".
+ * \param obj_key     stable content/identity key for the object (e.g. the oid).
+ *                    Keys the content-addressed object cache AND, with \c name,
+ *                    the warm-instance cache.
+ * \param object_len  the object's true length (so the cache slot is sized before
+ *                    fill; the fill callback confirms the actual length).
+ * \param fill        cold-fill callback, invoked ONLY on a content-cache miss.
+ * \param fill_arg    opaque context for \c fill.
+ * \param out         host output buffer for the module result.
+ * \param out_len     capacity of \c out.
+ * \param result_len  set to the TRUE result length the module produced.
+ *
+ * Returns an SPDK_KVDEV_IO_STATUS_* code (same contract as the plain run above,
+ * plus FAILED if \c fill fails on a miss).
+ */
+int kvdev_rados_nkvx_wasm_run_cached(const char *name,
+				     const char *obj_key, size_t object_len,
+				     kvdev_rados_nkvx_fill_fn fill, void *fill_arg,
+				     void *out, uint32_t out_len, uint32_t *result_len);
+
+/* Drop the entire object + warm-instance cache (test teardown / shutdown). */
+void kvdev_rados_nkvx_wasm_cache_reset(void);
+
+/*
+ * Probe whether \c obj_key is already present (filled) in the identity-addressed
+ * object cache. Stateless boolean probe; prefer kvdev_rados_nkvx_wasm_cache_pin
+ * on the datapath where the bytes will be read later (it is race-safe against a
+ * concurrent invalidation). Returns false in the stub build (no cache).
+ */
+bool kvdev_rados_nkvx_wasm_cache_has(const char *obj_key);
+
+/*
+ * Probe-and-PIN (spdk-ii0 D2): if \c obj_key is present and filled, take a
+ * reference on its buffer and return an opaque handle (non-NULL); else return
+ * NULL. The pin makes the probe -> later-read sequence race-safe: a Store/Delete
+ * invalidation between the pin and the eventual run cannot free the buffer, and
+ * the in-flight Exec serves exactly the pinned version while subsequent Execs
+ * miss the invalidated entry and cold-fill fresh (no stale read). The caller MUST
+ * release the handle with kvdev_rados_nkvx_wasm_cache_unpin. Returns NULL in the
+ * stub build.
+ */
+void *kvdev_rados_nkvx_wasm_cache_pin(const char *obj_key);
+
+/* Release a handle from kvdev_rados_nkvx_wasm_cache_pin (NULL-safe). */
+void kvdev_rados_nkvx_wasm_cache_unpin(void *handle);
+
+/*
+ * Run module \c name against a PINNED object (the handle from cache_pin), serving
+ * exactly that version with NO librados refetch and NO cold fill. Same status
+ * contract as run_cached. The caller still owns the pin and must unpin after.
+ */
+int kvdev_rados_nkvx_wasm_run_pinned(const char *name, void *pin,
+				     void *out, uint32_t out_len, uint32_t *result_len);
+
+/*
+ * Invalidate every cache entry (object + warm instances) for \c obj_key. MUST be
+ * called from every value-mutating datapath op (Store, Delete, ...) so a later
+ * Exec cannot serve stale cached bytes (spdk-ii0 D2). No-op in the stub build and
+ * for an unknown key.
+ */
+void kvdev_rados_nkvx_wasm_cache_invalidate(const char *obj_key);
+
+/*
+ * Test-only introspection counters (TB4 acceptance proof). Defined unconditionally
+ * so the unit test links them in both --with-wasm and --without-wasm builds.
+ *   - cold_fills:        number of times a fill callback actually ran (cold fill).
+ *   - content_hits:      number of content-cache hits (served locally, no fill).
+ *   - warm_hits:         number of warm-instance reuses.
+ *   - last_mem_base:     base pointer of the last run's wasm linear memory.
+ *   - last_cache_base:   base pointer of the cache buffer backing it.
+ *                        Equal iff the linear memory was backed ZERO-COPY.
+ */
+struct kvdev_rados_nkvx_wasm_stats {
+	uint64_t	cold_fills;
+	uint64_t	content_hits;
+	uint64_t	warm_hits;
+	const void	*last_mem_base;
+	const void	*last_cache_base;
+};
+
+void kvdev_rados_nkvx_wasm_get_stats(struct kvdev_rados_nkvx_wasm_stats *out);
+
 #endif /* SPDK_KVDEV_RADOS_NKVX_WASM_H */

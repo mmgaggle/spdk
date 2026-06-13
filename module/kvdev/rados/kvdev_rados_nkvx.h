@@ -75,8 +75,18 @@ void kvdev_rados_nkvx_stop(void);
  * Dispatch a built-in module run OFF the SPDK reactor.
  *
  * \param module      built-in module name (after the "nkvx:" prefix).
+ * \param obj_key     stable identity key for the object (the oid). Keys the
+ *                    executor's identity-addressed object cache and, with the
+ *                    module, the warm-instance cache (TB4 / spdk-ii0). May be NULL
+ *                    or "" to bypass the cache (plain-copy run).
+ * \param obj_pin     OPTIONAL pinned cache handle from
+ *                    kvdev_rados_nkvx_wasm_cache_pin (probe-hit on the datapath,
+ *                    spdk-ii0 D2). When non-NULL the worker serves exactly this
+ *                    pinned object version (no librados refetch, race-safe against
+ *                    a concurrent Store/Delete invalidation) and releases the pin
+ *                    when the run finishes. NULL on the cold-read path.
  * \param object      object bytes cold-filled from RADOS (owned by caller; must
- *                    remain valid until done_fn fires).
+ *                    remain valid until done_fn fires). Ignored when obj_pin set.
  * \param object_len  length of \c object.
  * \param out         host output buffer to receive the module result.
  * \param out_len     capacity of \c out.
@@ -89,7 +99,7 @@ void kvdev_rados_nkvx_stop(void);
  */
 typedef void (*kvdev_rados_nkvx_done_fn)(void *done_arg, int kvstatus, uint32_t out_len);
 
-int kvdev_rados_nkvx_dispatch(const char *module,
+int kvdev_rados_nkvx_dispatch(const char *module, const char *obj_key, void *obj_pin,
 			      const void *object, size_t object_len,
 			      void *out, uint32_t out_len,
 			      kvdev_rados_nkvx_done_fn done_fn, void *done_arg);

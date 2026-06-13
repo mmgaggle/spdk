@@ -158,6 +158,26 @@ if [[ $rc -eq 0 ]]; then
 	fi
 fi
 
+# Criterion 4 (B2, spdk-ii0): once an object is in the executor cache, a repeat
+# Exec of that object does NO librados read. All Execs here hit the SAME object
+# (key kvkey01 -> one oid); the C built-ins (op 10/11) bypass the executor cache
+# and each cold-read, and the first wasm Exec (op 12) cold-fills the cache, so the
+# later wasm Execs (op 13/14/15) on that object MUST be served from cache with NO
+# librados read ("served from executor cache (no librados read)"). Assert at least
+# one such cache-hit Exec occurred (the B2 fix path fired and skipped the read).
+if [[ $rc -eq 0 ]]; then
+	cold_reads=$(grep -c "cache miss -> librados cold-fill read" "$tgt_log" || true)
+	cache_hits=$(grep -c "served from executor cache (no librados read)" "$tgt_log" || true)
+	if [[ "${cache_hits:-0}" -ge 1 ]]; then
+		echo "B2 no-refetch: $cache_hits cache-hit Exec(s) skipped librados ($cold_reads cold-fill read(s))"
+		grep -E "cold-fill read|no librados read" "$tgt_log" | head -8 || true
+	else
+		echo "kv_nkvx_exec: FAIL (B2: no cache-hit Exec skipped librados; cold_reads=$cold_reads cache_hits=$cache_hits)"
+		grep -E "cold-fill read|no librados read" "$tgt_log" | head -8 || true
+		rc=1
+	fi
+fi
+
 # Tear down.
 $rpc_py nvmf_subsystem_remove_listener "$nqn" -t VFIOUSER -a "$muser_dir" -s 0
 $rpc_py nvmf_delete_subsystem "$nqn"

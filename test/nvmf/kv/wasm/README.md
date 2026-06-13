@@ -32,6 +32,85 @@ clang --target=wasm32 -nostdlib -O2 \
   -o bytecount.wasm bytecount.c
 ```
 
+## checksum.wasm
+
+Folds the object bytes into a little-endian `u64` (position-weighted byte sum,
+mixed with the length). Source: `checksum.c`. Unlike `bytecount` (which only
+echoes the `obj_len` argument), `checksum` READS the object bytes out of linear
+memory, so its result is wrong unless the bytes are actually present there — this
+makes it the TB4 (spdk-ii0) zero-copy proof: a correct answer requires the
+custom-`MemoryCreator` backing to alias the cached object buffer.
+
+Rebuild (single-page initial memory so small objects fit one page of the
+content-addressed backing):
+
+```sh
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=checksum \
+  -Wl,--initial-memory=65536 -Wl,--export-memory \
+  -o checksum.wasm checksum.c
+```
+
+## TB4 cached / zero-copy path (spdk-ii0)
+
+When an Exec carries an object key (the oid), the executor routes the wasm run
+through `kvdev_rados_nkvx_wasm_run_cached`: the object is cold-filled ONCE into an
+executor-owned, content-addressed buffer; subsequent Execs of the same object are
+served locally (no librados refetch), the wasm linear memory is backed zero-copy
+by that buffer via the custom `MemoryCreator` (on-demand strategy, ADR-0013), and
+the instantiated instance is reused (warm-instance cache keyed by `(module,
+object)`). See `module/kvdev/rados/kvdev_rados_nkvx_wasm.c`.
+
+## oob.wasm (sandbox-escape regression, spdk-ii0 B1)
+
+Adversarial module: declares a single 64 KiB page and writes one byte at offset
+`65536` — exactly one byte PAST its own linear memory. A sound sandbox MUST trap
+this; the dispatch is then contained (FAILED/ABORTED), never a host-memory clobber.
+Before the B1 fix the zero-copy host memory had no guard region and used static
+bounds-check elision, so this write silently succeeded (escape). The fix forces
+dynamic bounds checks (`memory_reservation=0`, `memory_guard_size=0`) so the access
+is caught. Exercised by `test_nkvx_tb4_oob_traps` in `kvdev_rados_nkvx_ut`. Source:
+`oob.c`.
+
+Rebuild (requires clang with the wasm32 target):
+
+```sh
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=oob \
+  -Wl,--initial-memory=65536 -Wl,--export-memory \
+  -o oob.wasm oob.c
+```
+
+## slackwrite.wasm / pageprobe.wasm (sandbox-semantics regression, spdk-ii0 D1)
+
+A module that declares fewer pages than the (possibly larger) object backing must
+not be able to reach the slack between its declared size and the backing. Before
+the D1 fix the custom zero-copy linear memory reported the FULL object backing as
+its size, so a small module run against a big object could read/write that slack
+without trapping (contained to the object buffer, but a violation of normal
+linear-memory semantics). The fix caps the REPORTED size to the module's declared,
+page-rounded minimum while keeping the full backing as the allocation (so the
+alias stays zero-copy and `memory.grow` can still extend up to the backing).
+
+* `slackwrite.wasm` declares one page and writes at offset `70000` — past its own
+  page but inside a 2-page backing. After the fix this MUST trap.
+* `pageprobe.wasm` declares one page and writes IN-BOUNDS (offset `1000`) against
+  the same 2-page backing — it must still succeed and stay zero-copy.
+
+Exercised by `test_nkvx_d1_declared_size_caps_slack`. Sources: `slackwrite.c`,
+`pageprobe.c`.
+
+```sh
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=slackwrite \
+  -Wl,--initial-memory=65536 -Wl,--export-memory \
+  -o slackwrite.wasm slackwrite.c
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=pageprobe \
+  -Wl,--initial-memory=65536 -Wl,--export-memory \
+  -o pageprobe.wasm pageprobe.c
+```
+
 ## libwasmtime.so (runtime dependency)
 
 wasmtime is loaded at runtime via `dlopen` (NOT linked into SPDK). The executor

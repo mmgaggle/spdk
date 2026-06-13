@@ -17,6 +17,7 @@
 
 #include "kvdev_rados.h"
 #include "kvdev_rados_nkvx.h"
+#include "kvdev_rados_nkvx_wasm.h"
 
 /*
  * librados-backed kvdev. See kvdev_rados.h / ADR-0002 / ADR-0004 for the model.
@@ -132,6 +133,7 @@ struct kvdev_rados_io {
 	 * the object (stat); the librados read_op fills it, then io_finish hands it
 	 * to the off-reactor worker, which frees it after the module runs. */
 	char				nkvx_module[32];
+	char				nkvx_oid[KVDEV_RADOS_OID_MAX];	/* TB4 cache key */
 	void				*nkvx_obj;
 	uint32_t			nkvx_obj_cap;	/* allocated size of nkvx_obj */
 	spdk_kvdev_io_completion_cb	cb_fn;
@@ -606,9 +608,9 @@ kvdev_rados_nkvx_dispatch_or_fail(struct kvdev_rados_io *io, int ret)
 
 		/* Dispatch the built-in module off the reactor against the true
 		 * object length. The buffer + io live until nkvx_io_done frees them. */
-		rc = kvdev_rados_nkvx_dispatch(io->nkvx_module, io->nkvx_obj,
-					       io->stat_size, io->host_out, io->buf_len,
-					       kvdev_rados_nkvx_io_done, io);
+		rc = kvdev_rados_nkvx_dispatch(io->nkvx_module, io->nkvx_oid, NULL,
+					       io->nkvx_obj, io->stat_size, io->host_out,
+					       io->buf_len, kvdev_rados_nkvx_io_done, io);
 		if (rc != 0) {
 			SPDK_ERRLOG("nkvx: dispatch failed: %s\n", spdk_strerror(-rc));
 			io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
@@ -819,6 +821,18 @@ kvdev_rados_store(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 
 	kvdev_rados_key_to_oid(key, key_len, oid);
 
+	/*
+	 * D2 (spdk-ii0): a Store changes the value, so any executor cache entry for
+	 * this oid is now stale. Invalidate BEFORE issuing the write so a concurrent
+	 * Exec cannot get a fresh cache hit on the old bytes after this point: the
+	 * entry is dropped immediately and the next Exec cold-reads from RADOS. (A
+	 * probe-hit already in flight keeps its pinned version, ordered before this
+	 * Store — see kvdev_rados_nkvx_wasm_cache_pin.) Invalidating at submission is
+	 * deliberately conservative: even if the write later fails, the only cost is a
+	 * cache miss that re-reads the unchanged object — never a stale read.
+	 */
+	kvdev_rados_nkvx_wasm_cache_invalidate(oid);
+
 	io = kvdev_rados_io_alloc(ch, KVDEV_RADOS_OP_STORE, cb_fn, cb_arg);
 	if (io == NULL) {
 		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
@@ -934,6 +948,11 @@ kvdev_rados_op_delete(struct spdk_io_channel *_ch, const void *key, uint8_t key_
 
 	kvdev_rados_key_to_oid(key, key_len, oid);
 
+	/* D2 (spdk-ii0): a Delete removes the value; drop any executor cache entry for
+	 * this oid before issuing the remove so a subsequent Exec misses (and then
+	 * fails the cold read with KEY_NOT_EXIST) rather than serving stale bytes. */
+	kvdev_rados_nkvx_wasm_cache_invalidate(oid);
+
 	io = kvdev_rados_io_alloc(ch, KVDEV_RADOS_OP_DELETE, cb_fn, cb_arg);
 	if (io == NULL) {
 		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
@@ -1026,6 +1045,51 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
 	io->buf_len = output_buf_len;
 	io->host_out = output_buf;
 	snprintf(io->nkvx_module, sizeof(io->nkvx_module), "%s", module);
+	/* The oid (hex of the key) is the stable content/identity key for the
+	 * executor's TB4 content-addressed object + warm-instance cache. */
+	snprintf(io->nkvx_oid, sizeof(io->nkvx_oid), "%s", oid);
+
+	/*
+	 * B2 (spdk-ii0): if the executor already holds this object in its identity
+	 * cache, skip the librados read ENTIRELY and dispatch straight to the
+	 * executor. This makes the cold-fill the ONLY librados touch: the 1st Exec of
+	 * an object reads it once; subsequent Execs of the same object do ZERO librados
+	 * reads.
+	 *
+	 * D2 RACE SAFETY (spdk-ii0): probe-and-PIN, not a bare boolean probe. A Store
+	 * or Delete on the SAME oid can invalidate the cache between this probe and the
+	 * worker's later read. cache_pin takes a reference that DEFERS the buffer free,
+	 * so the worker serves exactly the pinned version (no use-after-free, no stale
+	 * read served to a LATER Exec — the invalidated entry is unlinked, so the next
+	 * Exec cold-fills fresh). The worker releases the pin when it finishes; if the
+	 * dispatch itself fails we release it here. The unused aio completion is freed.
+	 */
+	{
+		void *pin = kvdev_rados_nkvx_wasm_cache_pin(io->nkvx_oid);
+
+		if (pin != NULL) {
+			SPDK_NOTICELOG("nkvx: oid %s served from executor cache "
+				       "(pinned, no librados read)\n", io->nkvx_oid);
+			rados_aio_release(io->comp);
+			io->comp = NULL;
+			io->nkvx_obj = NULL;
+			io->nkvx_obj_cap = 0;
+			rc = kvdev_rados_nkvx_dispatch(io->nkvx_module, io->nkvx_oid, pin,
+						       NULL, 0, io->host_out, io->buf_len,
+						       kvdev_rados_nkvx_io_done, io);
+			if (rc != 0) {
+				SPDK_ERRLOG("nkvx: cache-hit dispatch failed: %s\n",
+					    spdk_strerror(-rc));
+				kvdev_rados_nkvx_wasm_cache_unpin(pin);
+				free(io);
+				cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+				return 0;
+			}
+			return 0;
+		}
+	}
+
+	SPDK_NOTICELOG("nkvx: oid %s cache miss -> librados cold-fill read\n", io->nkvx_oid);
 
 	io->nkvx_obj_cap = KVDEV_RADOS_NKVX_COLDFILL_CAP;
 	io->nkvx_obj = malloc(io->nkvx_obj_cap);
