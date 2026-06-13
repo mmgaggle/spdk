@@ -52,13 +52,13 @@
 /* xattr name for the store-only vendor TTL (ADR-0003 spirit; not enforced). */
 #define KVDEV_RADOS_TTL_XATTR "kv_ttl"
 
-/* librados oids are NUL-terminated C strings, so a binary key (1-16 bytes) is
- * hex-encoded: 16 bytes -> 32 hex chars + NUL. */
-#define KVDEV_RADOS_OID_MAX (SPDK_KVDEV_KEY_MAX_LEN * 2 + 1)
-
-/* KV Exec keys ride in the request payload and may be up to 255 bytes (ADR-0014),
- * so their hex oid needs a larger buffer: 255 bytes -> 510 hex chars + NUL. */
-#define KVDEV_RADOS_EXEC_OID_MAX (SPDK_KVDEV_EXEC_KEY_MAX_LEN * 2 + 1)
+/* KVDEV_RADOS_OID_MAX / KVDEV_RADOS_EXEC_OID_MAX / KVDEV_RADOS_NKVX_OID_BUFSZ and
+ * kvdev_rados_key_to_oid() live in kvdev_rados.h so the unit test shares the exact
+ * oid sizing + encoding used by this datapath (see test_nkvx_long_key_oid). */
+SPDK_STATIC_ASSERT(KVDEV_RADOS_EXEC_OID_MAX >= KVDEV_RADOS_OID_MAX,
+		   "Exec oid buffer must also cover spec Store/Retrieve keys");
+SPDK_STATIC_ASSERT(KVDEV_RADOS_NKVX_OID_BUFSZ == KVDEV_RADOS_EXEC_OID_MAX,
+		   "nkvx_oid must hold the full hex of a 255-byte KV Exec key");
 
 /* ---- shared, named cluster registry (mirrors bdev_rbd) ------------------- */
 
@@ -141,7 +141,7 @@ struct kvdev_rados_io {
 	 * the object (stat); the librados read_op fills it, then io_finish hands it
 	 * to the off-reactor worker, which frees it after the module runs. */
 	char				nkvx_module[32];
-	char				nkvx_oid[KVDEV_RADOS_OID_MAX];	/* TB4 cache key */
+	char				nkvx_oid[KVDEV_RADOS_NKVX_OID_BUFSZ];	/* TB4 cache key (KV Exec keys up to 255 B, ADR-0014) */
 	void				*nkvx_obj;
 	uint32_t			nkvx_obj_cap;	/* allocated size of nkvx_obj */
 	/*
@@ -226,29 +226,10 @@ kvdev_rados_dup_config(const char *const *config)
 }
 
 /* ---- key -> oid hex encoding --------------------------------------------- */
-
-/*
- * Encode a binary key into a NUL-terminated lowercase-hex oid. librados oids are
- * C strings, so a binary key cannot be used verbatim; hex is collision-free and
- * reversible. Writes exactly key_len*2 + 1 bytes, so the CALLER must size oid to
- * the key it passes: KVDEV_RADOS_OID_MAX for the spec's <=16-byte Store/Retrieve
- * keys, but KVDEV_RADOS_EXEC_OID_MAX for KV Exec keys (up to
- * SPDK_KVDEV_EXEC_KEY_MAX_LEN = 255 bytes, ADR-0014). Passing the smaller buffer
- * for a long Exec key overflows it.
- */
-static void
-kvdev_rados_key_to_oid(const void *key, uint8_t key_len, char *oid)
-{
-	static const char hex[] = "0123456789abcdef";
-	const uint8_t *k = key;
-	uint8_t i;
-
-	for (i = 0; i < key_len; i++) {
-		oid[i * 2]     = hex[k[i] >> 4];
-		oid[i * 2 + 1] = hex[k[i] & 0xf];
-	}
-	oid[key_len * 2] = '\0';
-}
+/* kvdev_rados_key_to_oid() is a static-inline in kvdev_rados.h (shared with the
+ * unit test). The CALLER must size oid to the key it passes: KVDEV_RADOS_OID_MAX
+ * for the spec's <=16-byte Store/Retrieve keys, but KVDEV_RADOS_EXEC_OID_MAX for
+ * KV Exec keys (up to SPDK_KVDEV_EXEC_KEY_MAX_LEN = 255 bytes, ADR-0014). */
 
 /* ---- cluster registry ---------------------------------------------------- */
 

@@ -16,6 +16,54 @@ extern "C" {
 #endif
 
 /*
+ * librados oid buffer sizing. A binary key is hex-encoded into a NUL-terminated
+ * C string for use as the librados oid (and, for KV Exec, the executor cache key).
+ *
+ * KVDEV_RADOS_OID_MAX      - spec Store/Retrieve/Exist/Delete keys (<= 16 bytes ->
+ *                            32 hex chars + NUL).
+ * KVDEV_RADOS_EXEC_OID_MAX - KV Exec keys (up to 255 bytes, ADR-0014 -> 510 hex
+ *                            chars + NUL). The per-io nkvx_oid (cache + librados
+ *                            object key for the Exec data phase) is sized to this
+ *                            so a long Exec key is never truncated into a wrong
+ *                            (short) oid.
+ *
+ * These live in the header (not the .c) so the unit test can size its working
+ * buffer from the SAME source of truth as the production io->nkvx_oid field; a
+ * regression that shrinks that buffer back to KVDEV_RADOS_OID_MAX then makes the
+ * long-key oid round-trip test fail on truncation. See test_nkvx_long_key_oid.
+ */
+#define KVDEV_RADOS_OID_MAX (SPDK_KVDEV_KEY_MAX_LEN * 2 + 1)
+#define KVDEV_RADOS_EXEC_OID_MAX (SPDK_KVDEV_EXEC_KEY_MAX_LEN * 2 + 1)
+
+/*
+ * Size of struct kvdev_rados_io::nkvx_oid (the Exec data-phase oid / cache key).
+ * Named so both the production struct and the unit test reference one constant;
+ * shrinking it back to KVDEV_RADOS_OID_MAX is what the long-key regression catches.
+ */
+#define KVDEV_RADOS_NKVX_OID_BUFSZ KVDEV_RADOS_EXEC_OID_MAX
+
+/*
+ * librados oids are NUL-terminated C strings, so a binary key is hex-encoded:
+ * key_len bytes -> key_len*2 hex chars + NUL. \c oid must hold at least
+ * key_len*2 + 1 bytes (KVDEV_RADOS_EXEC_OID_MAX covers the largest Exec key).
+ * Header static-inline so the production datapath and the unit test encode oids
+ * identically.
+ */
+static inline void
+kvdev_rados_key_to_oid(const void *key, uint8_t key_len, char *oid)
+{
+	static const char hex[] = "0123456789abcdef";
+	const uint8_t *k = key;
+	uint8_t i;
+
+	for (i = 0; i < key_len; i++) {
+		oid[i * 2]     = hex[k[i] >> 4];
+		oid[i * 2 + 1] = hex[k[i] & 0xf];
+	}
+	oid[key_len * 2] = '\0';
+}
+
+/*
  * librados-backed kvdev (ADR-0002, ADR-0004).
  *
  * Tenancy mapping:

@@ -34,6 +34,11 @@
 /* And the dlopen-backed wasm runtime, so the real-wasm path is exercised in the
  * same translation unit. With --without-wasm this is the NOT_SUPPORTED stub. */
 #include "kvdev/rados/kvdev_rados_nkvx_wasm.c"
+/* The datapath's oid sizing (KVDEV_RADOS_NKVX_OID_BUFSZ, the actual size of
+ * struct kvdev_rados_io::nkvx_oid) and its key->oid encoder live here, so the
+ * long-key regression below tests the SAME buffer + encoder the datapath uses.
+ * This header is librados-free, so it is safe in the unit build. */
+#include "kvdev/rados/kvdev_rados.h"
 
 #include "common/lib/ut_multithread.c"
 
@@ -627,6 +632,204 @@ test_nkvx_tb4_distinct_object_is_miss(void)
 	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
 #else
 	printf("\n    built --without-wasm: TB4 distinct-object test is a no-op\n");
+#endif
+}
+
+/*
+ * LONG-KEY oid TRUNCATION regression (spdk-vim) -- the core, config-independent
+ * guard. Runs in EVERY build (including the pipeline's --without-wasm config), and
+ * is wired to the SAME source of truth as the datapath: KVDEV_RADOS_NKVX_OID_BUFSZ
+ * is the literal size of struct kvdev_rados_io::nkvx_oid, and kvdev_rados_key_to_oid
+ * is the literal encoder, both from kvdev_rados.h.
+ *
+ * The bug: kvdev_rados_nkvx_exec() builds the full hex oid then does
+ *     snprintf(io->nkvx_oid, sizeof(io->nkvx_oid), "%s", oid);   // kvdev_rados.c
+ * When nkvx_oid was sized KVDEV_RADOS_OID_MAX (33), any key >16 bytes was TRUNCATED
+ * to 32 hex chars in io->nkvx_oid -- the value every data-phase reader (cache pin,
+ * cold-fill librados read, dispatch) then uses -- so it addressed a WRONG/short
+ * object, and two distinct long keys sharing a 16-byte prefix collapsed to one oid.
+ *
+ * This test reproduces that exact snprintf into a buffer of the REAL field size and
+ * asserts no truncation + distinctness. It is engineered to FAIL if nkvx_oid is ever
+ * shrunk back to KVDEV_RADOS_OID_MAX and PASS at KVDEV_RADOS_EXEC_OID_MAX.
+ */
+static void
+ut_exec_oid_like_datapath(const void *key, uint8_t key_len, char *io_nkvx_oid)
+{
+	/* Mirror kvdev_rados_nkvx_exec(): hex-encode into a full-size scratch, then
+	 * the lossy snprintf copy into the (possibly-too-small) per-io field. */
+	char oid[KVDEV_RADOS_EXEC_OID_MAX];
+
+	kvdev_rados_key_to_oid(key, key_len, oid);
+	snprintf(io_nkvx_oid, KVDEV_RADOS_NKVX_OID_BUFSZ, "%s", oid);
+}
+
+static void
+test_nkvx_long_key_oid(void)
+{
+	/* A 255-byte key is the Exec ABI maximum (SPDK_KVDEV_EXEC_KEY_MAX_LEN). Its
+	 * full oid is 510 hex chars; nkvx_oid MUST hold it (511 incl. NUL). */
+	CU_ASSERT(KVDEV_RADOS_NKVX_OID_BUFSZ >= SPDK_KVDEV_EXEC_KEY_MAX_LEN * 2 + 1);
+
+	/* Buffers sized exactly like the production io->nkvx_oid field. */
+	char io_oid_a[KVDEV_RADOS_NKVX_OID_BUFSZ];
+	char io_oid_b[KVDEV_RADOS_NKVX_OID_BUFSZ];
+
+	/* Two 32-byte keys (>16 B) sharing a 16-byte prefix; they differ only in the
+	 * second half -- only past hex char 32, exactly where a 33-byte oid buffer
+	 * truncates and loses the distinction. */
+	uint8_t key_a[32], key_b[32];
+	memset(key_a, 0xA5, sizeof(key_a));
+	memcpy(key_b, key_a, 16);		/* identical 16-byte prefix */
+	memset(key_b + 16, 0x5A, 16);		/* diverge only past byte 16 */
+
+	ut_exec_oid_like_datapath(key_a, sizeof(key_a), io_oid_a);
+	ut_exec_oid_like_datapath(key_b, sizeof(key_b), io_oid_b);
+
+	/* NOT truncated: a 32-byte key yields 64 hex chars in io->nkvx_oid. With the
+	 * buggy 33-byte buffer this strlen would be 32 -> assertion fails. */
+	CU_ASSERT(strlen(io_oid_a) == sizeof(key_a) * 2);
+	CU_ASSERT(strlen(io_oid_b) == sizeof(key_b) * 2);
+
+	/* Distinct in full, despite a shared 32-char prefix. With truncation both
+	 * collapse to the same 32-char oid -> this inequality fails. */
+	CU_ASSERT(strncmp(io_oid_a, io_oid_b, 32) == 0);	/* shared prefix */
+	CU_ASSERT(strcmp(io_oid_a, io_oid_b) != 0);		/* but distinct */
+
+	/* Round-trip identity: re-deriving key A's oid yields the identical string the
+	 * data phase used the first time (store and retrieve address the same object). */
+	char io_oid_a2[KVDEV_RADOS_NKVX_OID_BUFSZ];
+	ut_exec_oid_like_datapath(key_a, sizeof(key_a), io_oid_a2);
+	CU_ASSERT(strcmp(io_oid_a, io_oid_a2) == 0);
+
+	/* The full 255-byte Exec maximum must survive end to end (no truncation). */
+	uint8_t key_max[SPDK_KVDEV_EXEC_KEY_MAX_LEN];
+	char io_oid_max[KVDEV_RADOS_NKVX_OID_BUFSZ];
+	memset(key_max, 0xC3, sizeof(key_max));
+	ut_exec_oid_like_datapath(key_max, sizeof(key_max), io_oid_max);
+	CU_ASSERT(strlen(io_oid_max) == (size_t)SPDK_KVDEV_EXEC_KEY_MAX_LEN * 2);
+
+	printf("\n    long-key oid: nkvx_oid buf=%zu, 32B key -> |oid|=%zu (not 32), "
+	       "255B key -> |oid|=%zu, A==A round-trip, A!=B\n",
+	       (size_t)KVDEV_RADOS_NKVX_OID_BUFSZ, strlen(io_oid_a), strlen(io_oid_max));
+}
+
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+/* Mirror of kvdev_rados_key_to_oid for a size_t key_len (the deep wasm test below
+ * uses oversized keys); identical hex encoding. */
+static void
+ut_key_to_oid(const void *key, size_t key_len, char *oid)
+{
+	static const char hex[] = "0123456789abcdef";
+	const uint8_t *k = key;
+	size_t i;
+
+	for (i = 0; i < key_len; i++) {
+		oid[i * 2]     = hex[k[i] >> 4];
+		oid[i * 2 + 1] = hex[k[i] & 0xf];
+	}
+	oid[key_len * 2] = '\0';
+}
+#endif
+
+/*
+ * LONG-KEY oid cache-distinctness (spdk-vim), wasm-deep variant: with a real wasm
+ * runtime, drive the executor cache with two full-length long-key oids sharing a
+ * 16-byte prefix and prove they back DISTINCT cached objects (no false content hit)
+ * and that re-running the same long oid hits the same slot. Complements
+ * test_nkvx_long_key_oid (which is the config-independent truncation guard).
+ */
+static void
+test_nkvx_long_key_oid_distinct(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> long-key oid test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	/* Two 32-byte keys (>16 B) sharing a 16-byte prefix; they differ only in the
+	 * second half, i.e. only past hex char 32 -- exactly where the old truncated
+	 * oid buffer would have lost the distinction. */
+	uint8_t key_a[32], key_b[32];
+	char oid_a[KVDEV_RADOS_EXEC_OID_MAX];
+	char oid_b[KVDEV_RADOS_EXEC_OID_MAX];
+
+	memset(key_a, 0xA5, sizeof(key_a));
+	memcpy(key_b, key_a, 16);		/* identical 16-byte prefix */
+	memset(key_b + 16, 0x5A, 16);		/* diverge only past byte 16 */
+
+	ut_key_to_oid(key_a, sizeof(key_a), oid_a);
+	ut_key_to_oid(key_b, sizeof(key_b), oid_b);
+	CU_ASSERT(strlen(oid_a) == sizeof(key_a) * 2);		/* 64 hex chars */
+	CU_ASSERT(strncmp(oid_a, oid_b, 32) == 0);		/* same 32-char prefix */
+	CU_ASSERT(strcmp(oid_a, oid_b) != 0);			/* but distinct in full */
+
+	static const uint8_t obj_a[] = "object-bytes-for-long-key-A";
+	static const uint8_t obj_b[] = "object-bytes-for-long-key-B-differs";
+	struct fake_fill fa = { .bytes = obj_a, .len = sizeof(obj_a), .calls = 0 };
+	struct fake_fill fb = { .bytes = obj_b, .len = sizeof(obj_b), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	uint64_t ga = 0, gb = 0, ga2 = 0;
+	const void *base_a;
+	struct kvdev_rados_nkvx_wasm_stats st;
+
+	/* Long key A -> cold fill, distinct cache slot. */
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, oid_a, sizeof(obj_a),
+			fake_cold_fill, &fa, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&ga, out, sizeof(ga));
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	base_a = st.last_cache_base;
+
+	/* Long key B (shares A's 32-char oid prefix) -> MUST be a genuine MISS, not a
+	 * collision with A's slot. A truncated oid would make this a false hit on A. */
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, oid_b, sizeof(obj_b),
+			fake_cold_fill, &fb, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&gb, out, sizeof(gb));
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+
+	CU_ASSERT(fa.calls == 1);
+	CU_ASSERT(fb.calls == 1);			/* B cold-filled on its own */
+	CU_ASSERT(st.cold_fills == 2);
+	CU_ASSERT(st.content_hits == 0);		/* no false hit on A */
+	CU_ASSERT(st.last_cache_base != base_a);	/* distinct backing buffers */
+	CU_ASSERT(ga == expected_checksum(obj_a, sizeof(obj_a)));
+	CU_ASSERT(gb == expected_checksum(obj_b, sizeof(obj_b)));
+	CU_ASSERT(ga != gb);				/* the correct, distinct objects */
+
+	/* Re-run long key A -> same full oid must HIT A's slot (round-trip identity),
+	 * with no extra cold fill. */
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, oid_a, sizeof(obj_a),
+			fake_cold_fill, &fa, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&ga2, out, sizeof(ga2));
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	CU_ASSERT(fa.calls == 1);			/* no refetch of A */
+	CU_ASSERT(st.cold_fills == 2);
+	CU_ASSERT(st.content_hits == 1);		/* A served from cache */
+	CU_ASSERT(ga2 == ga);				/* same object as the first A run */
+
+	printf("\n    long-key oid: |oid|=%zu shared-prefix=32 distinct -> cold_fills=%llu "
+	       "content_hits=%llu (A!=B, A round-trips)\n",
+	       strlen(oid_a), (unsigned long long)st.cold_fills,
+	       (unsigned long long)st.content_hits);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: long-key oid test is a no-op\n");
 #endif
 }
 
@@ -1981,6 +2184,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_wasm_normal_within_caps);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cache_zerocopy_warm);
 	CU_ADD_TEST(suite, test_nkvx_tb4_distinct_object_is_miss);
+	CU_ADD_TEST(suite, test_nkvx_long_key_oid);
+	CU_ADD_TEST(suite, test_nkvx_long_key_oid_distinct);
 	CU_ADD_TEST(suite, test_nkvx_tb4_multipage_module_private);
 	CU_ADD_TEST(suite, test_nkvx_tb4_oob_traps);
 	CU_ADD_TEST(suite, test_nkvx_d1_declared_size_caps_slack);
