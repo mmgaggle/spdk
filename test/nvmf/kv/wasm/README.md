@@ -111,6 +111,26 @@ clang --target=wasm32 -nostdlib -O2 \
   -o pageprobe.wasm pageprobe.c
 ```
 
+## growcap.wasm (store-limiter cap proof, spdk-90x)
+
+Grows a FIXED, BOUNDED number of pages (1024 = 64 MiB) then returns SUCCESS.
+Unlike `overalloc` (unbounded growth), the bounded ceiling makes `growcap` a clean
+fail-before/after probe for the wasmtime store memory LIMITER on the NON-custom-
+memory plain `run()` path (where the limiter — not `nkvx_zc_grow` — is the real
+bound): under a tight cap (e.g. 1 MiB) a `memory.grow` is refused before the target
+and the module traps (contained); with the limiter disabled the bounded grows all
+succeed and it returns SUCCESS without OOMing the target. Exercised by
+`test_nkvx_store_limiter_bounds_plain_path`. (The warm/cached path is bounded by
+`nkvx_zc_grow` instead; the store_limiter is belt-and-suspenders there — see the
+mechanism note on `test_nkvx_d3_warm_memory_cap_contained`.) Source: `growcap.c`.
+
+```sh
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=growcap \
+  -Wl,--initial-memory=65536 -Wl,--export-memory \
+  -o growcap.wasm growcap.c
+```
+
 ## libwasmtime.so (runtime dependency)
 
 wasmtime is loaded at runtime via `dlopen` (NOT linked into SPDK). The executor

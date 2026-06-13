@@ -985,19 +985,33 @@ test_nkvx_d2_pin_survives_invalidate(void)
  * the cached path must arm the SAME caps as the cold run() — memory limiter AND
  * the epoch wall-clock backstop — not just fuel.
  *
- *   (a) MEMORY: a module that grows past the per-invocation memory cap is
- *       contained (the grow fails, the module traps) — never a host OOM. Run on
- *       the warm path (run_cached) with a tight SPDK_NKVX_WASM_MAX_MEMORY.
+ *   (a) MEMORY: a module that grows past the warm-path memory bound is contained
+ *       (the grow fails, the module traps) — never a host OOM.
  *   (b) EPOCH:  a wall-clock-runaway module with FUEL DISABLED must be stopped by
  *       the epoch deadline the warm engine now arms (before the fix the warm path
  *       armed only fuel, so a fuel=0 runaway ran unbounded). Run on the warm path
  *       with SPDK_NKVX_WASM_FUEL=0 and a short epoch budget -> ABORTED, no hang.
+ *
+ * MECHANISM NOTE (spdk-90x). The warm/cached path is ALWAYS backed by our custom
+ * MemoryCreator (zero-copy alias, or the private fallback). For a custom host
+ * memory the REAL linear-memory bound is nkvx_zc_grow, which refuses any growth
+ * past the object backing (m->cap) and returns a wasmtime error -> the grow traps.
+ * The wasmtime store memory LIMITER (store_limiter) is belt-and-suspenders on this
+ * path: it never gets the chance to be the deciding bound because nkvx_zc_grow
+ * refuses growth first. So this warm test asserts the ACTUAL mechanism — that the
+ * grow is refused (contained) — and is INDEPENDENT of the store_limiter. The
+ * store_limiter is proven load-bearing separately, on the NON-custom-memory plain
+ * run() path, by test_nkvx_store_limiter_bounds_plain_path below (where disabling
+ * the limiter genuinely flips the result). This test used to (mis)attribute the
+ * containment to the store_limiter even though disabling it did not change the
+ * outcome (the overalloc grow was already refused by nkvx_zc_grow).
  */
 static void
 test_nkvx_d3_warm_memory_cap_contained(void)
 {
 #ifdef NKVX_WASM_RUNTIME_TESTS
 	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	/* A memory cap is set, but the warm-path bound is nkvx_zc_grow (see note). */
 	setenv("SPDK_NKVX_WASM_MAX_MEMORY", "1048576", 1);	/* 1 MiB cap */
 	unsetenv("SPDK_NKVX_WASM_FUEL");
 	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
@@ -1017,16 +1031,85 @@ test_nkvx_d3_warm_memory_cap_contained(void)
 	memset(out, 0, sizeof(out));
 	rc = kvdev_rados_nkvx_wasm_run_cached("overalloc", NULL, "d3memK", sizeof(obj),
 					      fake_cold_fill, &fill, out, sizeof(out), &rlen);
-	/* Contained by the WARM-path memory limiter: a clean failure, not an OOM. */
+	/* Contained by the WARM-path bound (nkvx_zc_grow refuses the grow past the
+	 * backing): a clean failure, not an OOM. Independent of the store_limiter. */
 	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_ABORTED ||
 		  rc == SPDK_KVDEV_IO_STATUS_FAILED);
-	printf("\n    D3 warm memory cap: status=%d (contained on cached path)\n", rc);
+	printf("\n    D3 warm memory cap: status=%d (contained on cached path by nkvx_zc_grow)\n",
+	       rc);
 
 	kvdev_rados_nkvx_wasm_cache_reset();
 	unsetenv("SPDK_NKVX_WASM_MAX_MEMORY");
 #else
 	printf("\n    built --without-wasm: TB4 D3 memory test is a no-op\n");
 #endif
+}
+
+/*
+ * STORE-LIMITER load-bearing proof on the NON-custom-memory plain run() path
+ * (spdk-90x). The plain run() path uses wasmtime's DEFAULT (non-custom) linear
+ * memory, whose growth is bounded by the wasmtime store memory LIMITER
+ * (store_limiter) — NOT by nkvx_zc_grow (which only governs the custom warm-path
+ * memory). This is therefore the path where the store_limiter is the genuine,
+ * deciding bound, so it is the right place to prove it is load-bearing.
+ *
+ * growcap.wasm grows a BOUNDED 1024 pages (64 MiB) then returns SUCCESS:
+ *   - WITH a tight 1 MiB cap the limiter refuses a grow well before 64 MiB; the
+ *     module traps -> the dispatch is contained (ABORTED/FAILED).
+ *   - The growth is BOUNDED, so even if the cap were removed the module would
+ *     allocate at most 64 MiB and return SUCCESS — it would NOT OOM the target.
+ *     That bound is what makes the fail-before (disable the limiter -> SUCCESS)
+ *     safe to run; see the manual fail-before note in the commit.
+ *
+ * Run via the dispatch path (NULL obj_key) so it goes through run() (plain copy,
+ * no MemoryCreator), exercising exactly the store_limiter-bounded path.
+ *
+ * Fail-before/after (manual, documented): with the plain-path store_limiter call
+ * commented out, growcap grows all 1024 bounded pages and returns SUCCESS, so the
+ * "contained" assert below FAILS; with the limiter in place the grow is refused at
+ * the cap and the dispatch is contained. The result flips solely on the limiter,
+ * proving it load-bearing on this path.
+ */
+static void
+test_nkvx_store_limiter_bounds_plain_path(void)
+{
+	struct nkvx_result r;
+	uint8_t out[64];
+
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+
+#ifdef NKVX_WASM_RUNTIME_TESTS
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	/* Tight 1 MiB cap, far below growcap's bounded 64 MiB target. Fuel/epoch high
+	 * enough not to interfere (the bounded grow loop is short). */
+	setenv("SPDK_NKVX_WASM_MAX_MEMORY", "1048576", 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "1000000000", 1);
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+
+	memset(out, 0, sizeof(out));
+	/* NULL obj_key -> plain run() path (default wasmtime memory, store_limiter). */
+	dispatch_and_wait("wasm:growcap", "x", 1, out, sizeof(out), &r);
+	CU_ASSERT(r.completed);
+	if (r.kvstatus != SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED) {
+		/* The store limiter refused the grow at the cap -> the module trapped ->
+		 * contained. With the limiter the result is NOT SUCCESS (the bounded grow
+		 * could not finish under the 1 MiB cap). */
+		CU_ASSERT(r.kvstatus == SPDK_KVDEV_IO_STATUS_ABORTED ||
+			  r.kvstatus == SPDK_KVDEV_IO_STATUS_FAILED);
+		CU_ASSERT(r.kvstatus != SPDK_KVDEV_IO_STATUS_SUCCESS);
+		printf("\n    store-limiter (plain path): growcap contained at 1MiB cap, status=%d "
+		       "(limiter load-bearing; disable it -> bounded grow SUCCEEDS)\n", r.kvstatus);
+	} else {
+		printf("\n    wasm runtime unavailable -> store-limiter plain-path test skipped\n");
+	}
+	unsetenv("SPDK_NKVX_WASM_MAX_MEMORY");
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+#else
+	(void)r;
+	(void)out;
+	printf("\n    built --without-wasm: store-limiter plain-path test is a no-op\n");
+#endif
+	kvdev_rados_nkvx_stop();
 }
 
 static void
@@ -1536,6 +1619,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_d2_invalidate_on_mutation);
 	CU_ADD_TEST(suite, test_nkvx_d2_pin_survives_invalidate);
 	CU_ADD_TEST(suite, test_nkvx_d3_warm_memory_cap_contained);
+	CU_ADD_TEST(suite, test_nkvx_store_limiter_bounds_plain_path);
 	CU_ADD_TEST(suite, test_nkvx_d3_warm_epoch_cap_contained);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cached_failsoft);
 	CU_ADD_TEST(suite, test_nkvx_tb4_dispatch_wires_cache);
