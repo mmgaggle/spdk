@@ -1000,20 +1000,27 @@ struct nkvx_obj_entry {
 };
 
 /*
- * A warm wasm instance, keyed by (module, obj_key). Holds the whole on-demand
- * tower (engine/store/module/instance) so a repeat Exec of the same pair skips
- * re-instantiation. Pinned to the object entry whose buffer backs its memory.
+ * A warm wasm engine+compiled-module, keyed by (module, obj_key). Caches the
+ * EXPENSIVE artifacts — the engine (with the per-object zero-copy MemoryCreator
+ * wired into its config) and the compiled module — so a repeat Exec of the same
+ * pair skips engine creation + module compile/deserialize. Pinned to the object
+ * entry whose buffer backs its memory.
+ *
+ * STATE ISOLATION (spdk-yc1): the per-Exec STORE + INSTANCE are deliberately NOT
+ * cached. Each Exec instantiates a fresh store+instance from the warm engine +
+ * compiled module and deletes the store when done. Re-instantiation resets every
+ * wasm GLOBAL to its declared init and RE-RUNS the module's data-segment
+ * initializers, so module state never leaks from one Exec to the next. The
+ * expensive compile/engine stay warm (instantiation is cheap relative to compile),
+ * so this keeps the warm-cache perf win while making each Exec start from a clean
+ * instance. A warm HIT still means "engine+compiled module reused" (warm_hits
+ * increments); only the cheap, isolation-critical instance is rebuilt per run.
  */
 struct nkvx_warm_entry {
 	char			module[64];
 	char			obj_key[256];
 	wasm_engine_t		*engine;
-	wasmtime_store_t	*store;
-	wasmtime_context_t	*ctx;
 	wasmtime_module_t	*module_h;
-	wasmtime_instance_t	instance;
-	wasmtime_extern_t	mem_ext;	/* exported "memory" */
-	wasmtime_extern_t	fn_ext;		/* exported <module> */
 	struct nkvx_obj_entry	*obj;		/* backing object (zero-copy alias) */
 	STAILQ_ENTRY(nkvx_warm_entry) link;
 };
@@ -1319,10 +1326,12 @@ nkvx_zc_new_memory(void *env, const wasm_memorytype_t *ty, size_t minimum,
 }
 
 /*
- * Build the on-demand tower (engine/store/module/instance) for a (module, object)
- * with the cached object's buffer wired in zero-copy via the MemoryCreator, then
- * cache it warm. On success *out_warm points at the cached warm entry (owned by
- * the cache). Caps are applied per-run by the caller, not here.
+ * Build and cache the WARM artifacts (engine + compiled module) for a
+ * (module, object), with the cached object's buffer wired in zero-copy via the
+ * MemoryCreator on the engine config. The per-Exec store + instance are NOT built
+ * here (state isolation, spdk-yc1) — they are created fresh on every run in
+ * nkvx_run_on_object_locked. On success *out_warm points at the cached warm entry
+ * (owned by the cache). Caps are applied per-run by the caller, not here.
  */
 static int
 nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
@@ -1334,13 +1343,8 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	size_t wasm_len = 0;
 	wasm_config_t *config = NULL;
 	wasm_engine_t *engine = NULL;
-	wasmtime_store_t *store = NULL;
-	wasmtime_context_t *ctx = NULL;
 	wasmtime_module_t *module_h = NULL;
 	wasmtime_error_t *err = NULL;
-	wasm_trap_t *trap = NULL;
-	wasmtime_instance_t instance;
-	wasmtime_extern_t mem_ext, fn_ext;
 	struct nkvx_warm_entry *w = NULL;
 	struct nkvx_zc_ctx *zc = NULL;
 	wasmtime_memory_creator_t creator;
@@ -1412,11 +1416,6 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	if (engine == NULL) {
 		goto out;
 	}
-	store = api->store_new(engine, NULL, NULL);
-	if (store == NULL) {
-		goto out;
-	}
-	ctx = api->store_context(store);
 
 	if (mod != NULL) {
 		/* VERIFIED path (ADR-0010): deserialize the sha256-cached compiled module
@@ -1436,27 +1435,6 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 			goto out;
 		}
 	}
-	err = api->instance_new(ctx, module_h, NULL, 0, &instance, &trap);
-	if (err != NULL) {
-		nkvx_wasm_log_error(api, "instance_new", err);
-		goto out;
-	}
-	if (trap != NULL) {
-		SPDK_ERRLOG("nkvx/wasm: zero-copy instantiation trapped\n");
-		api->trap_delete(trap);
-		goto out;
-	}
-	if (!api->instance_export_get(ctx, &instance, "memory", strlen("memory"), &mem_ext) ||
-	    mem_ext.kind != WASMTIME_EXTERN_MEMORY) {
-		SPDK_ERRLOG("nkvx/wasm: module '%s' has no exported 'memory'\n", module);
-		goto out;
-	}
-	if (!api->instance_export_get(ctx, &instance, module, strlen(module), &fn_ext) ||
-	    fn_ext.kind != WASMTIME_EXTERN_FUNC) {
-		SPDK_ERRLOG("nkvx/wasm: module '%s' has no exported function '%s'\n",
-			    module, module);
-		goto out;
-	}
 
 	w = calloc(1, sizeof(*w));
 	if (w == NULL) {
@@ -1465,16 +1443,12 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	snprintf(w->module, sizeof(w->module), "%s", module);
 	snprintf(w->obj_key, sizeof(w->obj_key), "%s", obj->obj_key);
 	w->engine = engine;
-	w->store = store;
-	w->ctx = ctx;
 	w->module_h = module_h;
-	w->instance = instance;
-	w->mem_ext = mem_ext;
-	w->fn_ext = fn_ext;
 	w->obj = obj;
-	/* The warm instance aliases obj->mem zero-copy: pin the object so an
-	 * invalidation cannot free the buffer out from under this warm instance
-	 * (spdk-ii0 D2). The pin is dropped when the warm entry is torn down. */
+	/* The warm engine's MemoryCreator aliases obj->mem zero-copy on every
+	 * instantiation: pin the object so an invalidation cannot free the buffer out
+	 * from under this warm entry (spdk-ii0 D2). The pin is dropped when the warm
+	 * entry is torn down. */
 	obj->refcount++;
 
 	STAILQ_INSERT_TAIL(&g_cache.warm, w, link);
@@ -1482,16 +1456,12 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 
 	/* Ownership transferred to the warm entry; do not tear down below. */
 	engine = NULL;
-	store = NULL;
 	module_h = NULL;
 	rc = 0;
 
 out:
 	if (module_h != NULL) {
 		api->module_delete(module_h);
-	}
-	if (store != NULL) {
-		api->store_delete(store);
 	}
 	if (engine != NULL) {
 		api->engine_delete(engine);
@@ -1507,9 +1477,6 @@ nkvx_warm_free(const struct nkvx_wasm_api *api, struct nkvx_warm_entry *w)
 	if (w->module_h != NULL) {
 		api->module_delete(w->module_h);
 	}
-	if (w->store != NULL) {
-		api->store_delete(w->store);
-	}
 	if (w->engine != NULL) {
 		api->engine_delete(w->engine);
 	}
@@ -1517,11 +1484,24 @@ nkvx_warm_free(const struct nkvx_wasm_api *api, struct nkvx_warm_entry *w)
 }
 
 /*
- * Run module `name` against object entry `obj` (mutex held). Builds or reuses a
- * warm instance bound to THIS object, applies the per-invocation caps, calls the
- * module, and extracts the result. Returns an SPDK_KVDEV_IO_STATUS_*. Shared by
- * the key-based run_cached (cold-fill path) and the pinned run (probe-skip path)
- * so both arm identical caps and zero-copy bookkeeping.
+ * Run module `name` against object entry `obj` (mutex held). Builds or reuses the
+ * WARM engine+compiled module bound to THIS object, then instantiates a FRESH
+ * store+instance for THIS Exec (state isolation, spdk-yc1), applies the
+ * per-invocation caps, calls the module, extracts the result, and deletes the
+ * store. Returns an SPDK_KVDEV_IO_STATUS_*. Shared by the key-based run_cached
+ * (cold-fill path) and the pinned run (probe-skip path) so both arm identical caps
+ * and zero-copy bookkeeping.
+ *
+ * STATE ISOLATION (spdk-yc1): the per-Exec store+instance are created here and torn
+ * down before return. Re-instantiating resets every wasm GLOBAL to its declared
+ * init and re-runs the module's data-segment initializers, so globals/scratch from
+ * a prior Exec of the same (module,object) never leak into this one. The expensive
+ * compile + engine stay warm (see nkvx_warm_entry), so the warm-cache perf win is
+ * preserved while each Exec starts from a clean instance. Note the OBJECT region of
+ * linear memory is the cached object buffer (zero-copy or private fallback) and is
+ * intentionally the same bytes across Execs of the SAME object — that is the
+ * object's own content, not cross-Exec state; only the module's instance state
+ * (globals, declared data segments) is reset.
  */
 static int
 nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
@@ -1533,12 +1513,17 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 	struct nkvx_wasm_caps caps;
 	uint8_t *mem_base;
 	size_t mem_size;
+	wasmtime_store_t *store = NULL;
+	wasmtime_context_t *ctx;
+	wasmtime_instance_t instance;
+	wasmtime_extern_t mem_ext, fn_ext;
 	wasmtime_error_t *err = NULL;
 	wasm_trap_t *trap = NULL;
+	bool epoch_armed = false;
 	wasmtime_val_t args[2], results[1];
 	int status = SPDK_KVDEV_IO_STATUS_FAILED;
 
-	/* ---- warm-instance cache, keyed by (module, object) ----------------- */
+	/* ---- warm engine + compiled-module cache, keyed by (module, object) -- */
 	warm = nkvx_warm_lookup(name, obj);
 	if (warm != NULL) {
 		g_nkvx_wasm_stats.warm_hits++;
@@ -1549,27 +1534,53 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 		}
 	}
 
-	/* ---- zero-copy proof: linear memory aliases the cache buffer -------- */
-	mem_base = api->memory_data(warm->ctx, &warm->mem_ext.of.memory);
-	mem_size = api->memory_data_size(warm->ctx, &warm->mem_ext.of.memory);
-	g_nkvx_wasm_stats.last_mem_base = mem_base;
-	g_nkvx_wasm_stats.last_cache_base = obj->mem;
-
 	/*
-	 * Per-invocation caps (TB2) on the warm store before the call (spdk-ii0 D3):
-	 * arm fuel AND the memory limiter AND the epoch deadline, matching run() so the
-	 * warm/cached path is contained against compute-, memory-, and wall-clock
-	 * runaways exactly like the cold path. Caps source: the binding's caps word
-	 * (TB3) when a verified \c mod is present; otherwise defaults (legacy tests).
+	 * FRESH per-Exec store + instance (spdk-yc1). The warm engine carries the
+	 * zero-copy MemoryCreator on its config, so this instantiation re-aliases the
+	 * cached object buffer (zero-copy) while resetting all module globals/data.
 	 */
+	store = api->store_new(warm->engine, NULL, NULL);
+	if (store == NULL) {
+		SPDK_ERRLOG("nkvx/wasm: store_new failed for '%s'\n", name);
+		return SPDK_KVDEV_IO_STATUS_FAILED;
+	}
+	ctx = api->store_context(store);
+
 	nkvx_wasm_caps_load(&caps, mod != NULL ? mod->caps : 0);
 
-	/* MEMORY CAP: bound linear memory so a memory.grow past the cap fails and the
-	 * module is contained (never OOMing the target), exactly as run() does. */
+	/* MEMORY CAP belt-and-suspenders on the warm path (the real bound is
+	 * nkvx_zc_grow refusing growth past the backing; see spdk-90x). */
 	if (caps.max_memory_bytes > 0) {
-		api->store_limiter(warm->store, (int64_t)caps.max_memory_bytes,
-				   -1, -1, -1, -1);
+		api->store_limiter(store, (int64_t)caps.max_memory_bytes, -1, -1, -1, -1);
 	}
+
+	err = api->instance_new(ctx, warm->module_h, NULL, 0, &instance, &trap);
+	if (err != NULL) {
+		nkvx_wasm_log_error(api, "instance_new (warm)", err);
+		goto out;
+	}
+	if (trap != NULL) {
+		SPDK_ERRLOG("nkvx/wasm: warm instantiation trapped\n");
+		api->trap_delete(trap);
+		trap = NULL;
+		goto out;
+	}
+	if (!api->instance_export_get(ctx, &instance, "memory", strlen("memory"), &mem_ext) ||
+	    mem_ext.kind != WASMTIME_EXTERN_MEMORY) {
+		SPDK_ERRLOG("nkvx/wasm: module '%s' has no exported 'memory'\n", name);
+		goto out;
+	}
+	if (!api->instance_export_get(ctx, &instance, name, strlen(name), &fn_ext) ||
+	    fn_ext.kind != WASMTIME_EXTERN_FUNC) {
+		SPDK_ERRLOG("nkvx/wasm: module '%s' has no exported function '%s'\n", name, name);
+		goto out;
+	}
+
+	/* ---- zero-copy proof: linear memory aliases the cache buffer -------- */
+	mem_base = api->memory_data(ctx, &mem_ext.of.memory);
+	mem_size = api->memory_data_size(ctx, &mem_ext.of.memory);
+	g_nkvx_wasm_stats.last_mem_base = mem_base;
+	g_nkvx_wasm_stats.last_cache_base = obj->mem;
 
 	/*
 	 * The warm engine ALWAYS has the fuel feature enabled (see nkvx_warm_build),
@@ -1579,10 +1590,10 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 	{
 		uint64_t fuel = caps.fuel_ceiling > 0 ? caps.fuel_ceiling : UINT64_MAX;
 
-		err = api->context_set_fuel(warm->ctx, fuel);
+		err = api->context_set_fuel(ctx, fuel);
 		if (err != NULL) {
 			nkvx_wasm_log_error(api, "context_set_fuel", err);
-			return SPDK_KVDEV_IO_STATUS_FAILED;
+			goto out;
 		}
 	}
 
@@ -1598,41 +1609,44 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 	 * never trips an unset deadline. The ticker is disarmed right after the call,
 	 * before the mutex is dropped, so it never advances a stale/reused engine. */
 	if (caps.epoch_deadline_ticks > 0) {
-		api->context_set_epoch_deadline(warm->ctx, caps.epoch_deadline_ticks);
+		api->context_set_epoch_deadline(ctx, caps.epoch_deadline_ticks);
 		nkvx_wasm_epoch_register(api, warm->engine);
+		epoch_armed = true;
 	} else {
-		api->context_set_epoch_deadline(warm->ctx, UINT64_MAX);
+		api->context_set_epoch_deadline(ctx, UINT64_MAX);
 	}
 
 	args[0].kind = WASMTIME_I32;
 	args[0].of.i32 = (int32_t)WASM_OBJ_OFF;
 	args[1].kind = WASMTIME_I32;
 	args[1].of.i32 = (int32_t)obj->obj_len;
-	err = api->func_call(warm->ctx, &warm->fn_ext.of.func, args, 2, results, 1, &trap);
+	err = api->func_call(ctx, &fn_ext.of.func, args, 2, results, 1, &trap);
 
-	/* Disarm the ticker as soon as the call returns (the engine is reused, not
-	 * deleted, so we only need to stop it pointing at this engine). Only armed
-	 * when the epoch cap was active this call. */
-	if (caps.epoch_deadline_ticks > 0) {
+	/* Disarm the ticker as soon as the call returns; the engine is reused (not
+	 * deleted), so we only need to stop it pointing at this engine. */
+	if (epoch_armed) {
 		nkvx_wasm_epoch_unregister(warm->engine);
+		epoch_armed = false;
 	}
 
 	if (err != NULL) {
 		nkvx_wasm_log_error(api, "func_call", err);
-		return SPDK_KVDEV_IO_STATUS_FAILED;
+		goto out;
 	}
 	if (trap != NULL) {
 		bool cap = nkvx_wasm_trap_is_cap(api, trap);
 
 		api->trap_delete(trap);
+		trap = NULL;
 		/* Log parity with the plain run() path so a cap kill on the cached path
 		 * is equally observable (a contained abort, never a crash). */
 		SPDK_ERRLOG("nkvx/wasm: module '%s' trapped during execution (%s)\n",
 			    name, cap ? "RESOURCE CAP — aborted" : "fault");
-		return cap ? SPDK_KVDEV_IO_STATUS_ABORTED : SPDK_KVDEV_IO_STATUS_FAILED;
+		status = cap ? SPDK_KVDEV_IO_STATUS_ABORTED : SPDK_KVDEV_IO_STATUS_FAILED;
+		goto out;
 	}
 	if (results[0].kind != WASMTIME_I32) {
-		return SPDK_KVDEV_IO_STATUS_FAILED;
+		goto out;
 	}
 
 	{
@@ -1640,7 +1654,7 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 		uint32_t copy;
 
 		if ((size_t)WASM_RES_OFF + produced > mem_size) {
-			return SPDK_KVDEV_IO_STATUS_FAILED;
+			goto out;
 		}
 		*result_len = produced;
 		copy = (uint32_t)spdk_min(produced, out_len);
@@ -1650,6 +1664,19 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 		status = (produced > out_len) ?
 			 SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL :
 			 SPDK_KVDEV_IO_STATUS_SUCCESS;
+	}
+
+out:
+	/* Disarm the ticker before deleting the store/instance if a goto skipped the
+	 * normal disarm (e.g. context_set_fuel failed after arming — cannot happen as
+	 * arming is after, but keep it defensive against future reorders). */
+	if (epoch_armed) {
+		nkvx_wasm_epoch_unregister(warm->engine);
+	}
+	/* Tear down the per-Exec store+instance so the NEXT Exec starts clean (resets
+	 * globals + data segments). The warm engine + compiled module survive. */
+	if (store != NULL) {
+		api->store_delete(store);
 	}
 	return status;
 }

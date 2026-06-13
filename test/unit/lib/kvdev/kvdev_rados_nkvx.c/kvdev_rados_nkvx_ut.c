@@ -1490,6 +1490,85 @@ test_nkvx_tb3_miss_without_bytes_fails_closed(void)
 }
 
 /*
+ * spdk-yc1: warm-instance STATE ISOLATION between Execs. The warm cache reuses the
+ * expensive engine + compiled module across Execs of the same (module,object), but
+ * each Exec now gets a FRESH store+instance, so wasm globals / declared data reset
+ * between runs and module state does not leak.
+ *
+ * statefulglobal.wasm keeps a mutable counter (declared init 0): each run reports
+ * the value it OBSERVED (before incrementing). Run it twice warm against the SAME
+ * (module,object):
+ *   - WITH per-Exec re-instantiation (the fix): run 2 observes 0 (clean instance) —
+ *     even though it is a warm HIT (warm_hits increments, engine+module reused).
+ *   - WITHOUT (instance reused, the old behaviour): run 2 would observe 1 (leak).
+ *
+ * Fail-before/after: revert nkvx_run_on_object_locked to caching+reusing the store/
+ * instance and run 2 observes 1 -> the run2==0 assert fails. With the fix run 2
+ * observes 0. The warm_hits assert proves the engine/module are still reused (this
+ * is genuine warm reuse with a reset instance, not a cold rebuild).
+ */
+static void
+test_nkvx_yc1_warm_state_isolation(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "0", 1);
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> yc1 state-isolation test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	static const uint8_t obj[] = "isolation-object";
+	struct fake_fill fill = { .bytes = obj, .len = sizeof(obj), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	uint64_t run1 = 0xdead, run2 = 0xdead;
+	struct kvdev_rados_nkvx_wasm_stats st;
+
+	/* ---- Run 1 (cold build): observes the declared-init counter (0). ---- */
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("statefulglobal", NULL, "isoK", sizeof(obj),
+			fake_cold_fill, &fill, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(rlen == sizeof(uint64_t));
+	memcpy(&run1, out, sizeof(run1));
+	CU_ASSERT(run1 == 0);				/* fresh instance starts at 0 */
+
+	/* ---- Run 2 (WARM hit, fresh instance): must ALSO observe 0. ---- */
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("statefulglobal", NULL, "isoK", sizeof(obj),
+			fake_cold_fill, &fill, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	memcpy(&run2, out, sizeof(run2));
+
+	kvdev_rados_nkvx_wasm_get_stats(&st);
+	/* Load-bearing: run 2 did NOT see run 1's mutation -> state was reset. */
+	CU_ASSERT(run2 == 0);
+	CU_ASSERT(run2 == run1);
+	/* Still a genuine WARM reuse of the engine+compiled module (not a cold rebuild):
+	 * the 2nd Exec re-instantiated from the cached engine+module, not recompiled.
+	 * (statefulglobal declares 2 pages, so on this small object it uses the private
+	 * fallback rather than the zero-copy alias — the zero-copy path is proven
+	 * elsewhere; here the load-bearing property is the per-Exec state RESET.) */
+	CU_ASSERT(st.warm_hits == 1);
+	CU_ASSERT(fill.calls == 1);			/* object cold-filled once */
+	printf("\n    yc1 state isolation: run1=%llu run2=%llu (reset, no leak); "
+	       "warm_hits=%llu (engine+module reused)\n",
+	       (unsigned long long)run1, (unsigned long long)run2,
+	       (unsigned long long)st.warm_hits);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: yc1 state-isolation test is a no-op\n");
+#endif
+}
+
+/*
  * spdk-0k1: the epoch ticker thread has a teardown hook and is JOINED on executor
  * stop -- no 1-thread leak across a stop/restart, no double-start, and the warm
  * epoch arming still works after a restart.
@@ -1626,6 +1705,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_tb3_hash_mismatch_rejected);
 	CU_ADD_TEST(suite, test_nkvx_tb3_verify_run_and_module_cache_hit);
 	CU_ADD_TEST(suite, test_nkvx_tb3_miss_without_bytes_fails_closed);
+	CU_ADD_TEST(suite, test_nkvx_yc1_warm_state_isolation);
 	CU_ADD_TEST(suite, test_nkvx_epoch_ticker_teardown);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
 

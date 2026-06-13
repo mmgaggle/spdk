@@ -140,9 +140,12 @@ int kvdev_rados_nkvx_wasm_run(const char *name,
  *   - The cached buffer backs the module's wasm linear memory ZERO-COPY via the
  *     wasmtime custom MemoryCreator (on-demand strategy, ADR-0013) — no gather /
  *     bounce copy-in. wasmtime_memory_data() aliases the cache buffer.
- *   - The instantiated wasm instance (engine/store/module/instance) is cached
- *     keyed by (module, obj_key) and REUSED on a subsequent Exec of the same
- *     pair (warm instance).
+ *   - The EXPENSIVE artifacts (engine + compiled module) are cached keyed by
+ *     (module, obj_key) and REUSED on a subsequent Exec of the same pair (warm
+ *     hit). For STATE ISOLATION (spdk-yc1) each Exec instantiates a FRESH
+ *     store+instance from those warm artifacts and tears it down afterwards, so
+ *     wasm globals / declared data segments reset between Execs and module state
+ *     never leaks from one Exec to the next; the costly compile stays warm.
  *
  * \c fill is called with the executor-allocated, page-rounded cache buffer and
  * its capacity; it must write up to \c cap bytes and set \c *out_len to the true

@@ -111,6 +111,25 @@ clang --target=wasm32 -nostdlib -O2 \
   -o pageprobe.wasm pageprobe.c
 ```
 
+## statefulglobal.wasm (warm-instance state isolation, spdk-yc1)
+
+Deliberately STATEFUL: keeps a mutable counter (declared init 0) and each run
+reports the value it observed BEFORE incrementing it. Run twice warm against the
+same `(module, object)`, the second run MUST also observe 0 — because the executor
+re-instantiates a fresh store+instance per Exec (resetting wasm globals + declared
+data segments) while keeping the expensive engine + compiled module warm. Reusing
+the same instance would let the second run observe 1 (state leak). Exercised by
+`test_nkvx_yc1_warm_state_isolation`. (Declares 2 pages, so on a small object it
+uses the private-fallback memory; the zero-copy alias is proven by other modules.)
+Source: `statefulglobal.c`.
+
+```sh
+clang --target=wasm32 -nostdlib -O2 \
+  -Wl,--no-entry -Wl,--export=statefulglobal \
+  -Wl,--initial-memory=131072 -Wl,--export-memory \
+  -o statefulglobal.wasm statefulglobal.c
+```
+
 ## growcap.wasm (store-limiter cap proof, spdk-90x)
 
 Grows a FIXED, BOUNDED number of pages (1024 = 64 MiB) then returns SUCCESS.
