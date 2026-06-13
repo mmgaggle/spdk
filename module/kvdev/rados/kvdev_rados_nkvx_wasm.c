@@ -307,16 +307,26 @@ nkvx_wasm_api(void)
  * On-demand (ADR-0013) means at most one engine is live at a time on the single
  * executor worker, so the ticker tracks a single "current engine" pointer under a
  * mutex. nkvx_wasm_epoch_register()/_unregister() bracket each run; the thread is
- * started once (lazily) and runs for process lifetime (it is a cheap sleeper and
- * there is no teardown hook on this path). If a second engine ever overlapped,
+ * started once (lazily) on the first armed run. If a second engine ever overlapped,
  * the register call would simply replace the pointer — acceptable because each
  * run also has its own fuel ceiling as a second, independent guard.
+ *
+ * TEARDOWN (spdk-0k1): the ticker is NOT a process-lifetime leak. Executor stop
+ * (kvdev_rados_nkvx_stop -> kvdev_rados_nkvx_wasm_runtime_teardown) calls
+ * nkvx_wasm_epoch_stop(), which signals the thread to exit and JOINS it, clearing
+ * \c started so a later executor (re)start lazily re-creates a fresh ticker — no
+ * leaked thread on restart, no double-start. The loop waits on the condvar with a
+ * tick-interval timeout (instead of a bare nanosleep) so stop is observed promptly
+ * and the thread never touches an engine after stop (the join completes before the
+ * caller tears any engine down). The warm-path epoch arming (spdk-ii0 D3) is
+ * unaffected: register lazily restarts the ticker after a stop/restart.
  */
 static struct {
 	pthread_mutex_t		mutex;
 	pthread_cond_t		cond;
 	pthread_t		tid;
 	bool			started;
+	bool			stop;		/* set by nkvx_wasm_epoch_stop to exit */
 	wasm_engine_t		*engine;	/* engine to tick, or NULL when idle */
 	const struct nkvx_wasm_api *api;
 } g_epoch = {
@@ -329,23 +339,35 @@ nkvx_wasm_epoch_thread(void *arg)
 {
 	(void)arg;
 
-	for (;;) {
+	pthread_mutex_lock(&g_epoch.mutex);
+	while (!g_epoch.stop) {
 		struct timespec ts;
 
-		/* Sleep one tick interval (NKVX_WASM_EPOCH_TICK_NS). nanosleep is
-		 * fine here; this thread does nothing else. */
-		ts.tv_sec = (time_t)(NKVX_WASM_EPOCH_TICK_NS / 1000000000ull);
-		ts.tv_nsec = (long)(NKVX_WASM_EPOCH_TICK_NS % 1000000000ull);
-		nanosleep(&ts, NULL);
+		/* Wait up to one tick interval, but wake immediately on stop. Using
+		 * the condvar (vs a bare nanosleep) makes teardown prompt and bounds
+		 * the join latency to at most one tick. clock_gettime + timedwait is
+		 * the portable cancellable sleep. */
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_nsec += (long)(NKVX_WASM_EPOCH_TICK_NS % 1000000000ull);
+		ts.tv_sec += (time_t)(NKVX_WASM_EPOCH_TICK_NS / 1000000000ull);
+		if (ts.tv_nsec >= 1000000000L) {
+			ts.tv_nsec -= 1000000000L;
+			ts.tv_sec += 1;
+		}
+		pthread_cond_timedwait(&g_epoch.cond, &g_epoch.mutex, &ts);
 
-		pthread_mutex_lock(&g_epoch.mutex);
+		if (g_epoch.stop) {
+			break;
+		}
 		if (g_epoch.engine != NULL && g_epoch.api != NULL) {
 			/* Bump the epoch of the in-flight run's engine. A run that has
-			 * set an epoch deadline traps once its tick budget elapses. */
+			 * set an epoch deadline traps once its tick budget elapses.
+			 * Held under the mutex, so a concurrent _unregister (which also
+			 * takes the mutex) can never let us touch a torn-down engine. */
 			g_epoch.api->engine_increment_epoch(g_epoch.engine);
 		}
-		pthread_mutex_unlock(&g_epoch.mutex);
 	}
+	pthread_mutex_unlock(&g_epoch.mutex);
 	return NULL;
 }
 
@@ -355,6 +377,7 @@ nkvx_wasm_epoch_register(const struct nkvx_wasm_api *api, wasm_engine_t *engine)
 {
 	pthread_mutex_lock(&g_epoch.mutex);
 	if (!g_epoch.started) {
+		g_epoch.stop = false;
 		if (pthread_create(&g_epoch.tid, NULL, nkvx_wasm_epoch_thread, NULL) == 0) {
 			g_epoch.started = true;
 		} else {
@@ -376,6 +399,55 @@ nkvx_wasm_epoch_unregister(wasm_engine_t *engine)
 		g_epoch.engine = NULL;
 	}
 	pthread_mutex_unlock(&g_epoch.mutex);
+}
+
+/*
+ * Stop and JOIN the epoch ticker thread (spdk-0k1). Called from the executor
+ * teardown path. Idempotent: a no-op when the ticker was never started. Clears
+ * \c started so a later executor restart re-creates a fresh ticker (no leak, no
+ * double-start). The join guarantees the thread is gone before the caller deletes
+ * any engine, so the ticker never advances a stale/freed engine after stop. The
+ * engine pointer is cleared first so a wakeup-before-stop tick is a safe no-op.
+ */
+static void
+nkvx_wasm_epoch_stop(void)
+{
+	pthread_t tid;
+	bool joinable;
+
+	pthread_mutex_lock(&g_epoch.mutex);
+	joinable = g_epoch.started;
+	if (joinable) {
+		g_epoch.engine = NULL;
+		g_epoch.api = NULL;
+		g_epoch.stop = true;
+		tid = g_epoch.tid;
+		pthread_cond_broadcast(&g_epoch.cond);
+	}
+	pthread_mutex_unlock(&g_epoch.mutex);
+
+	if (joinable) {
+		pthread_join(tid, NULL);
+		pthread_mutex_lock(&g_epoch.mutex);
+		g_epoch.started = false;
+		g_epoch.stop = false;
+		pthread_mutex_unlock(&g_epoch.mutex);
+	}
+}
+
+/*
+ * Tear down process-wide wasm runtime resources owned by the executor (spdk-0k1).
+ * Currently: stop+join the epoch ticker thread. Called from kvdev_rados_nkvx_stop
+ * so the ticker does not outlive the executor (no 1-thread leak on a restart). The
+ * dlopen'd libwasmtime handle and the compiled-module/object caches are
+ * deliberately NOT dropped here (the caches have their own reset entry points and
+ * may legitimately survive an executor cycle); this hook is specifically the
+ * thread-lifetime teardown the ticker needs.
+ */
+void
+kvdev_rados_nkvx_wasm_runtime_teardown(void)
+{
+	nkvx_wasm_epoch_stop();
 }
 
 /* Parse a uint64 env override; returns def when unset/empty/unparseable. */
@@ -2187,6 +2259,12 @@ kvdev_rados_nkvx_wasm_cache_invalidate(const char *obj_key)
 {
 	(void)obj_key;
 	/* No cache in the stub build. */
+}
+
+void
+kvdev_rados_nkvx_wasm_runtime_teardown(void)
+{
+	/* No epoch ticker / runtime in the stub build. */
 }
 
 #endif /* SPDK_CONFIG_WASM */

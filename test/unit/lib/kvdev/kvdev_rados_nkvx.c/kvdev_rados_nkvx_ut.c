@@ -1406,6 +1406,92 @@ test_nkvx_tb3_miss_without_bytes_fails_closed(void)
 #endif
 }
 
+/*
+ * spdk-0k1: the epoch ticker thread has a teardown hook and is JOINED on executor
+ * stop -- no 1-thread leak across a stop/restart, no double-start, and the warm
+ * epoch arming still works after a restart.
+ *
+ * The ticker is created lazily on the first epoch-armed run. We drive a real wasm
+ * run with the epoch cap ENABLED (a short tick budget) so the ticker starts, then
+ * tear the executor down and assert the ticker has been joined (g_epoch.started is
+ * cleared and the thread exited). We then RESTART and arm again to prove the lazy
+ * restart works (the warm-path epoch arming survives a stop/restart). When the wasm
+ * runtime is unavailable the run can't arm the ticker, so the test asserts the
+ * benign "never started -> teardown is a no-op" invariant instead.
+ *
+ * Fail-before: without nkvx_wasm_epoch_stop the ticker thread is never joined, so
+ * g_epoch.started stays true after teardown (and the thread leaks); this test's
+ * post-teardown assert fails.
+ */
+static void
+test_nkvx_epoch_ticker_teardown(void)
+{
+#if defined(SPDK_CONFIG_WASM) && defined(NKVX_UT_WASM_DIR)
+	struct fake_fill fill;
+	static const uint8_t obj[] = "x";
+	uint8_t out[16];
+	uint32_t rlen = 0;
+
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	/* Epoch ENABLED with a generous budget so a normal module completes but the
+	 * ticker is armed (and thus lazily started). Fuel generous too. */
+	setenv("SPDK_NKVX_WASM_FUEL", "100000000", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "100", 1);
+	unsetenv("SPDK_NKVX_WASM_MAX_MEMORY");
+
+	if (!nkvx_wasm_runtime_available()) {
+		/* No runtime -> the ticker is never armed/started. Teardown must still be
+		 * a safe no-op and leave started==false. */
+		CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+		kvdev_rados_nkvx_stop();
+		CU_ASSERT(g_epoch.started == false);
+		printf("\n    epoch-ticker teardown: runtime unavailable -> ticker never started "
+		       "(teardown no-op, ok)\n");
+		unsetenv("SPDK_NKVX_WASM_FUEL");
+		unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+
+	/* An epoch-armed run starts the ticker lazily. */
+	fill = (struct fake_fill){ .bytes = obj, .len = sizeof(obj), .calls = 0 };
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "tickK", sizeof(obj),
+			fake_cold_fill, &fill, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(g_epoch.started == true);	/* ticker is up */
+
+	/* Teardown JOINS the ticker (no leak) and clears started. */
+	kvdev_rados_nkvx_wasm_cache_reset();
+	kvdev_rados_nkvx_stop();
+	CU_ASSERT(g_epoch.started == false);	/* joined -> no leaked ticker thread */
+	CU_ASSERT(g_epoch.engine == NULL);
+	printf("\n    epoch-ticker teardown: started after armed run, JOINED on stop "
+	       "(started=%d, no leak)\n", g_epoch.started);
+
+	/* RESTART: a fresh executor + a fresh armed run re-creates the ticker (no
+	 * double-start crash; warm-path epoch arming still works post-restart). */
+	CU_ASSERT(kvdev_rados_nkvx_start() == 0);
+	fill = (struct fake_fill){ .bytes = obj, .len = sizeof(obj), .calls = 0 };
+	memset(out, 0, sizeof(out));
+	CU_ASSERT(kvdev_rados_nkvx_wasm_run_cached("checksum", NULL, "tickK2", sizeof(obj),
+			fake_cold_fill, &fill, out, sizeof(out), &rlen) ==
+		  SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(g_epoch.started == true);	/* lazily restarted */
+	kvdev_rados_nkvx_wasm_cache_reset();
+	kvdev_rados_nkvx_stop();
+	CU_ASSERT(g_epoch.started == false);	/* joined again */
+	printf("    epoch-ticker teardown: restart re-armed the ticker and re-joined it (ok)\n");
+
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: epoch-ticker teardown test is a no-op\n");
+#endif
+}
+
 static void
 test_nkvx_dispatch_without_thread_fails(void)
 {
@@ -1456,6 +1542,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_tb3_hash_mismatch_rejected);
 	CU_ADD_TEST(suite, test_nkvx_tb3_verify_run_and_module_cache_hit);
 	CU_ADD_TEST(suite, test_nkvx_tb3_miss_without_bytes_fails_closed);
+	CU_ADD_TEST(suite, test_nkvx_epoch_ticker_teardown);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
 
 	/* One SPDK thread stands in for the reactor; the executor worker is a real

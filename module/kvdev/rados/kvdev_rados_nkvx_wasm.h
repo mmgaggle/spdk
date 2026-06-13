@@ -221,6 +221,15 @@ int kvdev_rados_nkvx_wasm_run_pinned(const char *name,
 void kvdev_rados_nkvx_wasm_cache_invalidate(const char *obj_key);
 
 /*
+ * Tear down process-wide wasm runtime resources owned by the executor (spdk-0k1):
+ * stop and JOIN the background epoch ticker thread so it does not outlive the
+ * executor (no 1-thread leak on an executor stop/restart). Idempotent; a no-op in
+ * the stub build and when the ticker was never started. Called from
+ * kvdev_rados_nkvx_stop. A later executor restart lazily re-creates a fresh ticker.
+ */
+void kvdev_rados_nkvx_wasm_runtime_teardown(void);
+
+/*
  * Test-only introspection counters (TB4 acceptance proof). Defined unconditionally
  * so the unit test links them in both --with-wasm and --without-wasm builds.
  *   - cold_fills:        number of times a fill callback actually ran (cold fill).
