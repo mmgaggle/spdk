@@ -1484,8 +1484,12 @@ union spdk_nvme_cmd_cdw13 {
 		/*
 		 * Vendor extension (ADR-0005): Operation ID for a KV Exec. A small
 		 * integer that names the server-side operation to run (never a
-		 * class/method string on the data path). Built-ins in the in-memory
-		 * kvdev: 1 = echo input->output, 2 = append input to stored value.
+		 * class/method string on the data path; the binding is resolved from
+		 * the per-namespace allowlist by op_id). The data-object key does NOT
+		 * ride the inline CDW2/3/14/15 slots for Exec (ADR-0014) -- it is
+		 * length-prefixed at the head of the DPTR request payload. Built-ins in
+		 * the in-memory kvdev: 1 = echo input->output, 2 = append input to
+		 * stored value.
 		 */
 		uint32_t op_id     : 32;
 	} kv_exec;
@@ -1889,15 +1893,19 @@ enum spdk_nvme_kv_opcode {
 	 * blob host->controller and an output blob controller->host through the
 	 * single data buffer. KV Exec runs an op-ID-selected operation
 	 * server-side. CDW layout (see lib/nvme/nvme_kv.c / lib/nvmf/ctrlr_kvdev.c):
-	 *   - Key:               CDW2/3 (low 8 bytes), CDW14/15 (high 8 bytes)
-	 *   - Key length:        CDW11 bits 7:0 (kv.kl)
-	 *   - Input length:      CDW10 (bytes of input gathered to the device)
-	 *   - Output buffer size:CDW12 (max bytes the device may scatter back)
-	 *   - Operation ID:      CDW13
-	 * The single data buffer holds the input on submit and receives the
-	 * output on completion; the host sizes it to max(input_len, output_size).
-	 * The true output length is returned in completion DW0, with the same
-	 * truncation contract as Retrieve (device fills up to the host buffer).
+	 *   - Request payload len:CDW10 (TOTAL bytes of the request payload below)
+	 *   - Output buffer size: CDW12 (max bytes the device may scatter back)
+	 *   - Operation ID:       CDW13
+	 * UNLIKE the canonical KV ops, the data-object KEY does NOT ride the inline
+	 * CDW2/3/14/15 slots or use CDW11 kv.kl for Exec (ADR-0014 Option 1): those
+	 * slots are RESERVED/unused for opcode 0x83. Instead the key is carried
+	 * length-prefixed at the HEAD of the request payload, so it spans both 32B
+	 * content hashes and RADOS names up to 255 bytes (the 16B inline cap cannot):
+	 *   payload = [u16 key_len (1..255)][key_len key bytes][input bytes ...]
+	 * The single data buffer holds this request on submit and is overwritten with
+	 * the output on completion (bidirectional; one DMA). The true output length is
+	 * returned in completion DW0, with the same truncation contract as Retrieve
+	 * (device fills up to the host buffer).
 	 */
 	SPDK_NVME_OPC_KV_EXEC				= 0x83,
 };

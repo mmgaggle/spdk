@@ -3,6 +3,7 @@
  */
 
 #include "spdk/kvdev.h"
+#include "spdk/assert.h"
 #include "spdk/log.h"
 #include "spdk/thread.h"
 #include "spdk/string.h"
@@ -314,15 +315,24 @@ spdk_kvdev_list(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 
 int
 spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
-		const void *key, uint8_t key_len, uint32_t op_id,
-		const char *binding,
+		const void *key, uint8_t key_len, uint32_t op_id, bool read_only,
+		const struct spdk_kv_exec_binding *binding,
 		const void *input, uint32_t input_len,
 		void *output_buf, uint32_t output_buf_len,
 		spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
 {
 	struct spdk_kvdev *kvdev = desc->kvdev;
 
-	if (key == NULL || key_len < SPDK_KVDEV_KEY_MIN_LEN || key_len > kvdev->caps.max_key_len) {
+	/*
+	 * KV Exec keys ride length-prefixed in the request payload (ADR-0014), so
+	 * they are bounded by SPDK_KVDEV_EXEC_KEY_MAX_LEN (255: 32B hashes + RADOS
+	 * names), NOT the spec's 16-byte inline cap that gates Store/Retrieve. The
+	 * key_len field is a uint8_t whose full range (<=255) is exactly that bound,
+	 * so only the lower bound needs an explicit check here.
+	 */
+	SPDK_STATIC_ASSERT(SPDK_KVDEV_EXEC_KEY_MAX_LEN == UINT8_MAX,
+			   "exec key bound must match uint8_t range");
+	if (key == NULL || key_len < SPDK_KVDEV_KEY_MIN_LEN) {
 		return -EINVAL;
 	}
 
@@ -333,7 +343,7 @@ spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 		return -ENOTSUP;
 	}
 
-	return kvdev->fn_table->exec(ch, key, key_len, op_id, binding, input, input_len,
+	return kvdev->fn_table->exec(ch, key, key_len, op_id, read_only, binding, input, input_len,
 				     output_buf, output_buf_len, cb_fn, cb_arg);
 }
 

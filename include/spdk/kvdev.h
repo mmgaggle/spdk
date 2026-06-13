@@ -33,9 +33,69 @@ extern "C" {
 /** Maximum length of a key in bytes (per the NVMe Key-Value Command Set Specification). */
 #define SPDK_KVDEV_KEY_MAX_LEN 16
 
+/*
+ * Maximum KV Exec data-object key length in bytes (ADR-0014). KV Exec carries
+ * its key length-prefixed in the DPTR payload, NOT in the spec's 16-byte inline
+ * CDW slots, so it spans both 32-byte content hashes and RADOS object names up
+ * to 255 bytes. This bound applies ONLY to the Exec key; Store/Retrieve/etc.
+ * remain capped at SPDK_KVDEV_KEY_MAX_LEN.
+ */
+#define SPDK_KVDEV_EXEC_KEY_MAX_LEN 255
+
 struct spdk_kvdev;
 struct spdk_kvdev_desc;
 struct spdk_kvdev_module;
+
+/** Length of an artifact content hash (SHA-256) in bytes. */
+#define SPDK_KV_EXEC_SHA256_LEN 32
+
+/**
+ * KV Exec module runtime kind (ADR-0012, runtime-agnostic binding). Selects the
+ * backend that executes a bound module.
+ */
+enum spdk_kv_exec_runtime {
+	/** Unset/invalid. */
+	SPDK_KV_EXEC_RUNTIME_NONE	= 0,
+	/** Sandboxed wasmtime executor (rados-nkvx, the v1 runtime). */
+	SPDK_KV_EXEC_RUNTIME_WASM	= 1,
+	/**
+	 * Legacy Ceph object-class (cls) method. Preserved for the in-tree
+	 * "class:method" migration path; (module_namespace, module_key) carry the
+	 * (class, method) pair and the sha256 anchor is unused.
+	 */
+	SPDK_KV_EXEC_RUNTIME_CLS	= 2,
+};
+
+/**
+ * Structured KV Exec binding (ADR-0010 / ADR-0012 / ADR-0014).
+ *
+ * Replaces the prototype's opaque "class:method" string. Resolved from the
+ * per-namespace allowlist by the NVMf control plane and threaded into the
+ * backend exec op. Field roles:
+ *   - \c runtime selects the executor backend.
+ *   - \c sha256 / \c sha256_valid is the SOLE authorization + integrity anchor
+ *     (ADR-0010): a fetched artifact whose content hash does not match is
+ *     rejected. \c sha256_valid is false only on the legacy cls path.
+ *   - (\c module_namespace, \c module_key) is the cold-fetch locator, consulted
+ *     ONLY on a content-cache miss; it never participates in authorization.
+ *   - \c caps is a per-invocation capability bitmask (reserved; 0 in v1).
+ *
+ * Strings are NUL-terminated and owned by the caller (the namespace allowlist);
+ * a backend must copy anything it needs to outlive the call.
+ */
+struct spdk_kv_exec_binding {
+	enum spdk_kv_exec_runtime	runtime;
+	/** Cold-fetch locator namespace (e.g. RADOS pool/namespace). May be NULL. */
+	const char			*module_namespace;
+	/** Cold-fetch locator key (e.g. module object name / cls method). May be NULL. */
+	const char			*module_key;
+	/** Artifact content hash; the auth/integrity anchor (ADR-0010). */
+	uint8_t				sha256[SPDK_KV_EXEC_SHA256_LEN];
+	/** True when sha256 carries a real hash (false on the legacy cls path). */
+	bool				sha256_valid;
+	/** Per-invocation capability bitmask (reserved; 0 in v1). */
+	uint64_t			caps;
+};
 
 /**
  * Status codes returned via kvdev completions.  These are deliberately a small
@@ -69,6 +129,16 @@ enum spdk_kvdev_io_status {
 	 * layer maps it to the NVMe "command aborted" status.
 	 */
 	SPDK_KVDEV_IO_STATUS_ABORTED		= -8,
+	/**
+	 * A mutating operation was attempted on a read-only namespace. KV Exec is
+	 * permitted on a read-only namespace because the executor is read-only by
+	 * contract (ADR-0014), but that invariant is ENFORCED at the mutation
+	 * point: a backend that would write (e.g. a mutating built-in or a write
+	 * runtime/module) rejects the op with this status when \c read_only is set,
+	 * rather than the gate ASSUMING no Exec mutates. The NVMf layer maps it to
+	 * Command-Specific "Attempted Write to Read Only Range".
+	 */
+	SPDK_KVDEV_IO_STATUS_READ_ONLY		= -9,
 };
 
 /**
@@ -296,17 +366,25 @@ struct spdk_kvdev_fn_table {
 	 * \param ch io_channel obtained from get_io_channel().
 	 * \param key Key bytes (key_len in [1,16]).
 	 * \param op_id Operation identifier selecting the server-side operation.
-	 * \param binding Opaque binding descriptor resolved from the allowlist
-	 *                entry for \c op_id (KVX-3). NULL when the entry has none.
-	 *                The in-memory module ignores it; the librados module
-	 *                parses it as "class:method".
+	 * \param binding Structured binding resolved from the allowlist entry for
+	 *                \c op_id (ADR-0010/0012/0014). NULL when the entry has none.
+	 *                The in-memory module ignores it; the librados module routes
+	 *                on \c runtime (wasm -> nkvx, cls -> object-class method).
+	 * \param read_only The namespace is read-only. The backend MUST reject any
+	 *                  Exec path that could mutate stored state (a mutating
+	 *                  built-in op, or a write-capable runtime/module) with
+	 *                  SPDK_KVDEV_IO_STATUS_READ_ONLY. Non-mutating Exec (echo,
+	 *                  the read-only nkvx executor) still runs. This enforces
+	 *                  the "Exec never mutates" invariant at the mutation point
+	 *                  (ADR-0014) instead of assuming it at the opcode gate.
 	 * \param input Input blob bytes (may be NULL when input_len is 0).
 	 * \param input_len Length of \c input in bytes.
 	 * \param output_buf Buffer that receives the output blob.
 	 * \param output_buf_len Capacity of \c output_buf in bytes.
 	 */
 	int (*exec)(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
-		    uint32_t op_id, const char *binding,
+		    uint32_t op_id, bool read_only,
+		    const struct spdk_kv_exec_binding *binding,
 		    const void *input, uint32_t input_len,
 		    void *output_buf, uint32_t output_buf_len,
 		    spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
@@ -516,17 +594,21 @@ int spdk_kvdev_list(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
  * reports the true output length; if it exceeds \c output_buf_len the status is
  * SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL (output_buf_len bytes still copied).
  *
- * \param binding Opaque binding descriptor the NVMf layer resolved from the
- *                allowlist entry for \c op_id (KVX-3); passed through to the
+ * \param binding Structured binding the NVMf layer resolved from the allowlist
+ *                entry for \c op_id (ADR-0010/0012/0014); passed through to the
  *                backend exec op. May be NULL.
+ * \param read_only The namespace is read-only; forwarded to the backend so it
+ *                  rejects any mutating Exec path with
+ *                  SPDK_KVDEV_IO_STATUS_READ_ONLY (ADR-0014 invariant enforced
+ *                  at the mutation point).
  *
  * \return 0 if the request was accepted (a completion will fire), -ENOTSUP if
  *         the backend has no exec op (no completion fires), or another negative
  *         errno if it could not be submitted.
  */
 int spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
-		    const void *key, uint8_t key_len, uint32_t op_id,
-		    const char *binding,
+		    const void *key, uint8_t key_len, uint32_t op_id, bool read_only,
+		    const struct spdk_kv_exec_binding *binding,
 		    const void *input, uint32_t input_len,
 		    void *output_buf, uint32_t output_buf_len,
 		    spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);

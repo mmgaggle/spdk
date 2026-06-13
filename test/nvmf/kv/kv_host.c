@@ -204,8 +204,27 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	trid.trtype = SPDK_NVME_TRANSPORT_VFIOUSER;
-	snprintf(trid.traddr, sizeof(trid.traddr), "%s", argv[1]);
+	/* Transport select: KV_HOST_TRTYPE=tcp drives NVMe/TCP (for the E810
+	 * over-the-wire Exec test); default stays vfio-user (argv[1] = socket dir). */
+	{
+		const char *tt = getenv("KV_HOST_TRTYPE");
+		if (tt != NULL && (strcasecmp(tt, "tcp") == 0 || strcasecmp(tt, "rdma") == 0)) {
+			const char *a = getenv("KV_HOST_ADDR");
+			const char *p = getenv("KV_HOST_PORT");
+			const char *n = getenv("KV_HOST_NQN");
+			trid.trtype = (strcasecmp(tt, "rdma") == 0) ?
+				SPDK_NVME_TRANSPORT_RDMA : SPDK_NVME_TRANSPORT_TCP;
+			trid.adrfam = SPDK_NVMF_ADRFAM_IPV4;
+			snprintf(trid.traddr, sizeof(trid.traddr), "%s", a ? a : "127.0.0.1");
+			snprintf(trid.trsvcid, sizeof(trid.trsvcid), "%s", p ? p : "4420");
+			snprintf(trid.subnqn, sizeof(trid.subnqn), "%s", n ? n : "");
+			fprintf(stderr, "kv_host: NVMe/%s -> %s:%s nqn=%s\n",
+				tt, trid.traddr, trid.trsvcid, trid.subnqn);
+		} else {
+			trid.trtype = SPDK_NVME_TRANSPORT_VFIOUSER;
+			snprintf(trid.traddr, sizeof(trid.traddr), "%s", argv[1]);
+		}
+	}
 
 	if (spdk_nvme_probe(&trid, &ctx, probe_cb, attach_cb, NULL) != 0 || ctx.ctrlr == NULL) {
 		fprintf(stderr, "spdk_nvme_probe() failed for '%s'\n", trid.traddr);

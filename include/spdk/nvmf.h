@@ -17,6 +17,7 @@
 #include "spdk/env.h"
 #include "spdk/nvme.h"
 #include "spdk/nvmf_spec.h"
+#include "spdk/kvdev.h"
 #include "spdk/queue.h"
 #include "spdk/uuid.h"
 
@@ -1374,13 +1375,25 @@ uint32_t spdk_nvmf_subsystem_add_kv_ns(struct spdk_nvmf_subsystem *subsystem,
 				       bool read_only);
 
 /**
- * One entry of a namespace's KV Exec allowlist (vendor extension, ADR-0005).
+ * One entry of a namespace's KV Exec allowlist (vendor extension, ADR-0005;
+ * structured binding per ADR-0010/0012/0014).
+ *
+ * The opaque "class:method" string of the prototype is replaced by a typed
+ * binding. \c op_id is the data-plane selector. \c binding (when non-NULL) is the
+ * resolved structured binding: \c runtime selects the backend, \c module_namespace
+ * / \c module_key is the cold-fetch locator, and \c sha256 (gated by
+ * \c sha256_valid) is the auth/integrity anchor. A NULL \c binding means the
+ * op-ID is allowed with no binding (the in-memory backend selects on op_id alone).
+ *
+ * For migration, the control plane (RPC layer) accepts the legacy "class:method"
+ * string and maps it to a binding with runtime == SPDK_KV_EXEC_RUNTIME_CLS and
+ * (module_namespace, module_key) = (class, method); see lib/nvmf/nvmf_rpc.c.
  */
 struct spdk_nvmf_kv_exec_allow {
 	/** Permitted KV Exec operation ID. */
-	uint32_t	op_id;
-	/** Optional opaque binding descriptor (NULL if unset). */
-	const char	*binding;
+	uint32_t			op_id;
+	/** Resolved structured binding, or NULL when the entry has none. */
+	const struct spdk_kv_exec_binding	*binding;
 };
 
 /**
@@ -1407,14 +1420,18 @@ int spdk_nvmf_ns_set_kv_exec_allowlist(struct spdk_nvmf_subsystem *subsystem, ui
 /**
  * Get the KV Exec allowlist of a namespace (vendor extension, ADR-0005).
  *
- * On success \c *entries points at the namespace's internal entry array (valid
- * until the allowlist is next modified or the namespace is destroyed; do not
- * free) and \c *count is the number of entries.
+ * On success \c *entries points at a single caller-owned block (the public
+ * entry array followed by the bindings it references); the caller must
+ * \c free(*entries) to release it. The locator strings inside each returned
+ * binding still alias the namespace's internal entries and stay valid only
+ * until the allowlist is next modified or the namespace is destroyed, so the
+ * block must be consumed before either happens. \c *count is the number of
+ * entries.
  *
  * \param subsystem Subsystem owning the namespace.
  * \param nsid Namespace ID.
- * \param entries Output: pointer to the internal entry array (may be NULL when
- *                count is 0).
+ * \param entries Output: pointer to a caller-owned entry block to be freed with
+ *                free() (set to NULL when count is 0).
  * \param count Output: number of entries.
  *
  * \return 0 on success, negative errno on failure (e.g. -EINVAL if not a KV ns).

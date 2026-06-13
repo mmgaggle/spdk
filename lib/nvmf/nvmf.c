@@ -13,6 +13,7 @@
 #include "spdk/nvmf.h"
 #include "spdk/endian.h"
 #include "spdk/string.h"
+#include "spdk/hexlify.h"
 #include "spdk/log.h"
 #include "spdk_internal/usdt.h"
 
@@ -896,16 +897,42 @@ nvmf_write_ns_kv_exec_allowlist_config(struct spdk_json_write_ctx *w,
 	spdk_json_write_named_uint32(w, "nsid", spdk_nvmf_ns_get_id(ns));
 	spdk_json_write_named_array_begin(w, "allowlist");
 	for (i = 0; i < count; i++) {
+		const struct spdk_kv_exec_binding *b = entries[i].binding;
+
 		spdk_json_write_object_begin(w);
 		spdk_json_write_named_uint32(w, "op_id", entries[i].op_id);
-		if (entries[i].binding != NULL) {
-			spdk_json_write_named_string(w, "binding", entries[i].binding);
+		/* Emit the structured binding (ADR-0014) so load_config reconstructs it
+		 * via the structured RPC fields, not the deprecated 'binding' string. */
+		if (b != NULL) {
+			spdk_json_write_named_string(w, "runtime",
+						     b->runtime == SPDK_KV_EXEC_RUNTIME_WASM ? "wasm" :
+						     b->runtime == SPDK_KV_EXEC_RUNTIME_CLS ? "cls" : "none");
+			if (b->module_namespace != NULL) {
+				spdk_json_write_named_string(w, "module_namespace", b->module_namespace);
+			}
+			if (b->module_key != NULL) {
+				spdk_json_write_named_string(w, "module_key", b->module_key);
+			}
+			if (b->sha256_valid) {
+				char *hex = spdk_hexlify((const char *)b->sha256, SPDK_KV_EXEC_SHA256_LEN);
+
+				if (hex != NULL) {
+					spdk_json_write_named_string(w, "sha256", hex);
+					free(hex);
+				}
+			}
+			if (b->caps != 0) {
+				spdk_json_write_named_uint64(w, "caps", b->caps);
+			}
 		}
 		spdk_json_write_object_end(w);
 	}
 	spdk_json_write_array_end(w);
 	spdk_json_write_object_end(w);
 	spdk_json_write_object_end(w);
+
+	/* entries is a single caller-owned block (see spdk_nvmf_ns_get_kv_exec_allowlist). */
+	free((void *)entries);
 }
 
 static void

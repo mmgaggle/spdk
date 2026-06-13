@@ -149,6 +149,14 @@ nvmf_kvdev_complete(struct nvmf_kvdev_request *kv_req, int kvstatus, uint32_t va
 		 * the target stays up and other traffic is unaffected. */
 		rsp->status.sc = SPDK_NVME_SC_ABORTED_BY_REQUEST;
 		break;
+	case SPDK_KVDEV_IO_STATUS_READ_ONLY:
+		/* A mutating Exec path was rejected because the namespace is
+		 * read-only (the invariant is enforced at the mutation point,
+		 * ADR-0014). Report the same Command-Specific "Attempted Write to
+		 * Read Only Range" status the opcode gate uses for write ops. */
+		rsp->status.sct = SPDK_NVME_SCT_COMMAND_SPECIFIC;
+		rsp->status.sc = SPDK_NVME_SC_ATTEMPTED_WRITE_TO_RO_RANGE;
+		break;
 	case SPDK_KVDEV_IO_STATUS_FAILED:
 	default:
 		rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
@@ -315,23 +323,34 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 	void *data;
 	int rc;
 
-	nvmf_kvdev_decode_key(cmd, key, &key_len);
-	/* List uses the key as a START POSITION, where length 0 means "from the
-	 * beginning"; every other KV command requires a real 1..16 byte key. */
-	if (key_len > SPDK_KVDEV_KEY_MAX_LEN ||
-	    (key_len < SPDK_KVDEV_KEY_MIN_LEN && cmd->opc != SPDK_NVME_OPC_KV_LIST)) {
-		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
-		rsp->status.sc = SPDK_NVME_SC_INVALID_KEY_SIZE;
-		return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+	/*
+	 * KV Exec (vendor opcode 0x83) carries its data-object key length-prefixed
+	 * at the HEAD of the DPTR request payload (ADR-0014 Option 1), NOT in the
+	 * spec's inline CDW2/3/14/15 slots. So the inline decode + 1..16 validation
+	 * below applies only to the canonical-slot ops; the Exec case parses its own
+	 * (1..255) key out of the payload after the bounce buffer is gathered.
+	 */
+	if (cmd->opc != SPDK_NVME_OPC_KV_EXEC) {
+		nvmf_kvdev_decode_key(cmd, key, &key_len);
+		/* List uses the key as a START POSITION, where length 0 means "from the
+		 * beginning"; every other KV command requires a real 1..16 byte key. */
+		if (key_len > SPDK_KVDEV_KEY_MAX_LEN ||
+		    (key_len < SPDK_KVDEV_KEY_MIN_LEN && cmd->opc != SPDK_NVME_OPC_KV_LIST)) {
+			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+			rsp->status.sc = SPDK_NVME_SC_INVALID_KEY_SIZE;
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
 	}
 
 	/*
 	 * Per-namespace read-only enforcement (ADR-0008 trust split), deny-by-default.
-	 * A read-only KV namespace permits ONLY the read/lookup ops (Retrieve, Exist,
-	 * List); every other opcode -- Store, Delete, KV Exec, and any mutating KV
-	 * opcode added in the future -- is rejected here, BEFORE backend dispatch.
-	 * KV Exec is a write because it can mutate the value (the in-memory append
-	 * op / a rados object-class method). Using an allow-list (rather than a
+	 * A read-only KV namespace permits ONLY the read/lookup/compute ops that do
+	 * not mutate stored values: Retrieve, Exist, List, and KV Exec. KV Exec is
+	 * READ-ONLY (ADR-0014/0009/0011): it runs a sandboxed module over the object
+	 * but never writes the stored value back, so it is allowed here -- still
+	 * gated by the per-namespace op-ID allowlist below. Every mutating opcode --
+	 * Store, Delete, and any mutating KV opcode added in the future -- is rejected
+	 * here, BEFORE backend dispatch. Using an allow-list (rather than a
 	 * reject-list) guarantees a new opcode cannot silently bypass the boundary.
 	 * We report Command-Specific status "Attempted Write to Read Only Range"
 	 * (SCT 0x1, SC 0x82) -- the same status the NVM command set uses for the
@@ -343,6 +362,7 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		case SPDK_NVME_OPC_KV_RETRIEVE:
 		case SPDK_NVME_OPC_KV_EXIST:
 		case SPDK_NVME_OPC_KV_LIST:
+		case SPDK_NVME_OPC_KV_EXEC:
 			break;
 		default:
 			SPDK_DEBUGLOG(nvmf, "KV opcode 0x%02x rejected on read-only nsid %u\n",
@@ -425,15 +445,25 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		break;
 	case SPDK_NVME_OPC_KV_EXEC: {
 		/*
-		 * Vendor KV Exec (ADR-0005). CDW10 = input length (validated above
-		 * against req->length as xfer_len), CDW12 = output buffer size,
-		 * CDW13 = operation ID. The single data buffer carries the input on
-		 * the way in and receives the output on the way out (bidirectional).
+		 * Vendor KV Exec (ADR-0005 / ADR-0014). CDW10 = TOTAL request payload
+		 * length (validated above against req->length as xfer_len), CDW12 =
+		 * output buffer size, CDW13 = operation ID. The single DPTR buffer is
+		 * bidirectional: it carries the request on the way in and is overwritten
+		 * with the response on the way out.
+		 *
+		 * Request payload layout (ADR-0014 Option 1, key leaves the inline CDW
+		 * slots): [u16 key_len (1..255)][key_len key bytes][input bytes ...].
 		 */
-		uint32_t input_len = xfer_len;
 		uint32_t output_len = cmd->cdw12_bits.kv_exec.osize;
 		uint32_t op_id = cmd->cdw13_bits.kv_exec.op_id;
-		const char *binding = NULL;
+		struct spdk_kv_exec_binding binding;
+		struct spdk_kv_exec_binding *binding_arg = NULL;
+		bool has_binding = false;
+		const uint8_t *exec_key;
+		uint8_t exec_key_len;
+		const uint8_t *input;
+		uint32_t input_len;
+		uint16_t klp;
 
 		/*
 		 * Per-namespace KV Exec allowlist enforcement (ADR-0005). The trust
@@ -442,11 +472,11 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		 * (default-deny). Reject with INVALID_OPCODE — the same status the data
 		 * path already uses for an unsupported/absent KV Exec operation.
 		 * On success the allowlist lookup also yields the matching entry's
-		 * opaque binding (KVX-3), which we forward to the backend exec op:
-		 * the in-memory module ignores it; the librados module parses it as
-		 * "class:method" for rados_aio_exec.
+		 * structured binding (ADR-0010/0012/0014), which we forward to the
+		 * backend exec op: the in-memory module ignores it; the librados module
+		 * routes on binding->runtime.
 		 */
-		if (!nvmf_ns_kv_exec_op_allowed(ns, op_id, &binding)) {
+		if (!nvmf_ns_kv_exec_op_allowed(ns, op_id, &binding, &has_binding)) {
 			SPDK_DEBUGLOG(nvmf, "KV Exec op_id %u not in nsid %u allowlist; rejecting\n",
 				      op_id, ns->nsid);
 			free(kv_req);
@@ -454,6 +484,7 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 			rsp->status.sc = SPDK_NVME_SC_INVALID_OPCODE;
 			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
 		}
+		binding_arg = has_binding ? &binding : NULL;
 
 		/* The output the device may write back is bounded by the host data
 		 * buffer; clamp the advertised output size and use it as the
@@ -470,9 +501,35 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 			goto err_nomem;
 		}
 
-		rc = spdk_kvdev_exec(ns->kvdev_desc, ch, key, key_len, op_id, binding,
-				     data, input_len, data, output_len,
-				     nvmf_kvdev_exec_done, kv_req);
+		/*
+		 * Parse the payload-head key: [u16 key_len][key][input]. The header
+		 * (2 bytes) and the declared key must fit within the request payload
+		 * (xfer_len). Anything malformed is INVALID_KEY_SIZE before dispatch.
+		 */
+		if (xfer_len < sizeof(uint16_t)) {
+			free(kv_req->bounce);
+			free(kv_req);
+			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+			rsp->status.sc = SPDK_NVME_SC_INVALID_KEY_SIZE;
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+		memcpy(&klp, data, sizeof(klp));
+		if (klp < SPDK_KVDEV_KEY_MIN_LEN || klp > SPDK_KVDEV_EXEC_KEY_MAX_LEN ||
+		    (uint32_t)sizeof(uint16_t) + klp > xfer_len) {
+			free(kv_req->bounce);
+			free(kv_req);
+			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+			rsp->status.sc = SPDK_NVME_SC_INVALID_KEY_SIZE;
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+		exec_key_len = (uint8_t)klp;
+		exec_key = (const uint8_t *)data + sizeof(uint16_t);
+		input = exec_key + exec_key_len;
+		input_len = xfer_len - sizeof(uint16_t) - exec_key_len;
+
+		rc = spdk_kvdev_exec(ns->kvdev_desc, ch, exec_key, exec_key_len, op_id,
+				     ns->kv_read_only, binding_arg, input, input_len,
+				     data, output_len, nvmf_kvdev_exec_done, kv_req);
 		if (rc == -ENOTSUP) {
 			/* Backend has no exec op (e.g. librados until KVX-3): report
 			 * an NVMe not-supported status. No completion will fire. */

@@ -2858,23 +2858,45 @@ nvmf_ns_kv_exec_allowlist_free(struct spdk_nvmf_ns *ns)
 	uint32_t i;
 
 	for (i = 0; i < ns->kv_exec_allowlist_count; i++) {
-		free(ns->kv_exec_allowlist[i].binding);
+		free(ns->kv_exec_allowlist[i].module_namespace);
+		free(ns->kv_exec_allowlist[i].module_key);
 	}
 	free(ns->kv_exec_allowlist);
 	ns->kv_exec_allowlist = NULL;
 	ns->kv_exec_allowlist_count = 0;
 }
 
+/* Materialise an internal allowlist entry into the public structured binding. */
+static void
+nvmf_ns_kv_exec_entry_to_binding(const struct spdk_nvmf_kv_exec_allow_entry *e,
+				 struct spdk_kv_exec_binding *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->runtime = (enum spdk_kv_exec_runtime)e->runtime;
+	out->module_namespace = e->module_namespace;
+	out->module_key = e->module_key;
+	out->sha256_valid = e->sha256_valid;
+	if (e->sha256_valid) {
+		memcpy(out->sha256, e->sha256, SPDK_KV_EXEC_SHA256_LEN);
+	}
+	out->caps = e->caps;
+}
+
 bool
 nvmf_ns_kv_exec_op_allowed(const struct spdk_nvmf_ns *ns, uint32_t op_id,
-			   const char **binding_out)
+			   struct spdk_kv_exec_binding *binding_out, bool *has_binding)
 {
 	uint32_t i;
 
 	for (i = 0; i < ns->kv_exec_allowlist_count; i++) {
-		if (ns->kv_exec_allowlist[i].op_id == op_id) {
-			if (binding_out != NULL) {
-				*binding_out = ns->kv_exec_allowlist[i].binding;
+		const struct spdk_nvmf_kv_exec_allow_entry *e = &ns->kv_exec_allowlist[i];
+
+		if (e->op_id == op_id) {
+			if (has_binding != NULL) {
+				*has_binding = e->binding_present;
+			}
+			if (binding_out != NULL && e->binding_present) {
+				nvmf_ns_kv_exec_entry_to_binding(e, binding_out);
 			}
 			return true;
 		}
@@ -2906,15 +2928,30 @@ spdk_nvmf_ns_set_kv_exec_allowlist(struct spdk_nvmf_subsystem *subsystem, uint32
 			return -ENOMEM;
 		}
 		for (i = 0; i < count; i++) {
+			const struct spdk_kv_exec_binding *b = entries[i].binding;
+
 			list[i].op_id = entries[i].op_id;
-			if (entries[i].binding != NULL) {
-				list[i].binding = strdup(entries[i].binding);
-				if (list[i].binding == NULL) {
-					while (i-- > 0) {
-						free(list[i].binding);
-					}
-					free(list);
-					return -ENOMEM;
+			if (b == NULL) {
+				continue;
+			}
+			list[i].binding_present = true;
+			list[i].runtime = (uint32_t)b->runtime;
+			list[i].caps = b->caps;
+			list[i].sha256_valid = b->sha256_valid;
+			if (b->sha256_valid) {
+				memcpy(list[i].sha256, b->sha256, SPDK_KV_EXEC_SHA256_LEN);
+			}
+			/* Deep-copy the locator strings; the entry owns them. */
+			if (b->module_namespace != NULL) {
+				list[i].module_namespace = strdup(b->module_namespace);
+				if (list[i].module_namespace == NULL) {
+					goto oom;
+				}
+			}
+			if (b->module_key != NULL) {
+				list[i].module_key = strdup(b->module_key);
+				if (list[i].module_key == NULL) {
+					goto oom;
 				}
 			}
 		}
@@ -2926,6 +2963,14 @@ spdk_nvmf_ns_set_kv_exec_allowlist(struct spdk_nvmf_subsystem *subsystem, uint32
 	ns->kv_exec_allowlist_count = count;
 
 	return 0;
+
+oom:
+	for (i = 0; i < count; i++) {
+		free(list[i].module_namespace);
+		free(list[i].module_key);
+	}
+	free(list);
+	return -ENOMEM;
 }
 
 int
@@ -2933,16 +2978,10 @@ spdk_nvmf_ns_get_kv_exec_allowlist(struct spdk_nvmf_subsystem *subsystem, uint32
 				   const struct spdk_nvmf_kv_exec_allow **entries, uint32_t *count)
 {
 	struct spdk_nvmf_ns *ns;
-
-	/* The internal and public entry structs are deliberately layout-identical
-	 * (op_id + pointer), so the internal array can be exposed directly as the
-	 * read-only public view without an allocation/copy. */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_kv_exec_allow_entry) ==
-			   sizeof(struct spdk_nvmf_kv_exec_allow), "layout mismatch");
-	SPDK_STATIC_ASSERT(offsetof(struct spdk_nvmf_kv_exec_allow_entry, op_id) ==
-			   offsetof(struct spdk_nvmf_kv_exec_allow, op_id), "layout mismatch");
-	SPDK_STATIC_ASSERT(offsetof(struct spdk_nvmf_kv_exec_allow_entry, binding) ==
-			   offsetof(struct spdk_nvmf_kv_exec_allow, binding), "layout mismatch");
+	struct spdk_nvmf_kv_exec_allow *pub;
+	struct spdk_kv_exec_binding *bindings;
+	uint8_t *block;
+	uint32_t n, i;
 
 	ns = _nvmf_subsystem_get_ns(subsystem, nsid);
 	if (ns == NULL) {
@@ -2952,9 +2991,43 @@ spdk_nvmf_ns_get_kv_exec_allowlist(struct spdk_nvmf_subsystem *subsystem, uint32
 		return -EINVAL;
 	}
 
-	*entries = (const struct spdk_nvmf_kv_exec_allow *)ns->kv_exec_allowlist;
-	*count = ns->kv_exec_allowlist_count;
+	n = ns->kv_exec_allowlist_count;
+	*count = n;
+	if (n == 0) {
+		*entries = NULL;
+		return 0;
+	}
 
+	/*
+	 * The internal and public structs are no longer layout-identical (the
+	 * binding is now a typed struct, not a char*). Materialise a single
+	 * caller-owned block: the public-entry array followed by the bindings it
+	 * points at. A single free(*entries) releases both; the locator strings
+	 * inside each binding still alias the namespace's internal entries and so
+	 * stay valid only until the allowlist is next modified (matching the prior
+	 * borrow contract — the in-tree callers emit synchronously and then drop
+	 * the view).
+	 */
+	block = calloc(1, n * (sizeof(*pub) + sizeof(*bindings)));
+	if (block == NULL) {
+		return -ENOMEM;
+	}
+	pub = (struct spdk_nvmf_kv_exec_allow *)block;
+	bindings = (struct spdk_kv_exec_binding *)(block + n * sizeof(*pub));
+
+	for (i = 0; i < n; i++) {
+		const struct spdk_nvmf_kv_exec_allow_entry *e = &ns->kv_exec_allowlist[i];
+
+		pub[i].op_id = e->op_id;
+		if (e->binding_present) {
+			nvmf_ns_kv_exec_entry_to_binding(e, &bindings[i]);
+			pub[i].binding = &bindings[i];
+		} else {
+			pub[i].binding = NULL;
+		}
+	}
+
+	*entries = pub;
 	return 0;
 }
 
