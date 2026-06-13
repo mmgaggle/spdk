@@ -917,9 +917,15 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	/*
 	 * Enable the FUEL feature on the WARM engine's config (an engine property;
 	 * the warm engine is reused across invocations), so each call can (re)set a
-	 * fuel ceiling. (D3 adds epoch interruption here for the wall-clock backstop.)
+	 * fuel ceiling. ALSO enable EPOCH INTERRUPTION (spdk-ii0 D3, closes spdk-9jl):
+	 * the warm path must have the same wall-clock backstop as run() to catch a
+	 * runaway that fuel under-counts. CRITICAL (spdk-9jl): epoch interruption
+	 * WITHOUT a deadline traps immediately, so a per-run epoch deadline is set on
+	 * EVERY call (and the ticker armed only when the epoch cap is active) in
+	 * nkvx_run_on_object_locked — never left armed with the default 0 deadline.
 	 */
 	api->config_consume_fuel_set(config, true);
+	api->config_epoch_interruption_set(config, true);
 	/*
 	 * Force DYNAMIC bounds-checks for the zero-copy host memory (spdk-ii0 B1).
 	 * Our MemoryCreator hands wasmtime an exact-sized buffer with NO guard
@@ -1072,9 +1078,20 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 	g_nkvx_wasm_stats.last_mem_base = mem_base;
 	g_nkvx_wasm_stats.last_cache_base = obj->mem;
 
-	/* Per-invocation caps (TB2): fuel only on the warm path for now (D3 adds the
-	 * memory limiter + epoch backstop). */
+	/*
+	 * Per-invocation caps (TB2) on the warm store before the call (spdk-ii0 D3):
+	 * arm fuel AND the memory limiter AND the epoch deadline, matching run() so the
+	 * warm/cached path is contained against compute-, memory-, and wall-clock
+	 * runaways exactly like the cold path.
+	 */
 	nkvx_wasm_caps_load(&caps);
+
+	/* MEMORY CAP: bound linear memory so a memory.grow past the cap fails and the
+	 * module is contained (never OOMing the target), exactly as run() does. */
+	if (caps.max_memory_bytes > 0) {
+		api->store_limiter(warm->store, (int64_t)caps.max_memory_bytes,
+				   -1, -1, -1, -1);
+	}
 
 	/*
 	 * The warm engine ALWAYS has the fuel feature enabled (see nkvx_warm_build),
@@ -1091,11 +1108,36 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 		}
 	}
 
+	/*
+	 * EPOCH / WALL-CLOCK CAP (spdk-ii0 D3, closes spdk-9jl): arm the per-run epoch
+	 * deadline and the background ticker on the warm engine so a fuel-undercounting
+	 * runaway is stopped by wall-clock, matching run()'s ~100ms backstop. The warm
+	 * engine has epoch interruption enabled at build time, so a deadline MUST be
+	 * set on EVERY call or the engine traps immediately (spdk-9jl). When the caps
+	 * enable the epoch cap we set the real per-run deadline and arm the ticker for
+	 * THIS engine; when the caps disable it we set an effectively-infinite deadline
+	 * (and do NOT arm the ticker) so the run proceeds unbounded by wall-clock but
+	 * never trips an unset deadline. The ticker is disarmed right after the call,
+	 * before the mutex is dropped, so it never advances a stale/reused engine. */
+	if (caps.epoch_deadline_ticks > 0) {
+		api->context_set_epoch_deadline(warm->ctx, caps.epoch_deadline_ticks);
+		nkvx_wasm_epoch_register(api, warm->engine);
+	} else {
+		api->context_set_epoch_deadline(warm->ctx, UINT64_MAX);
+	}
+
 	args[0].kind = WASMTIME_I32;
 	args[0].of.i32 = (int32_t)WASM_OBJ_OFF;
 	args[1].kind = WASMTIME_I32;
 	args[1].of.i32 = (int32_t)obj->obj_len;
 	err = api->func_call(warm->ctx, &warm->fn_ext.of.func, args, 2, results, 1, &trap);
+
+	/* Disarm the ticker as soon as the call returns (the engine is reused, not
+	 * deleted, so we only need to stop it pointing at this engine). Only armed
+	 * when the epoch cap was active this call. */
+	if (caps.epoch_deadline_ticks > 0) {
+		nkvx_wasm_epoch_unregister(warm->engine);
+	}
 
 	if (err != NULL) {
 		nkvx_wasm_log_error(api, "func_call", err);

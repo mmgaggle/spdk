@@ -981,6 +981,92 @@ test_nkvx_d2_pin_survives_invalidate(void)
 }
 
 /*
+ * CONTAINMENT regression on the WARM/cached path (spdk-ii0 D3, closes spdk-9jl):
+ * the cached path must arm the SAME caps as the cold run() — memory limiter AND
+ * the epoch wall-clock backstop — not just fuel.
+ *
+ *   (a) MEMORY: a module that grows past the per-invocation memory cap is
+ *       contained (the grow fails, the module traps) — never a host OOM. Run on
+ *       the warm path (run_cached) with a tight SPDK_NKVX_WASM_MAX_MEMORY.
+ *   (b) EPOCH:  a wall-clock-runaway module with FUEL DISABLED must be stopped by
+ *       the epoch deadline the warm engine now arms (before the fix the warm path
+ *       armed only fuel, so a fuel=0 runaway ran unbounded). Run on the warm path
+ *       with SPDK_NKVX_WASM_FUEL=0 and a short epoch budget -> ABORTED, no hang.
+ */
+static void
+test_nkvx_d3_warm_memory_cap_contained(void)
+{
+#ifdef NKVX_WASM_RUNTIME_TESTS
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	setenv("SPDK_NKVX_WASM_MAX_MEMORY", "1048576", 1);	/* 1 MiB cap */
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB4 D3 memory test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	static const uint8_t obj[] = "x";
+	struct fake_fill fill = { .bytes = obj, .len = sizeof(obj), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	int rc;
+
+	memset(out, 0, sizeof(out));
+	rc = kvdev_rados_nkvx_wasm_run_cached("overalloc", "d3memK", sizeof(obj),
+					      fake_cold_fill, &fill, out, sizeof(out), &rlen);
+	/* Contained by the WARM-path memory limiter: a clean failure, not an OOM. */
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_ABORTED ||
+		  rc == SPDK_KVDEV_IO_STATUS_FAILED);
+	printf("\n    D3 warm memory cap: status=%d (contained on cached path)\n", rc);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_MAX_MEMORY");
+#else
+	printf("\n    built --without-wasm: TB4 D3 memory test is a no-op\n");
+#endif
+}
+
+static void
+test_nkvx_d3_warm_epoch_cap_contained(void)
+{
+#ifdef NKVX_WASM_RUNTIME_TESTS
+	setenv(KVDEV_RADOS_NKVX_WASM_DIR_ENV, NKVX_UT_WASM_DIR, 1);
+	/* Fuel OFF so ONLY the warm-path epoch deadline can stop it; short budget. */
+	setenv("SPDK_NKVX_WASM_FUEL", "0", 1);
+	setenv("SPDK_NKVX_WASM_EPOCH_TICKS", "3", 1);
+	unsetenv("SPDK_NKVX_WASM_MAX_MEMORY");
+
+	if (!nkvx_wasm_runtime_available()) {
+		printf("\n    wasm runtime unavailable -> TB4 D3 epoch test skipped\n");
+		return;
+	}
+	kvdev_rados_nkvx_wasm_cache_reset();
+
+	static const uint8_t obj[] = "x";
+	struct fake_fill fill = { .bytes = obj, .len = sizeof(obj), .calls = 0 };
+	uint8_t out[64];
+	uint32_t rlen = 0;
+	int rc;
+
+	memset(out, 0, sizeof(out));
+	rc = kvdev_rados_nkvx_wasm_run_cached("walltime_runaway", "d3epK", sizeof(obj),
+					      fake_cold_fill, &fill, out, sizeof(out), &rlen);
+	/* Stopped by the warm-path EPOCH deadline (fuel was disabled) -> ABORTED. */
+	CU_ASSERT(rc == SPDK_KVDEV_IO_STATUS_ABORTED);
+	printf("\n    D3 warm epoch cap: status=%d (ABORTED by wall-clock on cached path)\n", rc);
+
+	kvdev_rados_nkvx_wasm_cache_reset();
+	unsetenv("SPDK_NKVX_WASM_FUEL");
+	unsetenv("SPDK_NKVX_WASM_EPOCH_TICKS");
+#else
+	printf("\n    built --without-wasm: TB4 D3 epoch test is a no-op\n");
+#endif
+}
+
+/*
  * Fail-soft: --without-wasm or libwasmtime.so absent -> run_cached returns
  * NOT_SUPPORTED and NEVER invokes the fill callback (the executor cannot run the
  * module, so it must not cold-fill). Deterministic in both build modes.
@@ -1133,6 +1219,8 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_d1_declared_size_caps_slack);
 	CU_ADD_TEST(suite, test_nkvx_d2_invalidate_on_mutation);
 	CU_ADD_TEST(suite, test_nkvx_d2_pin_survives_invalidate);
+	CU_ADD_TEST(suite, test_nkvx_d3_warm_memory_cap_contained);
+	CU_ADD_TEST(suite, test_nkvx_d3_warm_epoch_cap_contained);
 	CU_ADD_TEST(suite, test_nkvx_tb4_cached_failsoft);
 	CU_ADD_TEST(suite, test_nkvx_tb4_dispatch_wires_cache);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
