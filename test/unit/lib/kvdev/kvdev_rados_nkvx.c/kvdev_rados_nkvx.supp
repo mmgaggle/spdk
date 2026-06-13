@@ -889,3 +889,33 @@
    fun:start_thread
    fun:clone
 }
+
+# ---------------------------------------------------------------------------
+# OpenSSL 3.x lazy OSSL_LIB_CTX default-context init (benign valgrind false
+# positive). The nkvx sha256 module-hash gate (kvdev_rados_nkvx_wasm_module_verify,
+# added by spdk-5wi as a reactor-side compile-free verify) calls EVP_MD_fetch on
+# first use; OpenSSL's first-time EVP fetch lazily materialises the default library
+# context, and get_default_context / ossl_lib_ctx_get_concrete branch on a
+# pthread_getspecific TLS slot that memcheck flags as uninitialised on the very
+# first read per thread. This is a well-known OpenSSL-under-valgrind FP, entirely
+# inside libcrypto -- every frame in these blocks is an OpenSSL/glibc-TLS function
+# (ossl_lib_ctx_get_concrete is the anchor), so NO nkvx/SPDK code can match and no
+# real nkvx uninitialised read can be hidden. Surfaced only after spdk-5pq removed
+# the over-broad longjmp-taint blocks AND spdk-5wi added the reactor verify path
+# that reaches EVP_MD_fetch under the UT.
+{
+   openssl3-ossl-lib-ctx-default-context-cond-via-getspecific
+   Memcheck:Cond
+   fun:pthread_getspecific*
+   fun:get_thread_default_context*
+   fun:get_default_context*
+   fun:ossl_lib_ctx_get_concrete*
+   ...
+}
+{
+   openssl3-ossl-lib-ctx-default-context-cond
+   Memcheck:Cond
+   fun:get_default_context*
+   fun:ossl_lib_ctx_get_concrete*
+   ...
+}
