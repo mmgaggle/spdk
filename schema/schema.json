@@ -585,7 +585,7 @@
         {
           "name": "caps",
           "type": "uint64",
-          "description": "Structured binding per-invocation capability bitmask (reserved; 0 in v1)."
+          "description": "Structured binding per-invocation capability TIER selector (ADR-0014), not a raw fuel/byte count. Valid values: 0=executor defaults, 1=small, 2=medium, 3=large. Words outside [0, 3] are rejected."
         }
       ]
     }

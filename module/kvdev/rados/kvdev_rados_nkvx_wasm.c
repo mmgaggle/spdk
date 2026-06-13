@@ -487,6 +487,11 @@ enum nkvx_wasm_caps_tier {
 	NKVX_WASM_CAPS_TIER_MEDIUM	= 2,	/* default-equivalent fixed triple */
 	NKVX_WASM_CAPS_TIER_LARGE	= 3,	/* generous: long compute, large mem */
 };
+/* The public caps contract (include/spdk/kvdev.h) is what the control plane
+ * validates against; keep its tier ceiling in lockstep with the enum above so a
+ * new tier cannot be admitted by the RPC layer without a matching case here. */
+SPDK_STATIC_ASSERT(NKVX_WASM_CAPS_TIER_LARGE == SPDK_KV_EXEC_CAPS_TIER_MAX,
+		   "caps tier ceiling out of sync with the public contract");
 
 /*
  * Load the per-invocation caps for THIS run from the allowlist binding's \c caps

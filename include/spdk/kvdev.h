@@ -50,6 +50,20 @@ struct spdk_kvdev_module;
 #define SPDK_KV_EXEC_SHA256_LEN 32
 
 /**
+ * Per-invocation capability TIER encoding for a binding's \c caps word (ADR-0014).
+ * \c caps is NOT a free-form fuel/byte count: it names a fixed capability tier whose
+ * fuel/epoch/memory triple is defined by the executor (rados-nkvx). Valid words are
+ * the small set [0, SPDK_KV_EXEC_CAPS_TIER_MAX]:
+ *   - 0: executor defaults (env-overridable) -- the v1/reserved value.
+ *   - 1: SMALL  (tight: short compute, small memory).
+ *   - 2: MEDIUM (default-equivalent fixed triple).
+ *   - 3: LARGE  (generous: long compute, large memory).
+ * The control plane MUST reject any other value; a raw byte/fuel count would be
+ * silently truncated to a tier by the executor and is therefore not accepted here.
+ */
+#define SPDK_KV_EXEC_CAPS_TIER_MAX 3
+
+/**
  * KV Exec module runtime kind (ADR-0012, runtime-agnostic binding). Selects the
  * backend that executes a bound module.
  */
@@ -78,7 +92,8 @@ enum spdk_kv_exec_runtime {
  *     rejected. \c sha256_valid is false only on the legacy cls path.
  *   - (\c module_namespace, \c module_key) is the cold-fetch locator, consulted
  *     ONLY on a content-cache miss; it never participates in authorization.
- *   - \c caps is a per-invocation capability bitmask (reserved; 0 in v1).
+ *   - \c caps selects a per-invocation capability TIER (not a raw count); valid
+ *     values are [0, SPDK_KV_EXEC_CAPS_TIER_MAX], with 0 meaning executor defaults.
  *
  * Strings are NUL-terminated and owned by the caller (the namespace allowlist);
  * a backend must copy anything it needs to outlive the call.
@@ -93,7 +108,7 @@ struct spdk_kv_exec_binding {
 	uint8_t				sha256[SPDK_KV_EXEC_SHA256_LEN];
 	/** True when sha256 carries a real hash (false on the legacy cls path). */
 	bool				sha256_valid;
-	/** Per-invocation capability bitmask (reserved; 0 in v1). */
+	/** Per-invocation capability TIER selector, [0, SPDK_KV_EXEC_CAPS_TIER_MAX]. */
 	uint64_t			caps;
 };
 

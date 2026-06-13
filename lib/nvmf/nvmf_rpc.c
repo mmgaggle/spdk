@@ -1534,6 +1534,18 @@ nvmf_rpc_item_to_kv_exec_binding(const struct rpc_nvmf_kv_exec_allow *item,
 	}
 	b->module_namespace = item->module_namespace;
 	b->module_key = item->module_key;
+
+	/* caps names a capability TIER, not a raw fuel/byte count (ADR-0014): the
+	 * executor selects defaults/SMALL/MEDIUM/LARGE from the low bits, so a word
+	 * outside [0, SPDK_KV_EXEC_CAPS_TIER_MAX] would be silently truncated to a
+	 * tier (e.g. a 64 MiB byte count maps to the default tier). Reject it here
+	 * rather than admit a binding whose caps mean nothing the operator intended;
+	 * caps == 0 keeps meaning "executor defaults". */
+	if (item->caps > SPDK_KV_EXEC_CAPS_TIER_MAX) {
+		SPDK_ERRLOG("KV Exec allowlist: caps %" PRIu64 " out of range; must be a tier in [0, %u]\n",
+			    item->caps, SPDK_KV_EXEC_CAPS_TIER_MAX);
+		return -EINVAL;
+	}
 	b->caps = item->caps;
 
 	if (item->sha256 != NULL) {
