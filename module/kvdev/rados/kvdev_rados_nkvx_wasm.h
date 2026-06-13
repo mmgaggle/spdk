@@ -30,6 +30,65 @@
 #define SPDK_KVDEV_RADOS_NKVX_WASM_H
 
 #include "spdk/stdinc.h"
+#include "spdk/kvdev.h"		/* SPDK_KV_EXEC_SHA256_LEN */
+
+/*
+ * TB3 (spdk-fbm / ADR-0010): the verified, content-addressed module binding for a
+ * single Exec. When a run is given a non-NULL \c struct kvdev_rados_nkvx_module
+ * the executor SKIPS the legacy filesystem-load-by-name path and instead:
+ *
+ *   - serves the COMPILED module from the sha256-keyed module cache on a hit
+ *     (no recompile), or
+ *   - on a miss, VERIFIES the supplied \c bytes hash to \c sha256 (a hard gate,
+ *     ADR-0010) BEFORE compiling, then caches the compiled artifact keyed by the
+ *     content hash so the NEXT Exec of the same hash skips refetch+recompile.
+ *
+ * This is the deny-by-default authorization anchor: the only modules that ever
+ * reach the compiler are ones whose fetched bytes matched the control-plane's
+ * bound sha256. The module cache is DISTINCT from the oid-keyed object cache and
+ * the (module,oid) warm-instance cache.
+ *
+ * \c bytes/\c bytes_len carry the librados-fetched .wasm on the fetch-miss path
+ * (the caller owns them; they need only outlive the run). They may be NULL/0 when
+ * the caller already knows the hash is cached (a module-cache hit) — the executor
+ * then serves the cached compiled module and never needs the raw bytes.
+ *
+ * \c caps is the per-invocation capability word from the allowlist binding
+ * (ADR-0014). 0 means "use the executor defaults" (env-overridable), preserving
+ * the TB2/TB4 behaviour; a non-zero value selects a capability tier (see
+ * kvdev_rados_nkvx_wasm.c, nkvx_wasm_caps_load).
+ */
+struct kvdev_rados_nkvx_module {
+	uint8_t		sha256[SPDK_KV_EXEC_SHA256_LEN];
+	const void	*bytes;		/* fetched .wasm (fetch-miss path); may be NULL */
+	size_t		bytes_len;
+	uint64_t	caps;		/* per-invocation caps word (0 => defaults) */
+};
+
+/*
+ * Probe whether a COMPILED module for \c sha256 is already in the content-addressed
+ * module cache. Reactor-callable (own lock); lets the datapath skip the librados
+ * module fetch entirely on a hit. Returns false in the stub build.
+ */
+bool kvdev_rados_nkvx_wasm_module_cached(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN]);
+
+/*
+ * VERIFY \c bytes against \c sha256 (the hard ADR-0010 gate), and on success
+ * compile + insert into the content-addressed module cache (idempotent). Returns
+ * SPDK_KVDEV_IO_STATUS_SUCCESS when the module is cached (verified+compiled, or
+ * already present), SPDK_KVDEV_IO_STATUS_INVALID on a hash MISMATCH (never
+ * compiled), SPDK_KVDEV_IO_STATUS_FAILED on a compile failure, or
+ * SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED when the runtime is unavailable. NEVER
+ * compiles or caches bytes that fail the hash check.
+ */
+int kvdev_rados_nkvx_wasm_module_insert(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN],
+					const void *bytes, size_t bytes_len);
+
+/* Drop the entire compiled-module (sha256) cache (test teardown / shutdown). */
+void kvdev_rados_nkvx_wasm_module_cache_reset(void);
+
+/* Test-only: count of compiled modules currently held in the sha256 cache. */
+uint64_t kvdev_rados_nkvx_wasm_module_cache_count(void);
 
 /*
  * Run a precompiled wasm module <name> against the object bytes, OFF the SPDK
@@ -51,6 +110,7 @@
  *   FAILED               the module file/instantiation/execution failed.
  */
 int kvdev_rados_nkvx_wasm_run(const char *name,
+			      const struct kvdev_rados_nkvx_module *mod,
 			      const void *object, size_t object_len,
 			      void *out, uint32_t out_len, uint32_t *result_len);
 
@@ -112,6 +172,7 @@ typedef int (*kvdev_rados_nkvx_fill_fn)(void *buf, size_t cap, size_t *out_len,
  * plus FAILED if \c fill fails on a miss).
  */
 int kvdev_rados_nkvx_wasm_run_cached(const char *name,
+				     const struct kvdev_rados_nkvx_module *mod,
 				     const char *obj_key, size_t object_len,
 				     kvdev_rados_nkvx_fill_fn fill, void *fill_arg,
 				     void *out, uint32_t out_len, uint32_t *result_len);
@@ -147,7 +208,8 @@ void kvdev_rados_nkvx_wasm_cache_unpin(void *handle);
  * exactly that version with NO librados refetch and NO cold fill. Same status
  * contract as run_cached. The caller still owns the pin and must unpin after.
  */
-int kvdev_rados_nkvx_wasm_run_pinned(const char *name, void *pin,
+int kvdev_rados_nkvx_wasm_run_pinned(const char *name,
+				     const struct kvdev_rados_nkvx_module *mod, void *pin,
 				     void *out, uint32_t out_len, uint32_t *result_len);
 
 /*

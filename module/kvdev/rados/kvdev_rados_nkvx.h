@@ -35,6 +35,8 @@
 
 #include "spdk/stdinc.h"
 
+#include "kvdev_rados_nkvx_wasm.h"	/* struct kvdev_rados_nkvx_module */
+
 /* Binding-string prefix that routes a KV Exec to the nkvx local executor instead
  * of the legacy cls path. The text after the prefix names the built-in module. */
 #define KVDEV_RADOS_NKVX_BINDING_PREFIX "nkvx:"
@@ -75,6 +77,13 @@ void kvdev_rados_nkvx_stop(void);
  * Dispatch a built-in module run OFF the SPDK reactor.
  *
  * \param module      built-in module name (after the "nkvx:" prefix).
+ * \param mod         OPTIONAL verified module binding (TB3 / spdk-fbm): the bound
+ *                    sha256, the librados-fetched .wasm bytes (fetch-miss path), and
+ *                    the per-invocation caps word. NULL on the legacy built-in /
+ *                    in-tree-test path; non-NULL on the live wasm datapath, where it
+ *                    is the deny-by-default authorization anchor (only bytes that
+ *                    hash to mod->sha256 are ever compiled/run). \c mod->bytes must
+ *                    outlive the run (the caller frees them after done_fn fires).
  * \param obj_key     stable identity key for the object (the oid). Keys the
  *                    executor's identity-addressed object cache and, with the
  *                    module, the warm-instance cache (TB4 / spdk-ii0). May be NULL
@@ -99,7 +108,8 @@ void kvdev_rados_nkvx_stop(void);
  */
 typedef void (*kvdev_rados_nkvx_done_fn)(void *done_arg, int kvstatus, uint32_t out_len);
 
-int kvdev_rados_nkvx_dispatch(const char *module, const char *obj_key, void *obj_pin,
+int kvdev_rados_nkvx_dispatch(const char *module, const struct kvdev_rados_nkvx_module *mod,
+			      const char *obj_key, void *obj_pin,
 			      const void *object, size_t object_len,
 			      void *out, uint32_t out_len,
 			      kvdev_rados_nkvx_done_fn done_fn, void *done_arg);

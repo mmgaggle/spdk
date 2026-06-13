@@ -39,6 +39,11 @@ kvdev_rados_nkvx_wasm_get_stats(struct kvdev_rados_nkvx_wasm_stats *out)
 
 #include <dlfcn.h>
 
+/* OpenSSL for the SHA-256 module-integrity gate (ADR-0010). -lcrypto is linked
+ * unconditionally into every SPDK app, so this adds no new link dependency. */
+#include <openssl/evp.h>
+#include <openssl/crypto.h>
+
 /* Vendored wasmtime C-API headers (signatures only; no link dependency). */
 #include "wasmtime.h"
 
@@ -155,6 +160,15 @@ struct nkvx_wasm_api {
 	wasmtime_error_t *(*module_new)(wasm_engine_t *, const uint8_t *, size_t,
 					wasmtime_module_t **);
 	void (*module_delete)(wasmtime_module_t *);
+	/*
+	 * TB3 content-addressed module cache (spdk-fbm): serialize a compiled module
+	 * to a portable blob, deserialize it into another engine. Lets the sha256
+	 * cache hold the COMPILED artifact and skip recompilation on a hash hit,
+	 * across distinct data objects/engines.
+	 */
+	wasmtime_error_t *(*module_serialize)(wasmtime_module_t *, wasm_byte_vec_t *);
+	wasmtime_error_t *(*module_deserialize)(wasm_engine_t *, const uint8_t *, size_t,
+						wasmtime_module_t **);
 
 	wasmtime_error_t *(*instance_new)(wasmtime_context_t *, const wasmtime_module_t *,
 					  const wasmtime_extern_t *, size_t,
@@ -228,6 +242,8 @@ nkvx_wasm_resolve(void *h)
 	SYM(context_set_epoch_deadline, "wasmtime_context_set_epoch_deadline");
 	SYM(module_new, "wasmtime_module_new");
 	SYM(module_delete, "wasmtime_module_delete");
+	SYM(module_serialize, "wasmtime_module_serialize");
+	SYM(module_deserialize, "wasmtime_module_deserialize");
 	SYM(instance_new, "wasmtime_instance_new");
 	SYM(instance_export_get, "wasmtime_instance_export_get");
 	SYM(memory_data, "wasmtime_memory_data");
@@ -384,20 +400,59 @@ nkvx_wasm_env_u64(const char *name, uint64_t def)
 }
 
 /*
- * Load the per-invocation caps for THIS run. TB2 source: provisional compile-time
- * defaults, each overridable by an environment variable (read on every run, so
- * caps are genuinely per-invocation configurable). TB3 will replace the body here
- * with the per-op allowlist binding once the binding-encoding freeze lands.
+ * Per-invocation caps TIER encoding (TB3 / spdk-fbm). ADR-0014 froze the binding's
+ * \c caps as a single uint64 word, so we cannot carry three independent 64-bit
+ * fuel/epoch/memory values; instead the low bits select a named TIER whose
+ * fuel/epoch/memory triple is fixed here. \c caps == 0 means "executor defaults"
+ * (env-overridable), preserving the TB2/TB4 behaviour. Higher tiers are
+ * progressively more generous (the control plane blesses a module with a tier per
+ * op-ID). Unknown tiers fall back to the default tier.
+ */
+#define NKVX_WASM_CAPS_TIER_MASK	0xFFull
+enum nkvx_wasm_caps_tier {
+	NKVX_WASM_CAPS_TIER_DEFAULT	= 0,	/* defaults (env-overridable) */
+	NKVX_WASM_CAPS_TIER_SMALL	= 1,	/* tight: short compute, small mem */
+	NKVX_WASM_CAPS_TIER_MEDIUM	= 2,	/* default-equivalent fixed triple */
+	NKVX_WASM_CAPS_TIER_LARGE	= 3,	/* generous: long compute, large mem */
+};
+
+/*
+ * Load the per-invocation caps for THIS run from the allowlist binding's \c caps
+ * word (TB3 source, ADR-0010/0014). When \c caps_word == 0 the executor defaults
+ * apply, each still env-overridable (so existing tests and ad-hoc tuning keep
+ * working). A non-zero word selects a fixed capability tier — the env overrides do
+ * NOT apply to an explicit tier, so the control plane's choice is authoritative.
  */
 static void
-nkvx_wasm_caps_load(struct nkvx_wasm_caps *caps)
+nkvx_wasm_caps_load(struct nkvx_wasm_caps *caps, uint64_t caps_word)
 {
-	caps->fuel_ceiling = nkvx_wasm_env_u64(NKVX_WASM_ENV_FUEL,
-					       NKVX_WASM_DEFAULT_FUEL);
-	caps->epoch_deadline_ticks = nkvx_wasm_env_u64(NKVX_WASM_ENV_EPOCH_TICKS,
-				     NKVX_WASM_DEFAULT_EPOCH_TICKS);
-	caps->max_memory_bytes = nkvx_wasm_env_u64(NKVX_WASM_ENV_MAX_MEMORY,
-				 NKVX_WASM_DEFAULT_MAX_MEMORY);
+	switch (caps_word & NKVX_WASM_CAPS_TIER_MASK) {
+	case NKVX_WASM_CAPS_TIER_DEFAULT:
+		/* Defaults, env-overridable (TB2/TB4 behaviour preserved). */
+		caps->fuel_ceiling = nkvx_wasm_env_u64(NKVX_WASM_ENV_FUEL,
+						       NKVX_WASM_DEFAULT_FUEL);
+		caps->epoch_deadline_ticks = nkvx_wasm_env_u64(NKVX_WASM_ENV_EPOCH_TICKS,
+					     NKVX_WASM_DEFAULT_EPOCH_TICKS);
+		caps->max_memory_bytes = nkvx_wasm_env_u64(NKVX_WASM_ENV_MAX_MEMORY,
+					 NKVX_WASM_DEFAULT_MAX_MEMORY);
+		return;
+	case NKVX_WASM_CAPS_TIER_SMALL:
+		caps->fuel_ceiling = 10ull * 1000ull * 1000ull;		/* 10M */
+		caps->epoch_deadline_ticks = 5ull;			/* ~50ms */
+		caps->max_memory_bytes = 1ull * 1024ull * 1024ull;	/* 1 MiB */
+		return;
+	case NKVX_WASM_CAPS_TIER_LARGE:
+		caps->fuel_ceiling = 1000ull * 1000ull * 1000ull;	/* 1B */
+		caps->epoch_deadline_ticks = 100ull;			/* ~1s */
+		caps->max_memory_bytes = 64ull * 1024ull * 1024ull;	/* 64 MiB */
+		return;
+	case NKVX_WASM_CAPS_TIER_MEDIUM:
+	default:
+		caps->fuel_ceiling = NKVX_WASM_DEFAULT_FUEL;
+		caps->epoch_deadline_ticks = NKVX_WASM_DEFAULT_EPOCH_TICKS;
+		caps->max_memory_bytes = NKVX_WASM_DEFAULT_MAX_MEMORY;
+		return;
+	}
 }
 
 /*
@@ -508,6 +563,332 @@ nkvx_wasm_read_file(const char *path, size_t *out_len)
 	fclose(f);
 	*out_len = (size_t)sz;
 	return buf;
+}
+
+/* ==========================================================================
+ * TB3: content-addressed (sha256) COMPILED-module cache + the integrity gate
+ * (spdk-fbm / ADR-0010). The sha256 is the SOLE authorization + integrity anchor:
+ * fetched .wasm bytes are run ONLY if they hash to the control-plane's bound
+ * sha256, and the compiled artifact is cached by that hash so a repeat Exec of the
+ * same module skips refetch+recompile. This cache is DISTINCT from the oid object
+ * cache and the (module,oid) warm-instance cache below.
+ * ========================================================================== */
+
+/*
+ * Compute SHA-256 of (buf,len) into out[32] using OpenSSL EVP. Returns true on
+ * success. A digest failure (should not happen for sha256) is treated as a verify
+ * failure by the caller, so unverified bytes are never run.
+ */
+static bool
+nkvx_sha256(const void *buf, size_t len, uint8_t out[SPDK_KV_EXEC_SHA256_LEN])
+{
+	unsigned int mdlen = 0;
+
+	if (EVP_Digest(buf, len, out, &mdlen, EVP_sha256(), NULL) != 1) {
+		SPDK_ERRLOG("nkvx/wasm: SHA-256 digest failed\n");
+		return false;
+	}
+	return mdlen == SPDK_KV_EXEC_SHA256_LEN;
+}
+
+/*
+ * The integrity gate (ADR-0010). Hash the fetched bytes and constant-time-compare
+ * the full 32-byte digest against the bound sha256. Returns true ONLY on an exact
+ * match. The caller MUST NOT compile or run bytes for which this returns false.
+ */
+static bool
+nkvx_wasm_verify(const void *bytes, size_t len, const uint8_t bound[SPDK_KV_EXEC_SHA256_LEN])
+{
+	uint8_t got[SPDK_KV_EXEC_SHA256_LEN];
+
+	if (!nkvx_sha256(bytes, len, got)) {
+		return false;
+	}
+	/* CRYPTO_memcmp is constant-time; a full-length compare either way. */
+	return CRYPTO_memcmp(got, bound, SPDK_KV_EXEC_SHA256_LEN) == 0;
+}
+
+/*
+ * One cached COMPILED module, keyed by the content hash. We store the SERIALIZED
+ * compilation artifact (engine-portable blob) so a hit deserializes cheaply into
+ * the per-object zero-copy engine instead of recompiling. The serialized blob is
+ * produced ONLY from verified bytes (see module_insert), so the mere existence of
+ * an entry is an authorization fact: its key IS the blessed hash.
+ */
+struct nkvx_module_entry {
+	uint8_t				sha256[SPDK_KV_EXEC_SHA256_LEN];
+	uint8_t				*serialized;	/* portable compiled blob, owned */
+	size_t				serialized_len;
+	STAILQ_ENTRY(nkvx_module_entry)	link;
+};
+
+static struct {
+	pthread_mutex_t				mutex;
+	STAILQ_HEAD(, nkvx_module_entry)	modules;
+	bool					inited;
+} g_modcache = {
+	.mutex = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static void
+nkvx_modcache_init_once(void)
+{
+	if (!g_modcache.inited) {
+		STAILQ_INIT(&g_modcache.modules);
+		g_modcache.inited = true;
+	}
+}
+
+/* Find a cached compiled module by hash (mutex held). */
+static struct nkvx_module_entry *
+nkvx_modcache_lookup(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN])
+{
+	struct nkvx_module_entry *e;
+
+	STAILQ_FOREACH(e, &g_modcache.modules, link) {
+		if (memcmp(e->sha256, sha256, SPDK_KV_EXEC_SHA256_LEN) == 0) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+bool
+kvdev_rados_nkvx_wasm_module_cached(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN])
+{
+	bool found;
+
+	if (sha256 == NULL) {
+		return false;
+	}
+	pthread_mutex_lock(&g_modcache.mutex);
+	nkvx_modcache_init_once();
+	found = nkvx_modcache_lookup(sha256) != NULL;
+	pthread_mutex_unlock(&g_modcache.mutex);
+	return found;
+}
+
+int
+kvdev_rados_nkvx_wasm_module_insert(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN],
+				    const void *bytes, size_t bytes_len)
+{
+	const struct nkvx_wasm_api *api = nkvx_wasm_api();
+	wasm_config_t *config = NULL;
+	wasm_engine_t *engine = NULL;
+	wasmtime_module_t *module_h = NULL;
+	wasmtime_error_t *err = NULL;
+	wasm_byte_vec_t blob;
+	struct nkvx_module_entry *e = NULL;
+	int status = SPDK_KVDEV_IO_STATUS_FAILED;
+
+	if (api == NULL) {
+		return SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED;
+	}
+	if (sha256 == NULL || bytes == NULL || bytes_len == 0) {
+		return SPDK_KVDEV_IO_STATUS_INVALID;
+	}
+
+	/* THE GATE (ADR-0010): verify BEFORE compiling. Unverified bytes never reach
+	 * the compiler. A mismatch is an authorization failure, surfaced distinctly. */
+	if (!nkvx_wasm_verify(bytes, bytes_len, sha256)) {
+		SPDK_ERRLOG("nkvx/wasm: module hash MISMATCH — rejecting (bytes never compiled/run)\n");
+		return SPDK_KVDEV_IO_STATUS_INVALID;
+	}
+
+	/* Idempotent: if a prior Exec already cached this hash, we are done. */
+	pthread_mutex_lock(&g_modcache.mutex);
+	nkvx_modcache_init_once();
+	if (nkvx_modcache_lookup(sha256) != NULL) {
+		pthread_mutex_unlock(&g_modcache.mutex);
+		return SPDK_KVDEV_IO_STATUS_SUCCESS;
+	}
+	pthread_mutex_unlock(&g_modcache.mutex);
+
+	/*
+	 * Compile under a dedicated engine whose Tunables MATCH the per-object
+	 * zero-copy engine (reservation=0/guard=0/may_move=false, fuel + epoch
+	 * enabled) so the serialized artifact deserializes into that engine. The
+	 * host_memory_creator is NOT set here (it does not affect serialization
+	 * compatibility and is per-object).
+	 */
+	config = api->config_new();
+	if (config == NULL) {
+		return SPDK_KVDEV_IO_STATUS_FAILED;
+	}
+	api->config_consume_fuel_set(config, true);
+	api->config_epoch_interruption_set(config, true);
+	api->config_memory_reservation_set(config, 0);
+	api->config_memory_guard_size_set(config, 0);
+	api->config_memory_may_move_set(config, false);
+
+	engine = api->engine_new_with_config(config);
+	config = NULL;
+	if (engine == NULL) {
+		return SPDK_KVDEV_IO_STATUS_FAILED;
+	}
+
+	err = api->module_new(engine, bytes, bytes_len, &module_h);
+	if (err != NULL) {
+		nkvx_wasm_log_error(api, "module_new (verified module)", err);
+		goto out;
+	}
+
+	memset(&blob, 0, sizeof(blob));
+	err = api->module_serialize(module_h, &blob);
+	if (err != NULL) {
+		nkvx_wasm_log_error(api, "module_serialize", err);
+		goto out;
+	}
+
+	e = calloc(1, sizeof(*e));
+	if (e == NULL) {
+		api->byte_vec_delete(&blob);
+		status = SPDK_KVDEV_IO_STATUS_NOMEM;
+		goto out;
+	}
+	e->serialized = malloc(blob.size);
+	if (e->serialized == NULL) {
+		api->byte_vec_delete(&blob);
+		free(e);
+		e = NULL;
+		status = SPDK_KVDEV_IO_STATUS_NOMEM;
+		goto out;
+	}
+	memcpy(e->serialized, blob.data, blob.size);
+	e->serialized_len = blob.size;
+	memcpy(e->sha256, sha256, SPDK_KV_EXEC_SHA256_LEN);
+	api->byte_vec_delete(&blob);
+
+	pthread_mutex_lock(&g_modcache.mutex);
+	nkvx_modcache_init_once();
+	if (nkvx_modcache_lookup(sha256) != NULL) {
+		/* Lost a race: another insert won. Drop ours, success either way. */
+		pthread_mutex_unlock(&g_modcache.mutex);
+		free(e->serialized);
+		free(e);
+		e = NULL;
+		status = SPDK_KVDEV_IO_STATUS_SUCCESS;
+		goto out;
+	}
+	STAILQ_INSERT_TAIL(&g_modcache.modules, e, link);
+	pthread_mutex_unlock(&g_modcache.mutex);
+	e = NULL;	/* owned by the cache now */
+	status = SPDK_KVDEV_IO_STATUS_SUCCESS;
+
+out:
+	if (module_h != NULL) {
+		api->module_delete(module_h);
+	}
+	if (engine != NULL) {
+		api->engine_delete(engine);
+	}
+	if (e != NULL) {
+		free(e->serialized);
+		free(e);
+	}
+	return status;
+}
+
+void
+kvdev_rados_nkvx_wasm_module_cache_reset(void)
+{
+	struct nkvx_module_entry *e;
+
+	pthread_mutex_lock(&g_modcache.mutex);
+	nkvx_modcache_init_once();
+	while ((e = STAILQ_FIRST(&g_modcache.modules)) != NULL) {
+		STAILQ_REMOVE_HEAD(&g_modcache.modules, link);
+		free(e->serialized);
+		free(e);
+	}
+	pthread_mutex_unlock(&g_modcache.mutex);
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_module_cache_count(void)
+{
+	struct nkvx_module_entry *e;
+	uint64_t n = 0;
+
+	pthread_mutex_lock(&g_modcache.mutex);
+	nkvx_modcache_init_once();
+	STAILQ_FOREACH(e, &g_modcache.modules, link) {
+		n++;
+	}
+	pthread_mutex_unlock(&g_modcache.mutex);
+	return n;
+}
+
+/*
+ * Obtain a compiled module for \c mod, ready to instantiate in \c engine. On a
+ * sha256-cache hit, deserialize the cached artifact (no recompile). On a miss,
+ * VERIFY + compile + cache via module_insert, then deserialize. Returns a freshly
+ * owned wasmtime_module_t in *out_mod (caller module_delete's it), or a negative
+ * SPDK_KVDEV_IO_STATUS_* on failure (mismatch/compile/missing bytes). NEVER
+ * returns a module for unverified bytes.
+ */
+static int
+nkvx_module_obtain(const struct nkvx_wasm_api *api, wasm_engine_t *engine,
+		   const struct kvdev_rados_nkvx_module *mod, wasmtime_module_t **out_mod)
+{
+	struct nkvx_module_entry *e;
+	uint8_t *blob = NULL;
+	size_t blob_len = 0;
+	wasmtime_error_t *err;
+	wasmtime_module_t *m = NULL;
+	int rc;
+
+	*out_mod = NULL;
+
+	pthread_mutex_lock(&g_modcache.mutex);
+	nkvx_modcache_init_once();
+	e = nkvx_modcache_lookup(mod->sha256);
+	if (e != NULL) {
+		/* Copy the blob out under the lock so a concurrent reset can't free it
+		 * under us; deserialize without holding the modcache mutex. */
+		blob = malloc(e->serialized_len);
+		if (blob == NULL) {
+			pthread_mutex_unlock(&g_modcache.mutex);
+			return SPDK_KVDEV_IO_STATUS_NOMEM;
+		}
+		memcpy(blob, e->serialized, e->serialized_len);
+		blob_len = e->serialized_len;
+	}
+	pthread_mutex_unlock(&g_modcache.mutex);
+
+	if (blob == NULL) {
+		/* Miss: verify + compile + cache from the fetched bytes. */
+		if (mod->bytes == NULL || mod->bytes_len == 0) {
+			SPDK_ERRLOG("nkvx/wasm: module-cache miss but no fetched bytes supplied\n");
+			return SPDK_KVDEV_IO_STATUS_FAILED;
+		}
+		rc = kvdev_rados_nkvx_wasm_module_insert(mod->sha256, mod->bytes, mod->bytes_len);
+		if (rc != SPDK_KVDEV_IO_STATUS_SUCCESS) {
+			return rc;	/* mismatch (INVALID) / compile (FAILED) — never run */
+		}
+		pthread_mutex_lock(&g_modcache.mutex);
+		e = nkvx_modcache_lookup(mod->sha256);
+		if (e != NULL) {
+			blob = malloc(e->serialized_len);
+			if (blob != NULL) {
+				memcpy(blob, e->serialized, e->serialized_len);
+				blob_len = e->serialized_len;
+			}
+		}
+		pthread_mutex_unlock(&g_modcache.mutex);
+		if (blob == NULL) {
+			return SPDK_KVDEV_IO_STATUS_FAILED;
+		}
+	}
+
+	err = api->module_deserialize(engine, blob, blob_len, &m);
+	free(blob);
+	if (err != NULL) {
+		nkvx_wasm_log_error(api, "module_deserialize", err);
+		return SPDK_KVDEV_IO_STATUS_FAILED;
+	}
+	*out_mod = m;
+	return SPDK_KVDEV_IO_STATUS_SUCCESS;
 }
 
 /* ==========================================================================
@@ -873,6 +1254,7 @@ nkvx_zc_new_memory(void *env, const wasm_memorytype_t *ty, size_t minimum,
  */
 static int
 nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
+		const struct kvdev_rados_nkvx_module *mod,
 		struct nkvx_obj_entry *obj, struct nkvx_warm_entry **out_warm)
 {
 	char path[1024];
@@ -892,12 +1274,21 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	wasmtime_memory_creator_t creator;
 	int rc = -1;
 
-	if (nkvx_wasm_module_path(module, path, sizeof(path)) != 0) {
-		return -1;
-	}
-	wasm = nkvx_wasm_read_file(path, &wasm_len);
-	if (wasm == NULL) {
-		return -1;
+	/*
+	 * TB3 (spdk-fbm): the VERIFIED path supplies \c mod (the bound sha256 + the
+	 * fetched bytes). We obtain the compiled module from the sha256 cache instead
+	 * of reading an unverified file from disk. The legacy filesystem-load-by-name
+	 * path (mod == NULL) is retained only for the in-tree unit tests that drive
+	 * the executor directly; the live datapath always passes a verified \c mod.
+	 */
+	if (mod == NULL) {
+		if (nkvx_wasm_module_path(module, path, sizeof(path)) != 0) {
+			return -1;
+		}
+		wasm = nkvx_wasm_read_file(path, &wasm_len);
+		if (wasm == NULL) {
+			return -1;
+		}
 	}
 
 	/* Per-binding zero-copy context: hand the cache buffer to the MemoryCreator.
@@ -955,10 +1346,23 @@ nkvx_warm_build(const struct nkvx_wasm_api *api, const char *module,
 	}
 	ctx = api->store_context(store);
 
-	err = api->module_new(engine, wasm, wasm_len, &module_h);
-	if (err != NULL) {
-		nkvx_wasm_log_error(api, "module_new", err);
-		goto out;
+	if (mod != NULL) {
+		/* VERIFIED path (ADR-0010): deserialize the sha256-cached compiled module
+		 * (verify+compile happened in module_insert on the cache-miss). This never
+		 * yields a module for unverified bytes. */
+		int orc = nkvx_module_obtain(api, engine, mod, &module_h);
+
+		if (orc != SPDK_KVDEV_IO_STATUS_SUCCESS) {
+			SPDK_ERRLOG("nkvx/wasm: could not obtain verified module '%s' (status %d)\n",
+				    module, orc);
+			goto out;
+		}
+	} else {
+		err = api->module_new(engine, wasm, wasm_len, &module_h);
+		if (err != NULL) {
+			nkvx_wasm_log_error(api, "module_new", err);
+			goto out;
+		}
 	}
 	err = api->instance_new(ctx, module_h, NULL, 0, &instance, &trap);
 	if (err != NULL) {
@@ -1049,6 +1453,7 @@ nkvx_warm_free(const struct nkvx_wasm_api *api, struct nkvx_warm_entry *w)
  */
 static int
 nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
+			  const struct kvdev_rados_nkvx_module *mod,
 			  struct nkvx_obj_entry *obj,
 			  void *out, uint32_t out_len, uint32_t *result_len)
 {
@@ -1066,7 +1471,7 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 	if (warm != NULL) {
 		g_nkvx_wasm_stats.warm_hits++;
 	} else {
-		if (nkvx_warm_build(api, name, obj, &warm) != 0) {
+		if (nkvx_warm_build(api, name, mod, obj, &warm) != 0) {
 			SPDK_ERRLOG("nkvx/wasm: warm build failed for '%s'/'%s'\n", name, obj->obj_key);
 			return SPDK_KVDEV_IO_STATUS_FAILED;
 		}
@@ -1082,9 +1487,10 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 	 * Per-invocation caps (TB2) on the warm store before the call (spdk-ii0 D3):
 	 * arm fuel AND the memory limiter AND the epoch deadline, matching run() so the
 	 * warm/cached path is contained against compute-, memory-, and wall-clock
-	 * runaways exactly like the cold path.
+	 * runaways exactly like the cold path. Caps source: the binding's caps word
+	 * (TB3) when a verified \c mod is present; otherwise defaults (legacy tests).
 	 */
-	nkvx_wasm_caps_load(&caps);
+	nkvx_wasm_caps_load(&caps, mod != NULL ? mod->caps : 0);
 
 	/* MEMORY CAP: bound linear memory so a memory.grow past the cap fails and the
 	 * module is contained (never OOMing the target), exactly as run() does. */
@@ -1178,6 +1584,7 @@ nkvx_run_on_object_locked(const struct nkvx_wasm_api *api, const char *name,
 
 int
 kvdev_rados_nkvx_wasm_run_cached(const char *name,
+				 const struct kvdev_rados_nkvx_module *mod,
 				 const char *obj_key, size_t object_len,
 				 kvdev_rados_nkvx_fill_fn fill, void *fill_arg,
 				 void *out, uint32_t out_len, uint32_t *result_len)
@@ -1244,7 +1651,7 @@ kvdev_rados_nkvx_wasm_run_cached(const char *name,
 		STAILQ_INSERT_TAIL(&g_cache.objects, obj, link);
 	}
 
-	status = nkvx_run_on_object_locked(api, name, obj, out, out_len, result_len);
+	status = nkvx_run_on_object_locked(api, name, mod, obj, out, out_len, result_len);
 
 	pthread_mutex_unlock(&g_cache.mutex);
 	return status;
@@ -1259,7 +1666,8 @@ kvdev_rados_nkvx_wasm_run_cached(const char *name,
  * a content hit (no librados refetch happened on this Exec).
  */
 int
-kvdev_rados_nkvx_wasm_run_pinned(const char *name, void *pin,
+kvdev_rados_nkvx_wasm_run_pinned(const char *name,
+				 const struct kvdev_rados_nkvx_module *mod, void *pin,
 				 void *out, uint32_t out_len, uint32_t *result_len)
 {
 	const struct nkvx_wasm_api *api = nkvx_wasm_api();
@@ -1279,7 +1687,7 @@ kvdev_rados_nkvx_wasm_run_pinned(const char *name, void *pin,
 	pthread_mutex_lock(&g_cache.mutex);
 	nkvx_cache_init_once();
 	g_nkvx_wasm_stats.content_hits++;
-	status = nkvx_run_on_object_locked(api, name, obj, out, out_len, result_len);
+	status = nkvx_run_on_object_locked(api, name, mod, obj, out, out_len, result_len);
 	pthread_mutex_unlock(&g_cache.mutex);
 	return status;
 }
@@ -1412,6 +1820,7 @@ kvdev_rados_nkvx_wasm_cache_invalidate(const char *obj_key)
 
 int
 kvdev_rados_nkvx_wasm_run(const char *name,
+			  const struct kvdev_rados_nkvx_module *mod,
 			  const void *object, size_t object_len,
 			  void *out, uint32_t out_len, uint32_t *result_len)
 {
@@ -1444,6 +1853,19 @@ kvdev_rados_nkvx_wasm_run(const char *name,
 		return SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED;
 	}
 
+	/*
+	 * This plain-copy path (no object cache) is legacy/test-only: the live TB3+
+	 * datapath always carries an object id and runs through run_cached/run_pinned
+	 * (zero-copy + the verified module cache). A verified \c mod is therefore never
+	 * routed here; reject it rather than re-derive a separate engine-config that
+	 * matches the modcache engine for deserialize. The legacy path reads an
+	 * unverified file by name (in-tree tests only).
+	 */
+	if (mod != NULL) {
+		SPDK_ERRLOG("nkvx/wasm: verified module not supported on the plain-copy path; "
+			    "use the cached/pinned path\n");
+		return SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED;
+	}
 	if (nkvx_wasm_module_path(name, path, sizeof(path)) != 0) {
 		return SPDK_KVDEV_IO_STATUS_FAILED;
 	}
@@ -1452,8 +1874,8 @@ kvdev_rados_nkvx_wasm_run(const char *name,
 		return SPDK_KVDEV_IO_STATUS_FAILED;
 	}
 
-	/* Per-invocation caps (TB2). See nkvx_wasm_caps_load() for the source. */
-	nkvx_wasm_caps_load(&caps);
+	/* Per-invocation caps (legacy defaults; env-overridable). */
+	nkvx_wasm_caps_load(&caps, 0);
 	SPDK_NOTICELOG("nkvx/wasm: module '%s' caps fuel=%" PRIu64 " epoch_ticks=%" PRIu64
 		       " max_mem=%" PRIu64 "B\n", name,
 		       caps.fuel_ceiling, caps.epoch_deadline_ticks, caps.max_memory_bytes);
@@ -1647,9 +2069,11 @@ out:
 
 int
 kvdev_rados_nkvx_wasm_run(const char *name,
+			  const struct kvdev_rados_nkvx_module *mod,
 			  const void *object, size_t object_len,
 			  void *out, uint32_t out_len, uint32_t *result_len)
 {
+	(void)mod;
 	(void)object;
 	(void)object_len;
 	(void)out;
@@ -1664,10 +2088,12 @@ kvdev_rados_nkvx_wasm_run(const char *name,
 
 int
 kvdev_rados_nkvx_wasm_run_cached(const char *name,
+				 const struct kvdev_rados_nkvx_module *mod,
 				 const char *obj_key, size_t object_len,
 				 kvdev_rados_nkvx_fill_fn fill, void *fill_arg,
 				 void *out, uint32_t out_len, uint32_t *result_len)
 {
+	(void)mod;
 	(void)obj_key;
 	(void)object_len;
 	(void)fill;
@@ -1686,6 +2112,37 @@ void
 kvdev_rados_nkvx_wasm_cache_reset(void)
 {
 	/* No cache exists in the stub build. */
+}
+
+bool
+kvdev_rados_nkvx_wasm_module_cached(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN])
+{
+	(void)sha256;
+	/* No module cache in the stub build: always a miss. */
+	return false;
+}
+
+int
+kvdev_rados_nkvx_wasm_module_insert(const uint8_t sha256[SPDK_KV_EXEC_SHA256_LEN],
+				    const void *bytes, size_t bytes_len)
+{
+	(void)sha256;
+	(void)bytes;
+	(void)bytes_len;
+	/* --without-wasm: cannot compile/run; fail-soft, never crash. */
+	return SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED;
+}
+
+void
+kvdev_rados_nkvx_wasm_module_cache_reset(void)
+{
+	/* No module cache in the stub build. */
+}
+
+uint64_t
+kvdev_rados_nkvx_wasm_module_cache_count(void)
+{
+	return 0;
 }
 
 bool
@@ -1711,9 +2168,11 @@ kvdev_rados_nkvx_wasm_cache_unpin(void *handle)
 }
 
 int
-kvdev_rados_nkvx_wasm_run_pinned(const char *name, void *pin,
+kvdev_rados_nkvx_wasm_run_pinned(const char *name,
+				 const struct kvdev_rados_nkvx_module *mod, void *pin,
 				 void *out, uint32_t out_len, uint32_t *result_len)
 {
+	(void)mod;
 	(void)pin;
 	(void)out;
 	(void)out_len;

@@ -41,6 +41,14 @@
  */
 #define KVDEV_RADOS_NKVX_COLDFILL_CAP (1ull * 1024 * 1024)
 
+/*
+ * TB3 (spdk-fbm) module-fetch cap: the largest .wasm artifact the executor will
+ * cold-read from (module_namespace, module_key). A compiled module is small; 16
+ * MiB is a generous ceiling. A module object larger than this is rejected (never
+ * partially read + run) — the hash check would fail on a truncated read anyway.
+ */
+#define KVDEV_RADOS_NKVX_MODULE_FETCH_CAP (16ull * 1024 * 1024)
+
 /* xattr name for the store-only vendor TTL (ADR-0003 spirit; not enforced). */
 #define KVDEV_RADOS_TTL_XATTR "kv_ttl"
 
@@ -136,6 +144,27 @@ struct kvdev_rados_io {
 	char				nkvx_oid[KVDEV_RADOS_OID_MAX];	/* TB4 cache key */
 	void				*nkvx_obj;
 	uint32_t			nkvx_obj_cap;	/* allocated size of nkvx_obj */
+	/*
+	 * TB3 (spdk-fbm) verified-module state. nkvx_mod carries the bound sha256 +
+	 * caps (by value) and, on the fetch-miss path, a pointer to nkvx_mod_buf (the
+	 * librados-fetched .wasm). nkvx_need_module_fetch is set when the sha256 cache
+	 * missed and the module object must be cold-read from RADOS BEFORE the data
+	 * object. nkvx_mod_* hold that module read's state; the module object may live
+	 * in a DIFFERENT pool/namespace (nkvx_mod_ioctx), distinct from the data oid.
+	 */
+	struct kvdev_rados_io_channel	*ch;		/* owning channel (for async continue) */
+	struct kvdev_rados_nkvx_module	nkvx_mod;
+	bool				nkvx_has_mod;	/* a verified binding is present */
+	bool				nkvx_in_module_fetch;	/* this aio IS the module read */
+	char				nkvx_mod_key[SPDK_KVDEV_EXEC_KEY_MAX_LEN + 1];
+	char				nkvx_mod_ns[256];	/* module pool[/namespace] locator */
+	rados_ioctx_t			nkvx_mod_ioctx;	/* module-object ioctx (own pool/ns) */
+	void				*nkvx_mod_buf;	/* malloc'd module .wasm buffer */
+	uint32_t			nkvx_mod_cap;	/* allocated size of nkvx_mod_buf */
+	size_t				nkvx_mod_bytes_read;
+	int				nkvx_mod_read_rval;
+	uint64_t			nkvx_mod_stat_size;
+	time_t				nkvx_mod_stat_mtime;
 	spdk_kvdev_io_completion_cb	cb_fn;
 	void				*cb_arg;
 	TAILQ_ENTRY(kvdev_rados_io)	link;
@@ -143,6 +172,12 @@ struct kvdev_rados_io {
 
 static int kvdev_rados_module_init(void);
 static void kvdev_rados_module_fini(void);
+
+/* Forward declarations for the TB3 (spdk-fbm) two-phase nkvx Exec: the module-fetch
+ * harvest continues into the data phase, both defined further down. */
+static void kvdev_rados_aio_cb(rados_completion_t comp, void *arg);
+static const struct kvdev_rados_nkvx_module *kvdev_rados_nkvx_mod_arg(struct kvdev_rados_io *io);
+static int kvdev_rados_nkvx_start_data_phase(struct kvdev_rados_io *io);
 
 static struct spdk_kvdev_module g_kvdev_rados_module = {
 	.name = "kvdev_rados",
@@ -578,6 +613,7 @@ kvdev_rados_nkvx_io_done(void *done_arg, int kvstatus, uint32_t out_len)
 
 	io->cb_fn(io->cb_arg, kvstatus, out_len);
 	free(io->nkvx_obj);
+	free(io->nkvx_mod_buf);	/* TB3: the fetched module bytes (NULL on hit/legacy) */
 	free(io);
 }
 
@@ -606,9 +642,12 @@ kvdev_rados_nkvx_dispatch_or_fail(struct kvdev_rados_io *io, int ret)
 			goto done_free;
 		}
 
-		/* Dispatch the built-in module off the reactor against the true
-		 * object length. The buffer + io live until nkvx_io_done frees them. */
-		rc = kvdev_rados_nkvx_dispatch(io->nkvx_module, io->nkvx_oid, NULL,
+		/* Dispatch the module off the reactor against the true object length.
+		 * TB3: pass the verified-module arg (sha256 + fetched bytes, or NULL on
+		 * the legacy/built-in path). The buffer + io live until io_done frees
+		 * them. */
+		rc = kvdev_rados_nkvx_dispatch(io->nkvx_module, kvdev_rados_nkvx_mod_arg(io),
+					       io->nkvx_oid, NULL,
 					       io->nkvx_obj, io->stat_size, io->host_out,
 					       io->buf_len, kvdev_rados_nkvx_io_done, io);
 		if (rc != 0) {
@@ -627,6 +666,94 @@ kvdev_rados_nkvx_dispatch_or_fail(struct kvdev_rados_io *io, int ret)
 
 done_free:
 	free(io->nkvx_obj);
+	free(io->nkvx_mod_buf);
+	free(io);
+}
+
+/*
+ * TB3 (spdk-fbm): the MODULE-object cold read completed (harvested by the poller).
+ * On a successful read: verify the bytes against the bound sha256 and compile +
+ * cache them by hash (kvdev_rados_nkvx_wasm_module_insert is the HARD gate — it
+ * never compiles/caches bytes that fail the hash check), then CONTINUE to the
+ * data-object phase. On any read/verify/compile failure: complete with a clear
+ * status and free — the module is NEVER run. librados read state (comp/read_op)
+ * is already released by the caller; the module ioctx is destroyed here.
+ *
+ * NOTE: module_insert does CPU work (compile) on the reactor here. This happens at
+ * most ONCE per unique module (a sha256-cache miss); every subsequent Exec of the
+ * same hash short-circuits the whole fetch+compile at the reactor-side cache probe
+ * in kvdev_rados_nkvx_exec. (Moving the one-time compile fully off-reactor is a
+ * possible later refinement; flagged in the deliverable.)
+ */
+static void
+kvdev_rados_nkvx_module_fetched(struct kvdev_rados_io *io, int ret)
+{
+	int status;
+	int insert;
+
+	/* Done with the module ioctx regardless of outcome. */
+	if (io->nkvx_mod_ioctx != NULL) {
+		rados_ioctx_destroy(io->nkvx_mod_ioctx);
+		io->nkvx_mod_ioctx = NULL;
+	}
+
+	if (ret < 0 || io->nkvx_mod_read_rval < 0) {
+		status = ret >= 0 ?
+			 kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, io->nkvx_mod_read_rval) :
+			 kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, ret);
+		SPDK_ERRLOG("nkvx: module fetch of '%s' failed -> module not run\n",
+			    io->nkvx_mod_key);
+		io->cb_fn(io->cb_arg, status, 0);
+		goto fail_free;
+	}
+	if (io->nkvx_mod_stat_size == 0 || io->nkvx_mod_stat_size > io->nkvx_mod_cap) {
+		SPDK_ERRLOG("nkvx: module '%s' size %" PRIu64 " B invalid/exceeds fetch cap %u B "
+			    "-> rejected\n", io->nkvx_mod_key,
+			    (uint64_t)io->nkvx_mod_stat_size, io->nkvx_mod_cap);
+		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_FAILED, 0);
+		goto fail_free;
+	}
+
+	/*
+	 * THE GATE (ADR-0010): verify + compile + cache by hash. A hash MISMATCH
+	 * returns INVALID and the bytes are never compiled or run. We surface that
+	 * distinctly so a tampered/wrong module is observably rejected.
+	 */
+	insert = kvdev_rados_nkvx_wasm_module_insert(io->nkvx_mod.sha256, io->nkvx_mod_buf,
+						     (size_t)io->nkvx_mod_stat_size);
+	if (insert != SPDK_KVDEV_IO_STATUS_SUCCESS) {
+		SPDK_ERRLOG("nkvx: module '%s' rejected before run (status %d: %s)\n",
+			    io->nkvx_mod_key, insert,
+			    insert == SPDK_KVDEV_IO_STATUS_INVALID ? "HASH MISMATCH" :
+			    insert == SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED ? "runtime unavailable" :
+			    "compile/cache failure");
+		io->cb_fn(io->cb_arg, insert, 0);
+		goto fail_free;
+	}
+
+	/*
+	 * Module verified, compiled, and cached. The fetched bytes are no longer
+	 * needed (the compiled artifact is cached by hash); free them now and continue
+	 * to the data-object phase, which serves the cached compiled module.
+	 */
+	free(io->nkvx_mod_buf);
+	io->nkvx_mod_buf = NULL;
+	io->nkvx_in_module_fetch = false;
+
+	/* Need a FRESH completion for the data-phase aio (the module-fetch comp was
+	 * released by the caller). On failure, complete + free. */
+	if (rados_aio_create_completion((void *)io, kvdev_rados_aio_cb, NULL, &io->comp) < 0) {
+		SPDK_ERRLOG("nkvx: cannot create completion for data phase\n");
+		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		free(io);
+		return;
+	}
+	kvdev_rados_nkvx_start_data_phase(io);
+	return;
+
+fail_free:
+	free(io->nkvx_mod_buf);
+	free(io->nkvx_obj);
 	free(io);
 }
 
@@ -644,11 +771,21 @@ kvdev_rados_io_finish(struct kvdev_rados_io *io)
 	 * the librados state here and let the dispatch helper own io afterwards.
 	 */
 	if (io->op == KVDEV_RADOS_OP_NKVX_EXEC) {
+		bool module_fetch = io->nkvx_in_module_fetch;
+
 		rados_aio_release(io->comp);
+		io->comp = NULL;
 		if (io->read_op) {
 			rados_release_read_op(io->read_op);
+			io->read_op = NULL;
 		}
-		kvdev_rados_nkvx_dispatch_or_fail(io, ret);
+		/* TB3: the module-fetch phase verifies+compiles+caches then continues to
+		 * the data phase; the data phase hands the object to the worker. */
+		if (module_fetch) {
+			kvdev_rados_nkvx_module_fetched(io, ret);
+		} else {
+			kvdev_rados_nkvx_dispatch_or_fail(io, ret);
+		}
 		return;
 	}
 
@@ -777,6 +914,7 @@ kvdev_rados_io_alloc(struct kvdev_rados_io_channel *ch, enum kvdev_rados_op op,
 		return NULL;
 	}
 	io->op = op;
+	io->ch = ch;
 	io->cb_fn = cb_fn;
 	io->cb_arg = cb_arg;
 
@@ -1018,16 +1156,243 @@ kvdev_rados_exist(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
  *      module and hands the result back to this SPDK thread. The reactor is
  *      never blocked by module execution.
  */
+/* Build a verified-module binding view for the worker from io's carried fields.
+ * On the fetch-miss path bytes/len point at the just-fetched module buffer; on a
+ * module-cache hit they are NULL/0 (the executor serves the cached compiled
+ * module). Returns NULL when no verified binding is present (legacy/test path). */
+static const struct kvdev_rados_nkvx_module *
+kvdev_rados_nkvx_mod_arg(struct kvdev_rados_io *io)
+{
+	if (!io->nkvx_has_mod) {
+		return NULL;
+	}
+	if (io->nkvx_mod_buf != NULL) {
+		io->nkvx_mod.bytes = io->nkvx_mod_buf;
+		io->nkvx_mod.bytes_len = (size_t)io->nkvx_mod_stat_size;
+	} else {
+		io->nkvx_mod.bytes = NULL;
+		io->nkvx_mod.bytes_len = 0;
+	}
+	return &io->nkvx_mod;
+}
+
+/*
+ * Start the DATA-OBJECT phase of an nkvx Exec: probe-and-pin the executor's
+ * identity cache for oid; on a hit dispatch straight to the worker (no librados
+ * read), on a miss issue the cold-fill aio. Runs ON THE REACTOR. Reused by the
+ * module-cache-hit fast path and by the module-fetch harvest continuation. On a
+ * synchronous failure it fires cb_fn and frees io (returns 0 like the rest of the
+ * datapath). io->comp must be a fresh, unreleased completion on entry.
+ */
+static int
+kvdev_rados_nkvx_start_data_phase(struct kvdev_rados_io *io)
+{
+	struct kvdev_rados_io_channel *ch = io->ch;
+	struct kvdev_rados *rdev = ch->rdev;
+	int rc;
+
+	/*
+	 * B2 (spdk-ii0): probe-and-PIN the data object's identity cache. A hit skips
+	 * the librados data read entirely and dispatches straight to the worker.
+	 * D2 race-safety: the pin defers the buffer free so the worker serves exactly
+	 * the pinned version even across a concurrent Store/Delete invalidation.
+	 */
+	{
+		void *pin = kvdev_rados_nkvx_wasm_cache_pin(io->nkvx_oid);
+
+		if (pin != NULL) {
+			SPDK_NOTICELOG("nkvx: oid %s served from executor cache "
+				       "(pinned, no librados read)\n", io->nkvx_oid);
+			rados_aio_release(io->comp);
+			io->comp = NULL;
+			io->nkvx_obj = NULL;
+			io->nkvx_obj_cap = 0;
+			rc = kvdev_rados_nkvx_dispatch(io->nkvx_module,
+						       kvdev_rados_nkvx_mod_arg(io),
+						       io->nkvx_oid, pin,
+						       NULL, 0, io->host_out, io->buf_len,
+						       kvdev_rados_nkvx_io_done, io);
+			if (rc != 0) {
+				SPDK_ERRLOG("nkvx: cache-hit dispatch failed: %s\n",
+					    spdk_strerror(-rc));
+				kvdev_rados_nkvx_wasm_cache_unpin(pin);
+				io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+				free(io->nkvx_mod_buf);
+				free(io);
+				return 0;
+			}
+			return 0;
+		}
+	}
+
+	SPDK_NOTICELOG("nkvx: oid %s cache miss -> librados cold-fill read\n", io->nkvx_oid);
+
+	io->nkvx_obj_cap = KVDEV_RADOS_NKVX_COLDFILL_CAP;
+	io->nkvx_obj = malloc(io->nkvx_obj_cap);
+	if (io->nkvx_obj == NULL) {
+		rados_aio_release(io->comp);
+		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		free(io->nkvx_mod_buf);
+		free(io);
+		return 0;
+	}
+
+	io->read_op = rados_create_read_op();
+	if (io->read_op == NULL) {
+		free(io->nkvx_obj);
+		rados_aio_release(io->comp);
+		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		free(io->nkvx_mod_buf);
+		free(io);
+		return 0;
+	}
+
+	rados_read_op_read(io->read_op, 0, io->nkvx_obj_cap, io->nkvx_obj,
+			   &io->bytes_read, &io->read_rval);
+	rados_read_op_stat(io->read_op, &io->stat_size, &io->stat_mtime, NULL);
+
+	rc = rados_aio_read_op_operate(io->read_op, rdev->io_ctx, io->comp, io->nkvx_oid, 0);
+	if (rc < 0) {
+		rados_release_read_op(io->read_op);
+		free(io->nkvx_obj);
+		rados_aio_release(io->comp);
+		io->cb_fn(io->cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, rc), 0);
+		free(io->nkvx_mod_buf);
+		free(io);
+		return 0;
+	}
+
+	TAILQ_INSERT_TAIL(&ch->inflight, io, link);
+	return 0;
+}
+
+/*
+ * TB3 (spdk-fbm): the module object lives at (module_namespace, module_key) in
+ * RADOS, possibly a DIFFERENT pool/namespace than the data oid. module_namespace
+ * is encoded as "pool" or "pool/namespace". Create an ioctx for it on the shared
+ * cluster handle. Returns 0 on success (*out set, caller destroys it), negative
+ * errno otherwise. NULL/empty module_namespace falls back to the data ioctx's pool
+ * is NOT assumed — a wasm binding must name where its module lives.
+ */
+static int
+kvdev_rados_nkvx_module_ioctx(struct kvdev_rados *rdev, const char *module_namespace,
+			      rados_ioctx_t *out)
+{
+	char buf[256];
+	char *slash;
+	const char *pool;
+	const char *ns = NULL;
+	rados_ioctx_t ioctx;
+	int rc;
+
+	*out = NULL;
+	if (module_namespace == NULL || module_namespace[0] == '\0') {
+		SPDK_ERRLOG("nkvx: wasm binding has no module_namespace (module locator)\n");
+		return -EINVAL;
+	}
+	if (snprintf(buf, sizeof(buf), "%s", module_namespace) >= (int)sizeof(buf)) {
+		SPDK_ERRLOG("nkvx: module_namespace too long\n");
+		return -EINVAL;
+	}
+	pool = buf;
+	slash = strchr(buf, '/');
+	if (slash != NULL) {
+		*slash = '\0';
+		ns = slash + 1;	/* may be "" => default namespace */
+	}
+
+	rc = rados_ioctx_create(*rdev->cluster_p, pool, &ioctx);
+	if (rc < 0) {
+		SPDK_ERRLOG("nkvx: cannot open module pool '%s': %s\n", pool, spdk_strerror(-rc));
+		return rc;
+	}
+	if (ns != NULL && ns[0] != '\0') {
+		rados_ioctx_set_namespace(ioctx, ns);
+	}
+	*out = ioctx;
+	return 0;
+}
+
+/*
+ * Issue the librados aio that cold-reads the MODULE object (read+stat) into
+ * io->nkvx_mod_buf. Runs ON THE REACTOR; harvested by the channel poller, which
+ * (on success) verifies+compiles+caches the bytes by hash and then continues to
+ * the data-object phase. Only invoked on a sha256 module-cache MISS.
+ */
+static int
+kvdev_rados_nkvx_start_module_fetch(struct kvdev_rados_io *io)
+{
+	struct kvdev_rados_io_channel *ch = io->ch;
+	struct kvdev_rados *rdev = ch->rdev;
+	int rc;
+
+	rc = kvdev_rados_nkvx_module_ioctx(rdev, io->nkvx_mod_ns,
+					   &io->nkvx_mod_ioctx);
+	if (rc < 0) {
+		rados_aio_release(io->comp);
+		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+		free(io);
+		return 0;
+	}
+
+	io->nkvx_mod_cap = KVDEV_RADOS_NKVX_MODULE_FETCH_CAP;
+	io->nkvx_mod_buf = malloc(io->nkvx_mod_cap);
+	if (io->nkvx_mod_buf == NULL) {
+		rados_ioctx_destroy(io->nkvx_mod_ioctx);
+		io->nkvx_mod_ioctx = NULL;
+		rados_aio_release(io->comp);
+		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		free(io);
+		return 0;
+	}
+
+	io->read_op = rados_create_read_op();
+	if (io->read_op == NULL) {
+		free(io->nkvx_mod_buf);
+		io->nkvx_mod_buf = NULL;
+		rados_ioctx_destroy(io->nkvx_mod_ioctx);
+		io->nkvx_mod_ioctx = NULL;
+		rados_aio_release(io->comp);
+		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		free(io);
+		return 0;
+	}
+
+	io->nkvx_in_module_fetch = true;
+	rados_read_op_read(io->read_op, 0, io->nkvx_mod_cap, io->nkvx_mod_buf,
+			   &io->nkvx_mod_bytes_read, &io->nkvx_mod_read_rval);
+	rados_read_op_stat(io->read_op, &io->nkvx_mod_stat_size, &io->nkvx_mod_stat_mtime, NULL);
+
+	SPDK_NOTICELOG("nkvx: module-cache miss -> fetching module '%s' from '%s'\n",
+		       io->nkvx_mod_key, io->nkvx_mod_ns);
+
+	rc = rados_aio_read_op_operate(io->read_op, io->nkvx_mod_ioctx, io->comp,
+				       io->nkvx_mod_key, 0);
+	if (rc < 0) {
+		rados_release_read_op(io->read_op);
+		io->read_op = NULL;
+		free(io->nkvx_mod_buf);
+		io->nkvx_mod_buf = NULL;
+		rados_ioctx_destroy(io->nkvx_mod_ioctx);
+		io->nkvx_mod_ioctx = NULL;
+		rados_aio_release(io->comp);
+		io->cb_fn(io->cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, rc), 0);
+		free(io);
+		return 0;
+	}
+
+	TAILQ_INSERT_TAIL(&ch->inflight, io, link);
+	return 0;
+}
+
 static int
 kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_t key_len,
-		      const char *module,
+		      const char *module, const struct spdk_kv_exec_binding *binding,
 		      void *output_buf, uint32_t output_buf_len,
 		      spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
 {
-	struct kvdev_rados *rdev = ch->rdev;
 	struct kvdev_rados_io *io;
 	char oid[KVDEV_RADOS_EXEC_OID_MAX];
-	int rc;
 
 	if (module[0] == '\0') {
 		SPDK_ERRLOG("nkvx: empty module name in binding\n");
@@ -1050,83 +1415,42 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
 	snprintf(io->nkvx_oid, sizeof(io->nkvx_oid), "%s", oid);
 
 	/*
-	 * B2 (spdk-ii0): if the executor already holds this object in its identity
-	 * cache, skip the librados read ENTIRELY and dispatch straight to the
-	 * executor. This makes the cold-fill the ONLY librados touch: the 1st Exec of
-	 * an object reads it once; subsequent Execs of the same object do ZERO librados
-	 * reads.
-	 *
-	 * D2 RACE SAFETY (spdk-ii0): probe-and-PIN, not a bare boolean probe. A Store
-	 * or Delete on the SAME oid can invalidate the cache between this probe and the
-	 * worker's later read. cache_pin takes a reference that DEFERS the buffer free,
-	 * so the worker serves exactly the pinned version (no use-after-free, no stale
-	 * read served to a LATER Exec — the invalidated entry is unlinked, so the next
-	 * Exec cold-fills fresh). The worker releases the pin when it finishes; if the
-	 * dispatch itself fails we release it here. The unused aio completion is freed.
+	 * TB3 (spdk-fbm): a real wasm binding carries the authorization anchor. Copy
+	 * the bound sha256 + caps + module locator into the io (the binding strings are
+	 * caller-owned and must not be referenced after we return). The module_key
+	 * names the module OBJECT to fetch; module_namespace names its pool/ns. We keep
+	 * the binding's module_namespace pointer only for the duration of THIS call —
+	 * the fetch path copies what it needs (module_namespace is read synchronously
+	 * in start_module_fetch before any async return).
 	 */
-	{
-		void *pin = kvdev_rados_nkvx_wasm_cache_pin(io->nkvx_oid);
+	if (binding != NULL && binding->sha256_valid) {
+		io->nkvx_has_mod = true;
+		memcpy(io->nkvx_mod.sha256, binding->sha256, SPDK_KV_EXEC_SHA256_LEN);
+		io->nkvx_mod.caps = binding->caps;
+		io->nkvx_mod.bytes = NULL;
+		io->nkvx_mod.bytes_len = 0;
+		snprintf(io->nkvx_mod_key, sizeof(io->nkvx_mod_key), "%s",
+			 binding->module_key != NULL ? binding->module_key : "");
+		snprintf(io->nkvx_mod_ns, sizeof(io->nkvx_mod_ns), "%s",
+			 binding->module_namespace != NULL ? binding->module_namespace : "");
 
-		if (pin != NULL) {
-			SPDK_NOTICELOG("nkvx: oid %s served from executor cache "
-				       "(pinned, no librados read)\n", io->nkvx_oid);
-			rados_aio_release(io->comp);
-			io->comp = NULL;
-			io->nkvx_obj = NULL;
-			io->nkvx_obj_cap = 0;
-			rc = kvdev_rados_nkvx_dispatch(io->nkvx_module, io->nkvx_oid, pin,
-						       NULL, 0, io->host_out, io->buf_len,
-						       kvdev_rados_nkvx_io_done, io);
-			if (rc != 0) {
-				SPDK_ERRLOG("nkvx: cache-hit dispatch failed: %s\n",
-					    spdk_strerror(-rc));
-				kvdev_rados_nkvx_wasm_cache_unpin(pin);
-				free(io);
-				cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
-				return 0;
-			}
-			return 0;
+		/*
+		 * Reactor-side sha256 module-cache probe: a HIT means the compiled
+		 * module is already cached, so we SKIP the librados module fetch and go
+		 * straight to the data-object phase. A MISS fetches the module object
+		 * first (deny-by-default still holds: the fetched bytes are verified
+		 * against this sha256 before they are ever compiled/run).
+		 */
+		if (kvdev_rados_nkvx_wasm_module_cached(io->nkvx_mod.sha256)) {
+			SPDK_NOTICELOG("nkvx: module sha256 cache HIT -> no module fetch\n");
+			return kvdev_rados_nkvx_start_data_phase(io);
 		}
+		return kvdev_rados_nkvx_start_module_fetch(io);
 	}
 
-	SPDK_NOTICELOG("nkvx: oid %s cache miss -> librados cold-fill read\n", io->nkvx_oid);
-
-	io->nkvx_obj_cap = KVDEV_RADOS_NKVX_COLDFILL_CAP;
-	io->nkvx_obj = malloc(io->nkvx_obj_cap);
-	if (io->nkvx_obj == NULL) {
-		rados_aio_release(io->comp);
-		free(io);
-		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
-		return 0;
-	}
-
-	/* Bundle read + stat exactly like Retrieve so we learn the true object
-	 * size in the same round-trip and can pass it to the module. */
-	io->read_op = rados_create_read_op();
-	if (io->read_op == NULL) {
-		free(io->nkvx_obj);
-		rados_aio_release(io->comp);
-		free(io);
-		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
-		return 0;
-	}
-
-	rados_read_op_read(io->read_op, 0, io->nkvx_obj_cap, io->nkvx_obj,
-			   &io->bytes_read, &io->read_rval);
-	rados_read_op_stat(io->read_op, &io->stat_size, &io->stat_mtime, NULL);
-
-	rc = rados_aio_read_op_operate(io->read_op, rdev->io_ctx, io->comp, oid, 0);
-	if (rc < 0) {
-		rados_release_read_op(io->read_op);
-		free(io->nkvx_obj);
-		rados_aio_release(io->comp);
-		free(io);
-		cb_fn(cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, rc), 0);
-		return 0;
-	}
-
-	TAILQ_INSERT_TAIL(&ch->inflight, io, link);
-	return 0;
+	/* No verified binding (legacy built-in / in-tree test path): straight to the
+	 * data-object phase with no module verification (mod arg stays NULL). */
+	return kvdev_rados_nkvx_start_data_phase(io);
 }
 
 /*
@@ -1178,16 +1502,36 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 	}
 
 	/*
-	 * rados-nkvx routing (ADR-0009): a wasm-runtime binding goes to the new
-	 * in-process executor, not the legacy cls path below. module_key names the
-	 * built-in/wasm module. The (module_namespace) cold-fetch pool locator and
-	 * the sha256 anchor are consumed by the executor in later tracer bullets.
+	 * rados-nkvx routing (ADR-0009/0010, TB3 spdk-fbm): a wasm-runtime binding goes
+	 * to the new in-process executor, not the legacy cls path below.
+	 *
+	 * DENY-BY-DEFAULT (ADR-0010): the sha256 is the SOLE authorization + integrity
+	 * anchor. A wasm binding WITHOUT a valid bound sha256 is REJECTED here — we do
+	 * NOT fall back to any implicit/legacy/built-in module. (The op-ID -> binding
+	 * lookup and the allowlist membership check already happened in the NVMf control
+	 * plane; an op-ID absent from the namespace allowlist never reaches this path.
+	 * This is the second, backend gate: even an allowlisted wasm op must carry the
+	 * hash that authorizes the bytes it will run.) The module object is fetched from
+	 * (module_namespace, module_key) and verified against this sha256 before it is
+	 * ever compiled or run; see kvdev_rados_nkvx_exec / the executor's hash gate.
 	 */
 	if (binding->runtime == SPDK_KV_EXEC_RUNTIME_WASM) {
 		const char *module = binding->module_key;
 
-		if (module == NULL) {
+		if (module == NULL || module[0] == '\0') {
 			SPDK_ERRLOG("nkvx: wasm binding has no module_key\n");
+			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+			return 0;
+		}
+		if (!binding->sha256_valid) {
+			SPDK_ERRLOG("nkvx: wasm binding has no bound sha256 — REJECTED "
+				    "(deny-by-default; unverified modules are never run)\n");
+			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+			return 0;
+		}
+		if (binding->module_namespace == NULL || binding->module_namespace[0] == '\0') {
+			SPDK_ERRLOG("nkvx: wasm binding has no module_namespace (module locator) "
+				    "— REJECTED\n");
 			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
 			return 0;
 		}
@@ -1195,7 +1539,7 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 		 * computes over the cold-fetched value and never writes it back, so
 		 * it is permitted on a read-only namespace. (A future write-capable
 		 * module class must consult read_only at its own mutation point.) */
-		return kvdev_rados_nkvx_exec(ch, key, key_len, module,
+		return kvdev_rados_nkvx_exec(ch, key, key_len, module, binding,
 					     output_buf, output_buf_len, cb_fn, cb_arg);
 	}
 

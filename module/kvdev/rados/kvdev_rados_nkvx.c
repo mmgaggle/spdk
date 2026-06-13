@@ -35,6 +35,16 @@ struct kvdev_rados_nkvx_job {
 	char				module[32];
 	char				obj_key[256];	/* identity key (oid) for the cache */
 	void				*obj_pin;	/* pinned cache handle (spdk-ii0 D2) or NULL */
+	/*
+	 * TB3 (spdk-fbm): the verified module binding for this Exec. has_mod tracks
+	 * whether a real binding was supplied (the live datapath always supplies one;
+	 * the in-tree TB1/TB2 dispatch tests do not). mod.bytes points at the
+	 * librados-fetched .wasm carried on the io; it is valid for the run's
+	 * lifetime (the reactor frees it after the worker completes). The 32-byte
+	 * sha256 / caps are copied by value.
+	 */
+	bool				has_mod;
+	struct kvdev_rados_nkvx_module	mod;
 	const void			*object;
 	size_t				object_len;
 	void				*out;
@@ -112,7 +122,8 @@ kvdev_rados_nkvx_fill_from_job(void *buf, size_t cap, size_t *out_len, void *arg
 }
 
 static int
-kvdev_rados_nkvx_run_module(const char *module, const char *obj_key, void *obj_pin,
+kvdev_rados_nkvx_run_module(const char *module, const struct kvdev_rados_nkvx_module *mod,
+			    const char *obj_key, void *obj_pin,
 			    const void *object, size_t object_len,
 			    void *out, uint32_t out_len, uint32_t *result_len)
 {
@@ -134,7 +145,7 @@ kvdev_rados_nkvx_run_module(const char *module, const char *obj_key, void *obj_p
 		const char *name = module + strlen(KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX);
 
 		if (obj_pin != NULL) {
-			int rc = kvdev_rados_nkvx_wasm_run_pinned(name, obj_pin,
+			int rc = kvdev_rados_nkvx_wasm_run_pinned(name, mod, obj_pin,
 								  out, out_len, result_len);
 
 			kvdev_rados_nkvx_wasm_cache_unpin(obj_pin);
@@ -143,11 +154,11 @@ kvdev_rados_nkvx_run_module(const char *module, const char *obj_key, void *obj_p
 		if (obj_key != NULL && obj_key[0] != '\0') {
 			struct nkvx_fill_src src = { .object = object, .object_len = object_len };
 
-			return kvdev_rados_nkvx_wasm_run_cached(name, obj_key, object_len,
+			return kvdev_rados_nkvx_wasm_run_cached(name, mod, obj_key, object_len,
 							        kvdev_rados_nkvx_fill_from_job, &src,
 							        out, out_len, result_len);
 		}
-		return kvdev_rados_nkvx_wasm_run(name, object, object_len, out, out_len,
+		return kvdev_rados_nkvx_wasm_run(name, mod, object, object_len, out, out_len,
 						 result_len);
 	}
 
@@ -241,7 +252,8 @@ kvdev_rados_nkvx_worker_main(void *arg)
 		job->run_tid = pthread_self();
 
 		/* The actual off-reactor compute. */
-		job->kvstatus = kvdev_rados_nkvx_run_module(job->module, job->obj_key,
+		job->kvstatus = kvdev_rados_nkvx_run_module(job->module,
+				job->has_mod ? &job->mod : NULL, job->obj_key,
 				job->obj_pin, job->object, job->object_len, job->out,
 				job->out_len, &job->result_len);
 
@@ -301,7 +313,8 @@ kvdev_rados_nkvx_stop(void)
 }
 
 int
-kvdev_rados_nkvx_dispatch(const char *module, const char *obj_key, void *obj_pin,
+kvdev_rados_nkvx_dispatch(const char *module, const struct kvdev_rados_nkvx_module *mod,
+			  const char *obj_key, void *obj_pin,
 			  const void *object, size_t object_len,
 			  void *out, uint32_t out_len,
 			  kvdev_rados_nkvx_done_fn done_fn, void *done_arg)
@@ -326,6 +339,10 @@ kvdev_rados_nkvx_dispatch(const char *module, const char *obj_key, void *obj_pin
 	snprintf(job->module, sizeof(job->module), "%s", module);
 	if (obj_key != NULL) {
 		snprintf(job->obj_key, sizeof(job->obj_key), "%s", obj_key);
+	}
+	if (mod != NULL) {
+		job->has_mod = true;
+		job->mod = *mod;	/* sha256/caps by value; bytes pointer carried (caller-owned) */
 	}
 	job->obj_pin = obj_pin;
 	job->object = object;
