@@ -34,12 +34,14 @@
 #define KVDEV_RADOS_MAX_VALUE_LEN (64ull * 1024 * 1024)
 
 /*
- * rados-nkvx (ADR-0009) TB1 cold-fill cap: the executor reads the object into a
- * fixed buffer before running the built-in module off-reactor. A larger object
- * is out of TB1 scope (a later tracer bullet streams into the content-addressed
- * raw-bdev cache); 1 MiB comfortably covers the tracer-bullet objects.
+ * rados-nkvx (ADR-0009) cold-fill cap: the executor reads the object into a
+ * per-IO buffer (malloc'd to this cap) before running the module off-reactor.
+ * Raised to match KVDEV_RADOS_MAX_VALUE_LEN (64 MiB) so GPU-initiated KV Exec
+ * works on bulk values up to the full advertised store size. The buffer is
+ * allocated per exec op and freed when the worker finishes, so the cap doubles
+ * as the buffer size — a larger value is rejected by the stat-size check below.
  */
-#define KVDEV_RADOS_NKVX_COLDFILL_CAP (1ull * 1024 * 1024)
+#define KVDEV_RADOS_NKVX_COLDFILL_CAP KVDEV_RADOS_MAX_VALUE_LEN
 
 /*
  * TB3 (spdk-fbm) module-fetch cap: the largest .wasm artifact the executor will
