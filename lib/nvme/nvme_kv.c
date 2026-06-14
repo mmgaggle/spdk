@@ -219,6 +219,16 @@ spdk_nvme_kv_exec(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 		return -EINVAL;
 	}
 
+	if (input_len > output_len) {
+		/*
+		 * The input alone cannot exceed the single (output) buffer that must
+		 * hold the whole staged request [u16 key_len][key][input]. Reject here,
+		 * before the payload_len arithmetic below, so a pathological input_len
+		 * near UINT32_MAX cannot wrap the 32-bit sum and bypass the bounds check.
+		 */
+		return -EINVAL;
+	}
+
 	/*
 	 * KV Exec carries its key length-prefixed at the HEAD of the DPTR request
 	 * payload (ADR-0014 Option 1), NOT in the inline CDW slots. The single

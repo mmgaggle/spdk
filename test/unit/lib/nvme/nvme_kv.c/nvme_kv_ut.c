@@ -209,6 +209,48 @@ test_kv_exec_bounds(void)
 	ut_qpair_cleanup(&qpair);
 }
 
+/*
+ * A pathological input_len near UINT32_MAX must be rejected outright, NOT wrap
+ * the 32-bit payload_len sum (sizeof(u16) + key_len + input_len) into a tiny
+ * value that bypasses the bounds check and drives an out-of-bounds memmove.
+ */
+static void
+test_kv_exec_input_len_overflow(void)
+{
+	struct spdk_nvme_ctrlr ctrlr = {};
+	struct spdk_nvme_qpair qpair = {};
+	struct spdk_nvme_ns ns = {};
+	const uint8_t key[] = {0x01, 0x02, 0x03, 0x04};
+	uint8_t output[8];
+	int rc;
+
+	ns.id = 5;
+	ut_qpair_init(&qpair, &ctrlr);
+
+	/*
+	 * input_len = UINT32_MAX with a small output buffer. The naive sum
+	 * 2 + 4 + 0xFFFFFFFF wraps to 5, which would pass payload_len > output_len.
+	 * The guard rejects on input_len > output_len before any arithmetic, so
+	 * no request is staged or submitted.
+	 */
+	g_submitted_req = NULL;
+	rc = spdk_nvme_kv_exec(&ns, &qpair, key, sizeof(key), 0,
+			       output, UINT32_MAX, output, sizeof(output),
+			       NULL, NULL);
+	CU_ASSERT(rc == -EINVAL);
+	CU_ASSERT(g_submitted_req == NULL);
+
+	/* input_len just over output_len is also rejected (no wrap involved). */
+	g_submitted_req = NULL;
+	rc = spdk_nvme_kv_exec(&ns, &qpair, key, sizeof(key), 0,
+			       output, sizeof(output) + 1, output, sizeof(output),
+			       NULL, NULL);
+	CU_ASSERT(rc == -EINVAL);
+	CU_ASSERT(g_submitted_req == NULL);
+
+	ut_qpair_cleanup(&qpair);
+}
+
 /* Argument validation that does not depend on a submit. */
 static void
 test_kv_exec_invalid_args(void)
@@ -260,6 +302,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_kv_exec_input_aliases_output);
 	CU_ADD_TEST(suite, test_kv_exec_zero_input);
 	CU_ADD_TEST(suite, test_kv_exec_bounds);
+	CU_ADD_TEST(suite, test_kv_exec_input_len_overflow);
 	CU_ADD_TEST(suite, test_kv_exec_invalid_args);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
