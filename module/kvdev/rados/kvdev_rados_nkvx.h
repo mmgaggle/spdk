@@ -41,6 +41,17 @@
  * of the legacy cls path. The text after the prefix names the built-in module. */
 #define KVDEV_RADOS_NKVX_BINDING_PREFIX "nkvx:"
 
+/*
+ * Legacy "nkvx:<module>" allowlist strings are decoded by the structured-binding
+ * parser (nvmf_rpc_item_to_kv_exec_binding) as a cls binding with this module
+ * namespace and module_key = <module>: e.g. "nkvx:bytecount" => runtime=cls,
+ * module_namespace="nkvx", module_key="bytecount". kvdev_rados_exec recognises
+ * this namespace and routes such a binding to the in-process executor (the
+ * built-in C modules carry no untrusted bytes, so they need no sha256 anchor),
+ * restoring the pre-structured-binding "nkvx:" routing for the built-ins.
+ */
+#define KVDEV_RADOS_NKVX_CLS_NAMESPACE "nkvx"
+
 /* Built-in module names (TB1: statically bound, selected by the binding). */
 #define KVDEV_RADOS_NKVX_MODULE_BYTECOUNT "bytecount"
 #define KVDEV_RADOS_NKVX_MODULE_IDENTITY  "identity"

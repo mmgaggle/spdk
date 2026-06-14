@@ -93,18 +93,58 @@ $rpc_py nvmf_create_subsystem "$nqn" -s SPDKNKVX01 -a
 $rpc_py nvmf_subsystem_add_kv_ns "$nqn" "$kvdev_name"
 $rpc_py nvmf_subsystem_add_listener "$nqn" -t VFIOUSER -a "$muser_dir" -s 0
 
-# Allowlist the nkvx op-IDs. Binding format is "nkvx:<module>"; the CLI splits
-# each token on the FIRST ':' into op_id and binding, so "10:nkvx:bytecount"
-# yields op_id=10 binding="nkvx:bytecount", and "12:nkvx:wasm:bytecount" yields
-# op_id=12 binding="nkvx:wasm:bytecount" (module "wasm:bytecount" -> real .wasm).
+# Allowlist the nkvx op-IDs.
+#
+# Two kinds of binding (ADR-0014 structured model):
+#   - BUILT-INS (op 10/11): the legacy "nkvx:<module>" shorthand. The CLI splits
+#     each token on the FIRST ':' into op_id and binding, so "10:nkvx:bytecount"
+#     yields op_id=10 binding="nkvx:bytecount". This decodes to a cls binding with
+#     module_namespace="nkvx"; kvdev_rados_exec routes that namespace to the
+#     in-process executor's compiled-in C built-ins (no untrusted bytes -> no
+#     sha256 anchor required).
+#   - REAL WASM (op 12-15): a STRUCTURED wasm binding (runtime=wasm) carrying the
+#     module locator (module_namespace=pool, module_key="wasm:<name>" == the RADOS
+#     OBJECT NAME of the .wasm) AND the content sha256 that authorizes the fetched
+#     bytes (deny-by-default, ADR-0010). The legacy "nkvx:wasm:<name>" string
+#     CANNOT carry a sha256/locator, so the wasm ops use the structured form. The
+#     module objects are uploaded to RADOS below so the executor can fetch them.
 # op_ids 13/14/15 are the TB2 runaway/over-alloc modules: a compute-runaway
 # (fuel cap), a wall-clock-runaway (epoch cap), and an over-allocator (memory
 # cap). The host issues each and asserts the command is CONTAINED (aborted),
 # never crashing/hanging the target.
-nkvx_allowlist="10:nkvx:bytecount 11:nkvx:identity 12:nkvx:wasm:bytecount"
-nkvx_allowlist+=" 13:nkvx:wasm:fuel_runaway 14:nkvx:wasm:walltime_runaway"
-nkvx_allowlist+=" 15:nkvx:wasm:overalloc"
-$rpc_py nvmf_ns_set_kv_exec_allowlist "$nqn" "$nsid" "$nkvx_allowlist"
+
+# Upload the wasm module objects to RADOS (object name == module_key "wasm:<name>"
+# so the executor routes it to the real wasmtime runtime, not a built-in).
+for m in bytecount fuel_runaway walltime_runaway overalloc; do
+	"$rados_bin" -c "$CEPH_CONF" -p "$pool_name" put "wasm:${m}" "$testdir/wasm/${m}.wasm"
+done
+
+# Built-ins via the legacy shorthand; their decode is asserted via get-allowlist.
+$rpc_py nvmf_ns_set_kv_exec_allowlist "$nqn" "$nsid" "10:nkvx:bytecount 11:nkvx:identity"
+
+# Real-wasm structured bindings (runtime=wasm + sha256 + locator). The CLI only
+# emits the legacy {op_id,binding} form, so the structured entries are merged in
+# via a direct RPC call that re-sets the full allowlist (built-ins + wasm).
+SHA_BC=$(sha256sum "$testdir/wasm/bytecount.wasm" | cut -d' ' -f1)
+SHA_FR=$(sha256sum "$testdir/wasm/fuel_runaway.wasm" | cut -d' ' -f1)
+SHA_WR=$(sha256sum "$testdir/wasm/walltime_runaway.wasm" | cut -d' ' -f1)
+SHA_OA=$(sha256sum "$testdir/wasm/overalloc.wasm" | cut -d' ' -f1)
+PYTHONPATH="$rootdir/python" python3 - "$rpc_sock" "$nqn" "$nsid" "$pool_name" \
+	"$SHA_BC" "$SHA_FR" "$SHA_WR" "$SHA_OA" <<'PY'
+import sys
+from spdk.rpc.client import JSONRPCClient
+sock, nqn, nsid, pool, sbc, sfr, swr, soa = sys.argv[1:9]
+allow = [
+    {"op_id": 10, "binding": "nkvx:bytecount"},
+    {"op_id": 11, "binding": "nkvx:identity"},
+    {"op_id": 12, "runtime": "wasm", "module_namespace": pool, "module_key": "wasm:bytecount",       "sha256": sbc, "caps": 0},
+    {"op_id": 13, "runtime": "wasm", "module_namespace": pool, "module_key": "wasm:fuel_runaway",     "sha256": sfr, "caps": 0},
+    {"op_id": 14, "runtime": "wasm", "module_namespace": pool, "module_key": "wasm:walltime_runaway", "sha256": swr, "caps": 0},
+    {"op_id": 15, "runtime": "wasm", "module_namespace": pool, "module_key": "wasm:overalloc",        "sha256": soa, "caps": 0},
+]
+JSONRPCClient(sock).call("nvmf_ns_set_kv_exec_allowlist",
+                         {"nqn": nqn, "nsid": int(nsid), "allowlist": allow})
+PY
 get_json=$($rpc_py nvmf_ns_get_kv_exec_allowlist "$nqn" "$nsid")
 echo "nvmf_ns_get_kv_exec_allowlist => $get_json"
 
@@ -163,11 +203,12 @@ fi
 # (key kvkey01 -> one oid); the C built-ins (op 10/11) bypass the executor cache
 # and each cold-read, and the first wasm Exec (op 12) cold-fills the cache, so the
 # later wasm Execs (op 13/14/15) on that object MUST be served from cache with NO
-# librados read ("served from executor cache (no librados read)"). Assert at least
-# one such cache-hit Exec occurred (the B2 fix path fired and skipped the read).
+# librados read ("served from executor cache (pinned, no librados read)"). Assert
+# at least one such cache-hit Exec occurred (the B2 fix path fired and skipped the
+# read). The "pinned" wording is the spdk-ii0 D2 race-safe probe-and-pin path.
 if [[ $rc -eq 0 ]]; then
 	cold_reads=$(grep -c "cache miss -> librados cold-fill read" "$tgt_log" || true)
-	cache_hits=$(grep -c "served from executor cache (no librados read)" "$tgt_log" || true)
+	cache_hits=$(grep -c "served from executor cache (.*no librados read)" "$tgt_log" || true)
 	if [[ "${cache_hits:-0}" -ge 1 ]]; then
 		echo "B2 no-refetch: $cache_hits cache-hit Exec(s) skipped librados ($cold_reads cold-fill read(s))"
 		grep -E "cold-fill read|no librados read" "$tgt_log" | head -8 || true

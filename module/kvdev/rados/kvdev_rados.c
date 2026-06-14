@@ -1644,6 +1644,43 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 					     output_buf, output_buf_len, cb_fn, cb_arg);
 	}
 
+	/*
+	 * rados-nkvx BUILT-IN routing (ADR-0009): a legacy "nkvx:<module>" allowlist
+	 * string decodes (in nvmf_rpc_item_to_kv_exec_binding) to a cls binding with
+	 * module_namespace == "nkvx" and module_key == <module>. This is the in-process
+	 * executor's BUILT-IN path (bytecount/identity): the modules are compiled-in C,
+	 * so there are NO untrusted bytes to fetch or verify and the deny-by-default
+	 * sha256 gate that guards REAL wasm does not apply. Route it to the executor
+	 * here so the "nkvx:" shorthand keeps reaching the off-reactor built-ins after
+	 * the structured-binding migration (ADR-0014) reworked the wasm route to key on
+	 * binding->runtime. A real wasm module name ("wasm:<name>") MUST instead use a
+	 * structured wasm binding (it carries the hash that authorizes its bytes), so it
+	 * is rejected on this legacy route with a clear error rather than run unverified.
+	 */
+	if (binding->runtime == SPDK_KV_EXEC_RUNTIME_CLS &&
+	    binding->module_namespace != NULL &&
+	    strcmp(binding->module_namespace, KVDEV_RADOS_NKVX_CLS_NAMESPACE) == 0) {
+		const char *module = binding->module_key;
+
+		if (module == NULL || module[0] == '\0') {
+			SPDK_ERRLOG("nkvx: built-in binding has no module name\n");
+			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+			return 0;
+		}
+		if (strncmp(module, KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX,
+			    strlen(KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX)) == 0) {
+			SPDK_ERRLOG("nkvx: real-wasm module '%s' requires a structured wasm "
+				    "binding (sha256 + module locator); the legacy 'nkvx:%s' "
+				    "string cannot authorize it — REJECTED\n", module, module);
+			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+			return 0;
+		}
+		/* Built-in: no verified binding (mod arg stays NULL in the executor). The
+		 * executor is read-only by contract, so it is permitted on a read-only ns. */
+		return kvdev_rados_nkvx_exec(ch, key, key_len, module, NULL,
+					     output_buf, output_buf_len, cb_fn, cb_arg);
+	}
+
 	/* Legacy Ceph object-class path: (module_namespace, module_key) = (class, method). */
 	if (binding->runtime != SPDK_KV_EXEC_RUNTIME_CLS) {
 		SPDK_ERRLOG("KV Exec: unsupported binding runtime %d\n", binding->runtime);
