@@ -205,15 +205,12 @@ spdk_nvme_kv_exec(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 {
 	struct nvme_request *req;
 	struct spdk_nvme_cmd *cmd;
-	uint32_t xfer_len;
+	uint16_t klp = key_len;
+	uint32_t payload_len;
+	uint8_t *buf;
 
 	if (key == NULL || key_len < SPDK_NVME_KV_KEY_MIN_LEN || key_len > SPDK_NVME_KV_KEY_MAX_LEN ||
 	    output == NULL || output_len == 0) {
-		return -EINVAL;
-	}
-
-	if (input_len > output_len) {
-		/* The single data buffer (output) must be able to carry the input. */
 		return -EINVAL;
 	}
 
@@ -223,18 +220,43 @@ spdk_nvme_kv_exec(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 	}
 
 	/*
-	 * KV Exec is bidirectional and uses one data buffer: the input blob is
-	 * gathered host->controller, then the controller scatters the output
-	 * back into the same buffer. Stage the input into the output buffer (a
-	 * no-op when the caller already passed the same pointer), then transfer
-	 * max(input_len, output_len) == output_len bytes both ways.
+	 * KV Exec carries its key length-prefixed at the HEAD of the DPTR request
+	 * payload (ADR-0014 Option 1), NOT in the inline CDW slots. The single
+	 * data buffer is bidirectional: it gathers the request host->controller,
+	 * then the controller scatters the output back into the same buffer from
+	 * offset 0. Stage the request as [u16 key_len][key][input] into the output
+	 * buffer; the total payload (header + key + input) must fit.
 	 */
-	if (input != NULL && input_len > 0 && input != output) {
-		memcpy(output, input, input_len);
+	payload_len = sizeof(uint16_t) + key_len + input_len;
+	if (payload_len > output_len) {
+		/* The single data buffer (output) must hold the staged request. */
+		return -EINVAL;
 	}
-	xfer_len = output_len;
 
-	req = nvme_allocate_request_contig(qpair, output, xfer_len, cb_fn, cb_arg);
+	buf = output;
+
+	/*
+	 * Place the input at its final offset BEFORE writing the header+key, so
+	 * that an in-place caller (input aliasing output, where the input bytes
+	 * currently sit at the buffer head) is not clobbered. memmove tolerates
+	 * the overlap; a distinct input buffer just copies.
+	 */
+	if (input_len > 0) {
+		if (input == output) {
+			memmove(buf + sizeof(uint16_t) + key_len, buf, input_len);
+		} else {
+			memcpy(buf + sizeof(uint16_t) + key_len, input, input_len);
+		}
+	}
+
+	/*
+	 * Write the 2-byte key-length header the same way the target reads it
+	 * (memcpy(&klp, data, 2) -> native byte order on this host), then the key.
+	 */
+	memcpy(buf, &klp, sizeof(klp));
+	memcpy(buf + sizeof(uint16_t), key, key_len);
+
+	req = nvme_allocate_request_contig(qpair, output, output_len, cb_fn, cb_arg);
 	if (req == NULL) {
 		return -ENOMEM;
 	}
@@ -243,12 +265,15 @@ spdk_nvme_kv_exec(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 	cmd->opc = SPDK_NVME_OPC_KV_EXEC;
 	cmd->nsid = ns->id;
 
-	/* CDW10: input length. CDW12: output buffer size. CDW13: operation ID. */
-	cmd->cdw10_bits.kv.vsize = input_len;
+	/*
+	 * CDW10: TOTAL request payload length ([u16 key_len][key][input]).
+	 * CDW12: output buffer size (scatter-back bound). CDW13: operation ID.
+	 * The key rides the payload head, so it does NOT go in the inline CDW
+	 * slots (no nvme_kv_cmd_set_key here).
+	 */
+	cmd->cdw10_bits.kv.vsize = payload_len;
 	cmd->cdw12_bits.kv_exec.osize = output_len;
 	cmd->cdw13_bits.kv_exec.op_id = op_id;
-
-	nvme_kv_cmd_set_key(cmd, key, key_len);
 
 	return nvme_qpair_submit_request(qpair, req);
 }
