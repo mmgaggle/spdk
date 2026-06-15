@@ -17,26 +17,158 @@
 #include <mercury.h>
 #include <mercury_bulk.h>
 
+/*
+ * MR / hg_bulk handle cache (Slice C7.2, design §4.3 / OQ-7).
+ *
+ * Registering a bulk handle over a 64 MiB DPTR is not free: on the verbs
+ * provider HG_Bulk_create -> ibv_reg_mr pins and page-walks ~16K pages on EVERY
+ * large Exec — a perf cliff. The common case is a RECURRING tenant DPTR (SPDK
+ * pool-recycles the DMA buffer), so a handle keyed by (addr,len,flags) is reused
+ * across Execs instead of re-registered. Nil benefit on sm/tcp; the win is verbs.
+ *
+ * Bounded LRU: a fixed per-front slot array, evicting the least-recently-used
+ * UNREFERENCED entry. nkvx_front is per reactor/channel and single-threaded (see
+ * nkvx_front_client.h), so no locking. `refs` guards an in-flight handle from
+ * eviction; a handle stays registered after refs hits 0 so the next reuse HITs.
+ * If every slot is referenced at once (>= NKVX_BULK_CACHE_SLOTS concurrent
+ * distinct DPTRs), the overflow handle is created uncached and freed on release.
+ *
+ * INVALIDATION CAVEAT (OQ-7, ties to C6 teardown): the cache keys on address and
+ * cannot observe a tenant DPTR being freed/remapped. It relies on SPDK DMA
+ * buffers being stable (pool-recycled, same mapping), which holds at the tenant
+ * edge. Explicit invalidation-on-free is deferred (OQ-7 / C6a).
+ */
+#define NKVX_BULK_CACHE_SLOTS 64
+
+struct nkvx_bulk_entry {
+	void		*addr;		/* key: buffer base (HG_BULK_NULL handle == empty) */
+	hg_size_t	len;		/* key: length */
+	uint8_t		flags;		/* key: HG_BULK_READ_ONLY / HG_BULK_WRITE_ONLY */
+	hg_bulk_t	handle;		/* the registered handle; HG_BULK_NULL if slot empty */
+	uint32_t	refs;		/* in-flight Execs holding this handle */
+	uint64_t	used_seq;	/* LRU stamp (front->bulk_seq at last acquire) */
+};
+
 struct nkvx_front {
 	hg_class_t	*cls;
 	hg_context_t	*ctx;
 	hg_id_t		rpc_id;
 	hg_addr_t	addr;	/* resolved executor target */
+
+	/* MR/hg_bulk handle cache (C7.2). */
+	struct nkvx_bulk_entry	bulk_cache[NKVX_BULK_CACHE_SLOTS];
+	uint64_t		bulk_seq;	/* monotonic LRU clock */
+	uint64_t		bulk_hits;
+	uint64_t		bulk_misses;
+	uint64_t		bulk_evicts;
 };
 
 /* Per-forward context, carried through HG_Forward's callback and freed there. */
 struct nkvx_call {
+	struct nkvx_front	*front;	/* owning front (for cache release in the cb) */
 	nkvx_front_done_cb	cb;
 	void			*arg;
 	/*
 	 * Bulk handles the front originated for this Exec (Slice C7). They must stay
 	 * registered for the whole RPC — the executor PULLs the input and PUSHes the
-	 * result during the call, all before it responds — so they are freed only
+	 * result during the call, all before it responds — so they are released only
 	 * here, in the forward completion. HG_BULK_NULL when the payload rode inline.
+	 * Released via the C7.2 handle cache (kept registered for reuse, not freed).
 	 */
 	hg_bulk_t		input_bulk;
 	hg_bulk_t		result_sink;
 };
+
+/*
+ * Acquire a bulk handle for [addr, addr+len) with `flags`, from the cache when a
+ * matching live entry exists (no re-registration), else register a fresh one and
+ * insert it (evicting the LRU unreferenced entry if the cache is full). Returns 0
+ * and sets *out; negative errno on a registration failure. A handle returned when
+ * the cache is full-of-in-flight-entries is UNCACHED — nkvx_bulk_release frees it.
+ */
+static int
+nkvx_bulk_acquire(struct nkvx_front *front, void *addr, hg_size_t len,
+		  uint8_t flags, hg_bulk_t *out)
+{
+	struct nkvx_bulk_entry *empty = NULL, *victim = NULL, *slot;
+	hg_bulk_t h;
+	hg_return_t ret;
+	int i;
+
+	for (i = 0; i < NKVX_BULK_CACHE_SLOTS; i++) {
+		struct nkvx_bulk_entry *e = &front->bulk_cache[i];
+
+		if (e->handle != HG_BULK_NULL && e->addr == addr &&
+		    e->len == len && e->flags == flags) {
+			e->refs++;
+			e->used_seq = ++front->bulk_seq;
+			front->bulk_hits++;
+			*out = e->handle;	/* HIT: reuse, no ibv_reg_mr */
+			return 0;
+		}
+		if (e->handle == HG_BULK_NULL) {
+			if (empty == NULL) {
+				empty = e;
+			}
+		} else if (e->refs == 0 &&
+			   (victim == NULL || e->used_seq < victim->used_seq)) {
+			victim = e;	/* LRU unreferenced eviction candidate */
+		}
+	}
+
+	/* MISS: register a fresh handle. */
+	front->bulk_misses++;
+	ret = HG_Bulk_create(front->cls, 1, &addr, &len, flags, &h);
+	if (ret != HG_SUCCESS) {
+		return -EIO;
+	}
+
+	slot = empty ? empty : victim;
+	if (slot == NULL) {
+		/* Every slot is in flight: hand back an uncached handle (release frees
+		 * it — it will not be found in the cache). */
+		*out = h;
+		return 0;
+	}
+	if (slot->handle != HG_BULK_NULL) {	/* reclaiming a victim slot */
+		HG_Bulk_free(slot->handle);
+		front->bulk_evicts++;
+	}
+	slot->addr = addr;
+	slot->len = len;
+	slot->flags = flags;
+	slot->handle = h;
+	slot->refs = 1;
+	slot->used_seq = ++front->bulk_seq;
+	*out = h;
+	return 0;
+}
+
+/*
+ * Release a handle acquired above: drop the cache entry's refcount (the handle
+ * stays REGISTERED for the next reuse). A handle not in the cache is an overflow
+ * registration and is freed now. HG_BULK_NULL is a no-op.
+ */
+static void
+nkvx_bulk_release(struct nkvx_front *front, hg_bulk_t h)
+{
+	int i;
+
+	if (h == HG_BULK_NULL) {
+		return;
+	}
+	for (i = 0; i < NKVX_BULK_CACHE_SLOTS; i++) {
+		struct nkvx_bulk_entry *e = &front->bulk_cache[i];
+
+		if (e->handle == h) {
+			if (e->refs > 0) {
+				e->refs--;
+			}
+			return;		/* keep registered for reuse */
+		}
+	}
+	HG_Bulk_free(h);		/* uncached overflow handle */
+}
 
 /*
  * HG_Forward completion, fired from HG_Trigger inside nkvx_front_progress() — so
@@ -77,14 +209,10 @@ nkvx_front_forward_cb(const struct hg_cb_info *info)
 
 out:
 	/* The executor is done with the bulk buffers by the time the forward
-	 * completes (it PULLs/PUSHes before responding), so release the handles. */
-	/* C7.2 seam: cache release of the handles acquired in nkvx_front_forward. */
-	if (call->input_bulk != HG_BULK_NULL) {
-		HG_Bulk_free(call->input_bulk);
-	}
-	if (call->result_sink != HG_BULK_NULL) {
-		HG_Bulk_free(call->result_sink);
-	}
+	 * completes (it PULLs/PUSHes before responding), so release the handles back
+	 * to the C7.2 cache (kept registered for reuse; overflow handles are freed). */
+	nkvx_bulk_release(call->front, call->input_bulk);
+	nkvx_bulk_release(call->front, call->result_sink);
 	HG_Destroy(handle);
 	free(call);
 	return HG_SUCCESS;
@@ -149,13 +277,34 @@ err:
 void
 nkvx_front_fini(struct nkvx_front *front)
 {
+	int i;
+
 	if (front == NULL) {
 		return;
+	}
+	/* Free every cached bulk handle. Callers drain in-flight Execs before fini
+	 * (per the threading contract), so no entry should still be referenced. */
+	for (i = 0; i < NKVX_BULK_CACHE_SLOTS; i++) {
+		if (front->bulk_cache[i].handle != HG_BULK_NULL) {
+			HG_Bulk_free(front->bulk_cache[i].handle);
+		}
 	}
 	HG_Addr_free(front->cls, front->addr);
 	HG_Context_destroy(front->ctx);
 	HG_Finalize(front->cls);
 	free(front);
+}
+
+void
+nkvx_front_get_bulk_stats(const struct nkvx_front *front,
+			  struct nkvx_front_bulk_stats *stats)
+{
+	if (front == NULL || stats == NULL) {
+		return;
+	}
+	stats->hits = front->bulk_hits;
+	stats->misses = front->bulk_misses;
+	stats->evicts = front->bulk_evicts;
 }
 
 int
@@ -167,6 +316,7 @@ nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 	nkvx_exec_in_t local;		/* mutable copy: carries the bulk handles */
 	hg_handle_t handle = HG_HANDLE_NULL;
 	hg_return_t ret;
+	int rc;
 
 	if (front == NULL || in == NULL || cb == NULL) {
 		return -EINVAL;
@@ -183,6 +333,7 @@ nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 	if (call == NULL) {
 		return -ENOMEM;
 	}
+	call->front = front;
 	call->cb = cb;
 	call->arg = arg;
 	call->input_bulk = HG_BULK_NULL;
@@ -199,36 +350,26 @@ nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 	local.result_sink = HG_BULK_NULL;
 
 	if (in->input_len > NKVX_INLINE_MAX && in->input_inline != NULL) {
-		void *p = in->input_inline;
-		hg_size_t sz = in->input_len;
-
-		/* C7.2 seam: replace register-per-Exec with an MR/hg_bulk-handle-cache
-		 * acquire keyed by the DPTR address (design §4.3); the matching release
-		 * is in nkvx_front_forward_cb. */
-		ret = HG_Bulk_create(front->cls, 1, &p, &sz, HG_BULK_READ_ONLY,
-				     &call->input_bulk);
-		if (ret != HG_SUCCESS) {
+		/* C7.2: reuse a cached MR/hg_bulk handle for this input DPTR, or
+		 * register one (design §4.3); released back to the cache in the cb. */
+		rc = nkvx_bulk_acquire(front, in->input_inline, in->input_len,
+				       HG_BULK_READ_ONLY, &call->input_bulk);
+		if (rc != 0) {
 			free(call);
-			return -EIO;
+			return rc;
 		}
 		local.input_bulk = call->input_bulk;
 	}
 
 	if (result_sink != NULL && result_sink_len > NKVX_INLINE_MAX) {
-		void *p = result_sink;
-		hg_size_t sz = result_sink_len;
-
-		/* C7.2 seam: replace register-per-Exec with an MR/hg_bulk-handle-cache
-		 * acquire keyed by the DPTR address (design §4.3); the matching release
-		 * is in nkvx_front_forward_cb. */
-		ret = HG_Bulk_create(front->cls, 1, &p, &sz, HG_BULK_WRITE_ONLY,
-				     &call->result_sink);
-		if (ret != HG_SUCCESS) {
-			if (call->input_bulk != HG_BULK_NULL) {
-				HG_Bulk_free(call->input_bulk);
-			}
+		/* C7.2: reuse a cached MR/hg_bulk handle for this result-sink DPTR
+		 * (the recurring tenant output buffer), or register one. */
+		rc = nkvx_bulk_acquire(front, result_sink, result_sink_len,
+				       HG_BULK_WRITE_ONLY, &call->result_sink);
+		if (rc != 0) {
+			nkvx_bulk_release(front, call->input_bulk);
 			free(call);
-			return -EIO;
+			return rc;
 		}
 		local.result_sink = call->result_sink;
 	}
@@ -253,12 +394,8 @@ nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 	return 0;
 
 err_bulk:
-	if (call->input_bulk != HG_BULK_NULL) {
-		HG_Bulk_free(call->input_bulk);
-	}
-	if (call->result_sink != HG_BULK_NULL) {
-		HG_Bulk_free(call->result_sink);
-	}
+	nkvx_bulk_release(front, call->input_bulk);
+	nkvx_bulk_release(front, call->result_sink);
 	free(call);
 	return -EIO;
 }

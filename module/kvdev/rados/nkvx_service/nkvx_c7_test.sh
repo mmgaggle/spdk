@@ -138,6 +138,16 @@ for i in $(seq 1 20); do
 done
 [ "$loop_fail" -eq 0 ] && echo "  20/20 verified" || fail=1
 
+# C7.2 MR/hg_bulk handle-cache reuse: 10 iters on ONE front + ONE sink buffer (the
+# recurring-DPTR case the cache targets). The driver asserts the cache registered
+# exactly once and reused thereafter (misses=1, hits=9, evicts=0) AND content-hash
+# verifies each iter.
+echo "--- C7.2 handle-cache reuse: 10x 1 MiB PUSH on one front+sink ---"
+"$DRV" --listen "$FRONT_NA" --addr-file "$ADDR_FILE" \
+	--runtime 2 --module-ns nkvx --module identity --key push1m \
+	--osize $((1024*1024)) --expect 0 --expect-result $((1024*1024)) \
+	--expect-sha256 "$SHA_1M" --iters 10 2>&1 | grep -E "cache (reuse|hits)|FAIL" || fail=1
+
 echo "--- executor log (tail) ---"; grep -E "nkvx_exec |PUSH|sink" "$SVC_LOG" | tail -8
 
 [ "$fail" -eq 0 ] && { echo "RESULT: PASS"; exit 0; } || { echo "RESULT: FAIL"; exit 1; }

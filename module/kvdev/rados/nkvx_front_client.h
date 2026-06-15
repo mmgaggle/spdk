@@ -75,6 +75,22 @@ int nkvx_front_init(const char *na_init, const char *target_addr,
 void nkvx_front_fini(struct nkvx_front *front);
 
 /**
+ * MR/hg_bulk handle-cache counters (Slice C7.2). A `hit` reused a registered
+ * handle for a recurring DPTR (no ibv_reg_mr); a `miss` registered a fresh one;
+ * an `evict` freed an LRU unreferenced entry to make room. Steady-state DPTR
+ * reuse drives hits up and keeps misses ~= the distinct-buffer count.
+ */
+struct nkvx_front_bulk_stats {
+	uint64_t	hits;
+	uint64_t	misses;
+	uint64_t	evicts;
+};
+
+/** Read the handle-cache counters (for observability / acceptance tests). */
+void nkvx_front_get_bulk_stats(const struct nkvx_front *front,
+			       struct nkvx_front_bulk_stats *stats);
+
+/**
  * Forward ONE nkvx_exec request (async), with the large-payload bulk RMA wired
  * (Slice C7, design §1.3). The scalar/inline fields of \p in are encoded
  * synchronously into the SEND before returning, so the \p in struct itself may

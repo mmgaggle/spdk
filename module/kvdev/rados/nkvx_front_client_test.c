@@ -113,9 +113,11 @@ main(int argc, char **argv)
 	int expect_result = -1;			/* >=0: assert result_len == this */
 	const char *sha256_hex = NULL;		/* module bound hash (64 hex) */
 	const char *expect_sha_hex = NULL;	/* expected sha256 of delivered bytes */
+	int iters = 1;				/* C7.2: repeat N forwards on one front+sink */
+	int distinct = 1;			/* C7.2: round-robin N distinct sink buffers */
 
 	enum { OPT_KEY = 256, OPT_RUNTIME, OPT_MODULE, OPT_MODULE_NS, OPT_OSIZE,
-	       OPT_EXPECT_RESULT, OPT_SHA256, OPT_EXPECT_SHA };
+	       OPT_EXPECT_RESULT, OPT_SHA256, OPT_EXPECT_SHA, OPT_ITERS, OPT_DISTINCT };
 	static const struct option opts[] = {
 		{ "listen",        required_argument, NULL, 'l' },
 		{ "target",        required_argument, NULL, 't' },
@@ -129,6 +131,8 @@ main(int argc, char **argv)
 		{ "expect-result", required_argument, NULL, OPT_EXPECT_RESULT },
 		{ "sha256",        required_argument, NULL, OPT_SHA256 },
 		{ "expect-sha256", required_argument, NULL, OPT_EXPECT_SHA },
+		{ "iters",         required_argument, NULL, OPT_ITERS },
+		{ "distinct",      required_argument, NULL, OPT_DISTINCT },
 		{ NULL,            0,                 NULL, 0 },
 	};
 	int c;
@@ -146,13 +150,24 @@ main(int argc, char **argv)
 		case OPT_EXPECT_RESULT: expect_result = atoi(optarg); break;
 		case OPT_SHA256: sha256_hex = optarg; break;
 		case OPT_EXPECT_SHA: expect_sha_hex = optarg; break;
+		case OPT_ITERS: iters = atoi(optarg); break;
+		case OPT_DISTINCT: distinct = atoi(optarg); break;
 		default:
 			fprintf(stderr, "usage: %s --listen NA (--target ADDR | --addr-file PATH) "
 				"[--key K] [--runtime N] [--module M] [--module-ns NS] [--osize N] "
-				"[--sha256 HEX] [--expect N] [--expect-result N] [--expect-sha256 HEX]\n",
+				"[--sha256 HEX] [--expect N] [--expect-result N] [--expect-sha256 HEX] "
+				"[--iters N]\n",
 				argv[0]);
 			return 2;
 		}
+	}
+	if (iters < 1) {
+		fprintf(stderr, "test: --iters must be >= 1\n");
+		return 2;
+	}
+	if (distinct < 1) {
+		fprintf(stderr, "test: --distinct must be >= 1\n");
+		return 2;
 	}
 
 	if (osize <= 0) {
@@ -199,21 +214,36 @@ main(int argc, char **argv)
 		return 2;
 	}
 
-	/* The host output buffer == the tenant DPTR stand-in / result sink. A poison
-	 * fill makes a short or absent push detectable. */
-	unsigned char *sink = malloc((size_t)osize);
-	if (sink == NULL) {
-		fprintf(stderr, "test: out of memory for %d-byte sink\n", osize);
+	/* The host output buffer(s) == the tenant DPTR stand-in / result sink. A
+	 * poison fill makes a short or absent push detectable. --distinct allocates N
+	 * separate buffers (distinct cache keys) round-robined across the iters, to
+	 * exercise the handle cache's LRU eviction when N exceeds its slot count. */
+	unsigned char **sinks = calloc((size_t)distinct, sizeof(*sinks));
+	if (sinks == NULL) {
+		fprintf(stderr, "test: out of memory for sink table\n");
 		return 1;
 	}
-	memset(sink, 0xA5, (size_t)osize);
+	for (int b = 0; b < distinct; b++) {
+		sinks[b] = malloc((size_t)osize);
+		if (sinks[b] == NULL) {
+			fprintf(stderr, "test: out of memory for %d-byte sink %d\n", osize, b);
+			for (int j = 0; j < b; j++) {
+				free(sinks[j]);
+			}
+			free(sinks);
+			return 1;
+		}
+	}
 
 	struct nkvx_front *front = NULL;
 	int rc = nkvx_front_init(na_init, target, &front);
 	if (rc != 0) {
 		fprintf(stderr, "test: nkvx_front_init(%s, %s) failed: %d\n",
 			na_init, target, rc);
-		free(sink);
+		for (int b = 0; b < distinct; b++) {
+			free(sinks[b]);
+		}
+		free(sinks);
 		return 1;
 	}
 
@@ -236,63 +266,97 @@ main(int argc, char **argv)
 	in.input_bulk = HG_BULK_NULL;
 	in.result_sink = HG_BULK_NULL;
 
-	struct done_state st;
-	memset(&st, 0, sizeof(st));
-	st.sink = sink;
-	st.sink_cap = (uint32_t)osize;
-
-	rc = nkvx_front_forward(front, &in, sink, (uint32_t)osize, on_done, &st);
-	if (rc != 0) {
-		fprintf(stderr, "test: nkvx_front_forward failed: %d\n", rc);
-		nkvx_front_fini(front);
-		free(sink);
-		return 1;
-	}
-
-	/* Drive progress exactly as the SPDK poller will, until the cb fires. */
-	for (int i = 0; i < 200000 && !st.called; i++) {
-		int prog = nkvx_front_progress(front, 100);
-		if (prog < 0) {
-			fprintf(stderr, "test: nkvx_front_progress failed: %d\n", prog);
-			nkvx_front_fini(front);
-			free(sink);
-			return 1;
-		}
-	}
-
 	int ret = 1;
-	if (!st.called) {
-		fprintf(stderr, "test: FAIL (completion never fired)\n");
-		goto done;
-	}
-	if ((int)st.status != expect) {
-		fprintf(stderr, "test: FAIL (status %d != expected %d)\n",
-			(int)st.status, expect);
-		goto done;
-	}
-	if (expect_result >= 0 && st.result_len != (uint32_t)expect_result) {
-		fprintf(stderr, "test: FAIL (result_len %u != expected %d)\n",
-			st.result_len, expect_result);
-		goto done;
-	}
-	if (have_expect_sha) {
-		uint32_t n = st.result_len < (uint32_t)osize ? st.result_len : (uint32_t)osize;
-		unsigned char got[SHA256_DIGEST_LENGTH];
 
-		SHA256(sink, n, got);
-		if (memcmp(got, expect_sha, sizeof(got)) != 0) {
-			fprintf(stderr, "test: FAIL (delivered %u bytes sha256 mismatch — "
-				"torn/short bulk push?)\n", n);
+	/*
+	 * Run `iters` Execs SEQUENTIALLY on the SAME front, round-robining `distinct`
+	 * sink buffers: submit, drain to completion, verify, repeat. Each sink is
+	 * re-poisoned before its Exec so a missing push is detectable. With
+	 * distinct==1 (the recurring-DPTR case the cache targets) the first large
+	 * result MISSes and the rest HIT; with distinct > cache slots the LRU evicts.
+	 */
+	for (int it = 0; it < iters; it++) {
+		unsigned char *sink = sinks[it % distinct];
+		struct done_state st;
+		memset(&st, 0, sizeof(st));
+		st.sink = sink;
+		st.sink_cap = (uint32_t)osize;
+		memset(sink, 0xA5, (size_t)osize);
+
+		rc = nkvx_front_forward(front, &in, sink, (uint32_t)osize, on_done, &st);
+		if (rc != 0) {
+			fprintf(stderr, "test: iter %d nkvx_front_forward failed: %d\n", it, rc);
 			goto done;
 		}
-		printf("test: delivered %u bytes, sha256 verified\n", n);
+
+		/* Drive progress exactly as the SPDK poller will, until the cb fires. */
+		for (int i = 0; i < 200000 && !st.called; i++) {
+			int prog = nkvx_front_progress(front, 100);
+			if (prog < 0) {
+				fprintf(stderr, "test: iter %d nkvx_front_progress failed: %d\n",
+					it, prog);
+				goto done;
+			}
+		}
+
+		if (!st.called) {
+			fprintf(stderr, "test: FAIL iter %d (completion never fired)\n", it);
+			goto done;
+		}
+		if ((int)st.status != expect) {
+			fprintf(stderr, "test: FAIL iter %d (status %d != expected %d)\n",
+				it, (int)st.status, expect);
+			goto done;
+		}
+		if (expect_result >= 0 && st.result_len != (uint32_t)expect_result) {
+			fprintf(stderr, "test: FAIL iter %d (result_len %u != expected %d)\n",
+				it, st.result_len, expect_result);
+			goto done;
+		}
+		if (have_expect_sha) {
+			uint32_t n = st.result_len < (uint32_t)osize ?
+				st.result_len : (uint32_t)osize;
+			unsigned char got[SHA256_DIGEST_LENGTH];
+
+			SHA256(sink, n, got);
+			if (memcmp(got, expect_sha, sizeof(got)) != 0) {
+				fprintf(stderr, "test: FAIL iter %d (delivered %u bytes sha256 "
+					"mismatch — torn/short bulk push?)\n", it, n);
+				goto done;
+			}
+		}
 	}
-	printf("test: PASS (status=%d result_len=%u inline_len=%u)\n",
-	       (int)st.status, st.result_len, st.result_inline_len);
+
+	/*
+	 * C7.2 acceptance: with a large result (osize > NKVX_INLINE_MAX) reusing ONE
+	 * sink buffer, the cache must register exactly once and reuse thereafter —
+	 * misses == 1, hits == iters - 1, no eviction (single recurring DPTR). With
+	 * --distinct > 1 the pattern is workload-dependent (eviction in play), so the
+	 * strict assert applies only to the single-buffer case; stats are printed
+	 * always for the caller to inspect.
+	 */
+	struct nkvx_front_bulk_stats bs;
+	nkvx_front_get_bulk_stats(front, &bs);
+	printf("test: bulk cache hits=%llu misses=%llu evicts=%llu\n",
+	       (unsigned long long)bs.hits, (unsigned long long)bs.misses,
+	       (unsigned long long)bs.evicts);
+	if (iters > 1 && distinct == 1 && osize > (int)NKVX_INLINE_MAX) {
+		if (bs.misses != 1 || bs.hits != (uint64_t)(iters - 1) || bs.evicts != 0) {
+			fprintf(stderr, "test: FAIL (cache reuse: expected misses=1 hits=%d "
+				"evicts=0 for one recurring DPTR)\n", iters - 1);
+			goto done;
+		}
+		printf("test: cache reuse verified (1 register, %d reuse)\n", iters - 1);
+	}
+	printf("test: PASS (%d iter(s), %d distinct sink(s), status=%d)\n",
+	       iters, distinct, expect);
 	ret = 0;
 
 done:
 	nkvx_front_fini(front);
-	free(sink);
+	for (int b = 0; b < distinct; b++) {
+		free(sinks[b]);
+	}
+	free(sinks);
 	return ret;
 }
