@@ -40,9 +40,18 @@
 #include <mercury.h>
 
 #include "nkvx_exec_rpc.h"
+#include "nkvx_executor.h"
 
 /* Set from a signal handler to break the progress loop for an orderly exit. */
 static volatile sig_atomic_t g_stop;
+
+/*
+ * The librados-backed executor backend (Slice C5a). NULL until a --rados-pool is
+ * configured; when NULL the handler keeps the C2 skeleton behaviour (decode +
+ * NOT_SUPPORTED) so the transport/contract still round-trips with no cluster.
+ * Single executor per process, so a file-scope handle is sufficient.
+ */
+static struct nkvx_executor *g_executor;
 
 static void
 on_signal(int sig)
@@ -82,24 +91,35 @@ nkvx_exec_handler(hg_handle_t handle)
 		return ret;
 	}
 
-	fprintf(stderr,
-		"nkvx_service: nkvx_exec op_id=%u key_len=%u runtime=%u "
-		"sha256_valid=%u caps=%llu input_len=%u osize=%u "
-		"module_key=%s module_ns=%s -> NOT_SUPPORTED (C2 skeleton)\n",
-		in.op_id, in.key_len, in.runtime, in.sha256_valid,
-		(unsigned long long)in.caps, in.input_len, in.osize,
-		in.module_key ? in.module_key : "(null)",
-		in.module_ns ? in.module_ns : "(null)");
-
-	/*
-	 * Skeleton reply: the runtime pipeline is not wired yet, so decline.
-	 * NOT_SUPPORTED maps at the tenant to INVALID_OPCODE (design §3), which is
-	 * the correct "executor cannot run this (yet)" signal.
-	 */
-	out.status = nkvx_status_to_wire(SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED);
-	out.result_len = 0;
-	out.result_inline_len = 0;
-	out.result_inline = NULL;
+	if (g_executor != NULL) {
+		/* Slice C5a: cold-fill from RADOS and run the module. The run is
+		 * synchronous here — it briefly occupies the progress loop, acceptable
+		 * on a dedicated executor (off-loop execution is a later optimization). */
+		nkvx_executor_run(g_executor, &in, &out);
+		fprintf(stderr,
+			"nkvx_service: nkvx_exec op_id=%u key_len=%u runtime=%u "
+			"module_key=%s module_ns=%s -> status=%d result_len=%u\n",
+			in.op_id, in.key_len, in.runtime,
+			in.module_key ? in.module_key : "(null)",
+			in.module_ns ? in.module_ns : "(null)",
+			out.status, out.result_len);
+	} else {
+		/*
+		 * No cluster configured (C2 skeleton mode): decode + decline so the
+		 * transport/contract still round-trips with no RADOS. NOT_SUPPORTED
+		 * maps at the tenant to INVALID_OPCODE (design §3).
+		 */
+		fprintf(stderr,
+			"nkvx_service: nkvx_exec op_id=%u key_len=%u runtime=%u "
+			"module_key=%s module_ns=%s -> NOT_SUPPORTED (no cluster)\n",
+			in.op_id, in.key_len, in.runtime,
+			in.module_key ? in.module_key : "(null)",
+			in.module_ns ? in.module_ns : "(null)");
+		out.status = nkvx_status_to_wire(SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED);
+		out.result_len = 0;
+		out.result_inline_len = 0;
+		out.result_inline = NULL;
+	}
 
 	ret = HG_Respond(handle, NULL, NULL, &out);
 	if (ret != HG_SUCCESS) {
@@ -107,6 +127,9 @@ nkvx_exec_handler(hg_handle_t handle)
 			HG_Error_to_string(ret));
 	}
 
+	/* HG_Respond encoded the response synchronously, so the result buffer can be
+	 * released now. */
+	nkvx_exec_out_free(&out);
 	HG_Free_input(handle, &in);
 	HG_Destroy(handle);
 
@@ -215,10 +238,16 @@ usage(const char *prog)
 {
 	fprintf(stderr,
 		"Usage: %s [--listen NA_INIT_STRING] [--addr-file PATH]\n"
-		"  --listen     Mercury/NA init string to listen on "
+		"          [--rados-pool POOL [--rados-namespace NS] [--rados-conf PATH] [--rados-user ID]]\n"
+		"  --listen           Mercury/NA init string to listen on "
 		"(default \"na+sm://\"; e.g. \"ofi+tcp://\", \"ofi+verbs://\")\n"
-		"  --addr-file  publish the self-address to PATH (atomic write) for "
-		"front bootstrap (design OQ-8)\n",
+		"  --addr-file        publish the self-address to PATH (atomic write) for "
+		"front bootstrap (design OQ-8)\n"
+		"  --rados-pool       RADOS pool holding the KV objects; enables the Slice C5a\n"
+		"                     cold-fill + module run (absent -> C2 skeleton, NOT_SUPPORTED)\n"
+		"  --rados-namespace  RADOS namespace (== KV namespace; default namespace if omitted)\n"
+		"  --rados-conf       ceph.conf path (default librados search if omitted)\n"
+		"  --rados-user       ceph client id (default \"admin\")\n",
 		prog);
 }
 
@@ -227,13 +256,24 @@ main(int argc, char **argv)
 {
 	const char *na_init = "na+sm://";
 	const char *addr_file = NULL;
+	const char *rados_pool = NULL;
+	const char *rados_ns = NULL;
+	const char *rados_conf = NULL;
+	const char *rados_user = NULL;
 	int rc = 0;
 
+	enum {
+		OPT_RADOS_POOL = 256, OPT_RADOS_NS, OPT_RADOS_CONF, OPT_RADOS_USER,
+	};
 	static const struct option opts[] = {
-		{ "listen",    required_argument, NULL, 'l' },
-		{ "addr-file", required_argument, NULL, 'a' },
-		{ "help",      no_argument,       NULL, 'h' },
-		{ NULL,        0,                 NULL, 0 },
+		{ "listen",          required_argument, NULL, 'l' },
+		{ "addr-file",       required_argument, NULL, 'a' },
+		{ "rados-pool",      required_argument, NULL, OPT_RADOS_POOL },
+		{ "rados-namespace", required_argument, NULL, OPT_RADOS_NS },
+		{ "rados-conf",      required_argument, NULL, OPT_RADOS_CONF },
+		{ "rados-user",      required_argument, NULL, OPT_RADOS_USER },
+		{ "help",            no_argument,       NULL, 'h' },
+		{ NULL,              0,                 NULL, 0 },
 	};
 	int c;
 	while ((c = getopt_long(argc, argv, "l:a:h", opts, NULL)) != -1) {
@@ -243,6 +283,18 @@ main(int argc, char **argv)
 			break;
 		case 'a':
 			addr_file = optarg;
+			break;
+		case OPT_RADOS_POOL:
+			rados_pool = optarg;
+			break;
+		case OPT_RADOS_NS:
+			rados_ns = optarg;
+			break;
+		case OPT_RADOS_CONF:
+			rados_conf = optarg;
+			break;
+		case OPT_RADOS_USER:
+			rados_user = optarg;
 			break;
 		case 'h':
 			usage(argv[0]);
@@ -282,6 +334,22 @@ main(int argc, char **argv)
 		goto out;
 	}
 
+	/* Slice C5a: connect librados up front (before publishing the address, so the
+	 * executor can serve the first Exec the moment the front looks it up). Absent
+	 * --rados-pool keeps the C2 skeleton (NOT_SUPPORTED) behaviour. */
+	if (rados_pool != NULL) {
+		int erc = nkvx_executor_open(rados_conf, rados_user, rados_pool, rados_ns,
+					     &g_executor);
+		if (erc != 0) {
+			fprintf(stderr, "nkvx_service: nkvx_executor_open(pool=%s) failed: %s\n",
+				rados_pool, strerror(-erc));
+			rc = 1;
+			goto out;
+		}
+		printf("nkvx_service: librados connected (pool=%s ns=%s)\n",
+		       rados_pool, rados_ns ? rados_ns : "(default)");
+	}
+
 	if (publish_self_addr(hg, addr_file) != 0) {
 		rc = 1;
 		goto out;
@@ -294,6 +362,8 @@ out:
 		/* Best-effort: do not leave a stale address behind on clean exit. */
 		remove(addr_file);
 	}
+	nkvx_executor_close(g_executor);
+	g_executor = NULL;
 	HG_Context_destroy(ctx);
 	HG_Finalize(hg);
 	return rc;

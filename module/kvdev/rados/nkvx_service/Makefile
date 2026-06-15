@@ -31,13 +31,17 @@ LDFLAGS := $(MERCURY_LIBS) -Wl,-rpath,$(MERCURY_PREFIX)/lib
 CONTRACT := $(RADOS_DIR)/nkvx_exec_rpc.c
 HEADER   := $(RADOS_DIR)/nkvx_exec_rpc.h
 
+# Slice C5a: the executor backend cold-fills objects from RADOS (cold path only,
+# ADR-0009), so the service binary links librados. The client never touches RADOS.
 SERVICE := nkvx_service
 CLIENT  := nkvx_exec_client
+SERVICE_SRCS := nkvx_service.c nkvx_executor.c $(CONTRACT)
+SERVICE_LIBS := -lrados
 
 all: $(SERVICE) $(CLIENT)
 
-$(SERVICE): nkvx_service.c $(CONTRACT) $(HEADER)
-	$(CC) $(CFLAGS) -o $@ nkvx_service.c $(CONTRACT) $(LDFLAGS)
+$(SERVICE): $(SERVICE_SRCS) nkvx_executor.h $(HEADER)
+	$(CC) $(CFLAGS) -o $@ $(SERVICE_SRCS) $(SERVICE_LIBS) $(LDFLAGS)
 
 $(CLIENT): nkvx_exec_client.c $(CONTRACT) $(HEADER)
 	$(CC) $(CFLAGS) -o $@ nkvx_exec_client.c $(CONTRACT) $(LDFLAGS)

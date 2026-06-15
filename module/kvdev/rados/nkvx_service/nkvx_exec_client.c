@@ -38,6 +38,8 @@ struct forward_ctx {
 	bool		have_out;
 	int32_t		wire_status;
 	uint32_t	result_len;
+	unsigned char	result[256];	/* captured inline result bytes */
+	uint32_t	result_n;	/* number captured (<= sizeof(result)) */
 };
 
 static hg_return_t
@@ -53,6 +55,12 @@ forward_cb(const struct hg_cb_info *info)
 		if (ret == HG_SUCCESS) {
 			fc->wire_status = out.status;
 			fc->result_len = out.result_len;
+			if (out.result_inline != NULL && out.result_inline_len > 0) {
+				uint32_t n = out.result_inline_len < sizeof(fc->result) ?
+					out.result_inline_len : (uint32_t)sizeof(fc->result);
+				memcpy(fc->result, out.result_inline, n);
+				fc->result_n = n;
+			}
 			fc->have_out = true;
 			HG_Free_output(info->info.forward.handle, &out);
 		} else {
@@ -119,15 +127,29 @@ main(int argc, char **argv)
 	const char *target = NULL;
 	const char *addr_file = NULL;
 	int expect = SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED;
+	/* Request fields (defaults preserve the C2 skeleton round-trip). */
+	const char *key = "ping";
+	int runtime = 1;			/* WASM */
+	const char *module_key = "nkvx:bytecount";
+	const char *module_ns = "kvpool";
+	int osize = 4096;
+	int expect_result = -1;			/* >=0: also assert result_len == this */
 	int rc = 1;
 
+	enum { OPT_KEY = 256, OPT_RUNTIME, OPT_MODULE, OPT_MODULE_NS, OPT_OSIZE, OPT_EXPECT_RESULT };
 	static const struct option opts[] = {
-		{ "listen",    required_argument, NULL, 'l' },
-		{ "target",    required_argument, NULL, 't' },
-		{ "addr-file", required_argument, NULL, 'a' },
-		{ "expect",    required_argument, NULL, 'e' },
-		{ "help",      no_argument,       NULL, 'h' },
-		{ NULL,        0,                 NULL, 0 },
+		{ "listen",        required_argument, NULL, 'l' },
+		{ "target",        required_argument, NULL, 't' },
+		{ "addr-file",     required_argument, NULL, 'a' },
+		{ "expect",        required_argument, NULL, 'e' },
+		{ "key",           required_argument, NULL, OPT_KEY },
+		{ "runtime",       required_argument, NULL, OPT_RUNTIME },
+		{ "module",        required_argument, NULL, OPT_MODULE },
+		{ "module-ns",     required_argument, NULL, OPT_MODULE_NS },
+		{ "osize",         required_argument, NULL, OPT_OSIZE },
+		{ "expect-result", required_argument, NULL, OPT_EXPECT_RESULT },
+		{ "help",          no_argument,       NULL, 'h' },
+		{ NULL,            0,                 NULL, 0 },
 	};
 	int c;
 	while ((c = getopt_long(argc, argv, "l:t:a:e:h", opts, NULL)) != -1) {
@@ -136,9 +158,20 @@ main(int argc, char **argv)
 		case 't': target = optarg; break;
 		case 'a': addr_file = optarg; break;
 		case 'e': expect = atoi(optarg); break;
+		case OPT_KEY: key = optarg; break;
+		case OPT_RUNTIME: runtime = atoi(optarg); break;
+		case OPT_MODULE: module_key = optarg; break;
+		case OPT_MODULE_NS: module_ns = optarg; break;
+		case OPT_OSIZE: osize = atoi(optarg); break;
+		case OPT_EXPECT_RESULT: expect_result = atoi(optarg); break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 2;
 		}
+	}
+	size_t key_len = strlen(key);
+	if (key_len == 0 || key_len > SPDK_KVDEV_EXEC_KEY_MAX_LEN) {
+		fprintf(stderr, "client: --key must be 1..%d bytes\n", SPDK_KVDEV_EXEC_KEY_MAX_LEN);
+		return 2;
 	}
 
 	char addr_buf[512];
@@ -193,19 +226,20 @@ main(int argc, char **argv)
 		goto out_addr;
 	}
 
-	/* A minimal but well-formed request (the C2 skeleton declines it anyway). */
+	/* A well-formed request; fields are CLI-driven (defaults round-trip the C2
+	 * skeleton, --runtime 2 --module-ns nkvx --module bytecount drives C5a). */
 	nkvx_exec_in_t in;
 	memset(&in, 0, sizeof(in));
 	in.op_id = 0x4242;
 	in.read_only = 1;
-	in.runtime = 1;			/* WASM */
+	in.runtime = (uint8_t)runtime;
 	in.caps = 0;
-	in.key_len = 4;
-	memcpy(in.key, "ping", 4);
+	in.key_len = (uint8_t)key_len;
+	memcpy(in.key, key, key_len);
 	in.sha256_valid = 0;
-	in.module_key = (char *)"nkvx:bytecount";
-	in.module_ns = (char *)"kvpool";
-	in.osize = 4096;
+	in.module_key = (char *)module_key;
+	in.module_ns = (char *)module_ns;
+	in.osize = (uint32_t)osize;
 	in.input_len = 0;
 	in.input_inline = NULL;
 	in.input_bulk = HG_BULK_NULL;
@@ -248,15 +282,36 @@ main(int argc, char **argv)
 	}
 
 	enum spdk_kvdev_io_status status = nkvx_status_from_wire(fc.wire_status);
-	printf("client: reply status=%d (%s) result_len=%u\n",
-	       fc.wire_status, status_name(status), fc.result_len);
+	printf("client: reply status=%d (%s) result_len=%u inline=%u bytes",
+	       fc.wire_status, status_name(status), fc.result_len, fc.result_n);
+	for (uint32_t i = 0; i < fc.result_n; i++) {
+		printf("%s%02x", i == 0 ? " [" : " ", fc.result[i]);
+	}
+	if (fc.result_n > 0) {
+		printf("]");
+		if (fc.result_n == 8) {
+			uint64_t v;
+			memcpy(&v, fc.result, 8);
+			printf(" (u64=%llu)", (unsigned long long)v);
+		}
+	}
+	printf("\n");
 
-	if (fc.wire_status == expect) {
-		printf("client: PASS (status matches expected %d)\n", expect);
+	bool ok = (fc.wire_status == expect);
+	if (ok && expect_result >= 0 && fc.result_len != (uint32_t)expect_result) {
+		fprintf(stderr, "client: FAIL (result_len %u != expected %d)\n",
+			fc.result_len, expect_result);
+		ok = false;
+	}
+	if (ok) {
+		printf("client: PASS (status %d%s)\n", expect,
+		       expect_result >= 0 ? ", result_len matches" : "");
 		rc = 0;
-	} else {
+	} else if (fc.wire_status != expect) {
 		fprintf(stderr, "client: FAIL (status %d != expected %d)\n",
 			fc.wire_status, expect);
+		rc = 1;
+	} else {
 		rc = 1;
 	}
 

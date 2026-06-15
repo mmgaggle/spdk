@@ -67,8 +67,8 @@ if [ "$CLIENT_RC" -ne 0 ]; then
 	exit 1
 fi
 
-# The skeleton handler must have logged the decoded request.
-if ! grep -q "NOT_SUPPORTED (C2 skeleton)" "$SVC_LOG"; then
+# The handler must have decoded the request and declined (no cluster configured).
+if ! grep -q "NOT_SUPPORTED (no cluster)" "$SVC_LOG"; then
 	echo "RESULT: FAIL (service did not log the decoded request)"
 	exit 1
 fi
