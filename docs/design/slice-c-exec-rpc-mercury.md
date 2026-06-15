@@ -489,6 +489,55 @@ result-cache hit — a *wrong answer that looks valid*, never an error. C5 is th
   key the executor may have cached (simpler, but adds a front→executor control path and a
   consistency window).
 
+**Decision (2026-06-15): start with `rados_watch`, with a documented scale caveat and a
+named successor.** Rationale and bounds:
+- The live watch count is bounded by **resident TB4 cache entries**, not total keys: the
+  executor watches an object only when it admits it to the cache and drops the watch on
+  eviction, so watches ≈ what is currently cached (already capped by the cache). For the
+  64 MiB KV-cache tensors that motivate this stack that is a modest number; the scale risk
+  is the *many-small-objects* regime.
+- This is an **atypical `rados_watch` usage** — most consumers (e.g. RGW metadata) hold a
+  handful of long-lived watches, not one-per-cached-blob — so watch scale (per-OSD watch
+  load, notify/ping overhead, watch re-establishment on osdmap change) is a **known
+  limitation that may force a change**.
+- Likely successor if it doesn't scale: **lazy version-validation, not the invalidate RPC.**
+  The cold-fill already `stat`s the object, so a cache entry can carry the RADOS object
+  version/mtime and an Exec re-`stat`s (cheap) to detect staleness — pull-validation
+  bounded by one stat per Exec, still executor-self-sufficient, no watch-count ceiling. The
+  explicit front→owning-executor invalidate RPC is the third fallback; note it is **NOT a
+  front-to-front collective** (each key has a single owning executor under CRUSH, so it is
+  point-to-point from the mutating front to that executor) but it is *blind-per-Store* (the
+  front cannot know whether the key is cached) and re-couples the data plane to the control
+  plane, which is why it is not first choice.
+
+**Cardinality across multiple executors (cache instances) — when a collective is needed.**
+All of the above assume the **CRUSH single-owner invariant**: each key has exactly one
+owning executor (co-located with its data via CRUSH-to-primary, one executor per host), so
+a mutation reaches that one executor with NO executor-to-executor coordination. A cross-
+executor *collective* invalidation is needed ONLY when single-owner is relaxed and the same
+key can be cached on several instances: **read-from-replica** Exec routing (the realistic
+one — spreading Exec load over a key's replicas), **sharded executors** (>1 per host), or
+non-CRUSH/load-balanced routing where a mutation cannot name the owner.
+- Broadcasting every Store/Delete to every executor is O(stores × executors) — the wrong
+  cardinality.
+- **Binned invalidation** is the coarsening lever for that regime: partition the keyspace
+  into B bins (e.g. `hash(key) mod B`); each executor tracks which bins it holds cached
+  content for; a mutation invalidates `bin(K)` via a collective/gossip carrying only bin
+  IDs, and each executor evicts (or marks-for-revalidation) its entries in that bin. Cost:
+  **false invalidations within a bin** (cache thrash); coarser bins → less coordination
+  state/traffic but more thrash. It has a clean `rados_watch` analog that ALSO bounds the
+  watch count: watch one **per-bin epoch object** instead of one-per-cached-object →
+  O(bins) watches, RADOS still does the fan-out (executors don't talk to each other), at
+  the price of a per-Store epoch bump (re-introduces some data/control coupling) and the
+  same bin false-positives.
+- **Re-stat validation sidesteps cardinality entirely** (no watches, collectives, or bins)
+  and is the preferred escape when ownership is single but scale is the worry; binning earns
+  its keep specifically when *push* invalidation is required under *multi-owner* routing.
+
+Recorded hierarchy: **single-owner → per-object `rados_watch` (C5 now), re-stat if the
+count bites; multi-owner → binned invalidation (gossip or per-bin-epoch watch).** C5b's
+mechanism stays selectable; C5a (relocate the pipeline) is invalidation-agnostic.
+
 Depends: C4. Validate: the TB4 cache acceptance proof (2nd Exec of same key does 0
 librados refetch — `cold_fills` counter) holds *with the executor remote*; **AND** a
 tenant Store/Delete to a cached key invalidates the executor object cache so the next
