@@ -85,6 +85,9 @@ function usage() {
 	echo " --without-rbd             No path required."
 	echo " --with-wasm               Build the rados-nkvx wasmtime Exec path (dlopen libwasmtime.so at runtime)."
 	echo " --without-wasm            No path required. Built-in Exec modules still work without wasmtime."
+	echo " --with-mercury[=DIR]      Build the Slice C Exec RPC path over Mercury/libfabric. Optional DIR is a"
+	echo "                           Mercury install prefix (its lib/pkgconfig holds mercury.pc/na.pc)."
+	echo " --without-mercury         No path required. A stock build links nothing Mercury/libfabric (default)."
 	echo " --with-ublk               Build ublk library."
 	echo " --without-ublk            No path required."
 	echo " --with-rdma[=PROVIDER]    Build RDMA transport for NVMf target and initiator."
@@ -479,6 +482,17 @@ for i in "$@"; do
 			;;
 		--without-wasm)
 			CONFIG[WASM]=n
+			;;
+		--with-mercury=*)
+			CONFIG[MERCURY]=y
+			CONFIG[MERCURY_DIR]=$(readlink -f ${i#*=})
+			;;
+		--with-mercury)
+			CONFIG[MERCURY]=y
+			;;
+		--without-mercury)
+			CONFIG[MERCURY]=n
+			CONFIG[MERCURY_DIR]=
 			;;
 		--with-rdma=*)
 			CONFIG[RDMA]=y
@@ -1071,6 +1085,33 @@ if [[ "${CONFIG[WASM]}" = "y" ]]; then
 	if [[ "${CONFIG[RBD]}" != "y" ]]; then
 		echo "--with-wasm requires --with-rbd (the rados-nkvx executor lives in the librados kvdev)."
 		echo "Please re-run with --with-rbd."
+		exit 1
+	fi
+fi
+
+if [[ "${CONFIG[MERCURY]}" = "y" ]]; then
+	# Slice C Exec RPC links Mercury (HG_*) + libfabric (fi_*). Probe both via
+	# pkg-config (Mercury ships mercury.pc/na.pc; Fedora libfabric-devel ships
+	# libfabric.pc). A Mercury install prefix can be supplied via
+	# --with-mercury=DIR; its lib/pkgconfig is prepended to PKG_CONFIG_PATH.
+	mercury_pkgpath=$PKG_CONFIG_PATH
+	if [[ -n "${CONFIG[MERCURY_DIR]}" ]]; then
+		for libdir in lib lib64; do
+			if [[ -d "${CONFIG[MERCURY_DIR]}/$libdir/pkgconfig" ]]; then
+				mercury_pkgpath="${CONFIG[MERCURY_DIR]}/$libdir/pkgconfig:$mercury_pkgpath"
+			fi
+		done
+	fi
+	if ! PKG_CONFIG_PATH="$mercury_pkgpath" pkg-config --exists mercury na; then
+		echo "--with-mercury requires Mercury (mercury.pc/na.pc) on the pkg-config path."
+		echo "Build mercury-hpc/mercury (NA_USE_OFI=ON NA_USE_SM=ON) and pass its"
+		echo "install prefix via --with-mercury=DIR, or set PKG_CONFIG_PATH."
+		exit 1
+	fi
+	if ! pkg-config --exists libfabric; then
+		echo "--with-mercury requires libfabric (libfabric.pc). On Fedora:"
+		echo "  dnf install libfabric libfabric-devel"
+		echo "Please install then re-run this script."
 		exit 1
 	fi
 fi

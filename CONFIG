@@ -117,6 +117,18 @@ CONFIG_RBD=n
 # never requires anything wasm at link time either way.
 CONFIG_WASM=n
 
+# Build the Slice C inter-tier Exec RPC path over Mercury/libfabric (ADR-0015,
+# docs/design/slice-c-exec-rpc-mercury.md). When y, the two-tier Exec front and
+# the rados-nkvx executor link Mercury (HG_*) + libfabric (fi_*); the libfabric
+# NA plugins na_ofi (verbs/tcp) and na_sm (loopback dev rung) carry the transport.
+# When n (default), nothing Mercury/libfabric is compiled or linked and a stock
+# SPDK build is byte-for-byte unchanged (graceful degrade, mirrors CONFIG_WASM).
+# MERCURY_DIR points at a Mercury install prefix (its lib/pkgconfig holds
+# mercury.pc/na.pc); empty means probe the system pkg-config path. libfabric is
+# always taken from the system pkg-config (Fedora libfabric-devel).
+CONFIG_MERCURY=n
+CONFIG_MERCURY_DIR=
+
 # Build DAOS support in bdev modules
 # Requires daos development libraries
 CONFIG_DAOS=n
