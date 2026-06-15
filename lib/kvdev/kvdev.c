@@ -347,4 +347,20 @@ spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 				     output_buf, output_buf_len, cb_fn, cb_arg);
 }
 
+int
+spdk_kvdev_abort(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch, void *cb_arg)
+{
+	struct spdk_kvdev *kvdev = desc->kvdev;
+
+	/* abort is OPTIONAL in the vtable (Slice C6c): a backend that cannot cancel
+	 * an in-flight op leaves it NULL. Report -ENOTSUP so the NVMf layer treats
+	 * the NVMe ABORT as "command not aborted" (the original op runs to natural
+	 * completion). */
+	if (kvdev->fn_table->abort == NULL) {
+		return -ENOTSUP;
+	}
+
+	return kvdev->fn_table->abort(ch, cb_arg);
+}
+
 SPDK_LOG_REGISTER_COMPONENT(kvdev)

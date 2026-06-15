@@ -581,15 +581,19 @@ nkvx_front_get_bulk_stats(const struct nkvx_front *front,
 }
 
 int
-nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
-		   void *result_sink, uint32_t result_sink_len,
-		   nkvx_front_done_cb cb, void *arg)
+nkvx_front_forward_tok(struct nkvx_front *front, const nkvx_exec_in_t *in,
+		       void *result_sink, uint32_t result_sink_len,
+		       nkvx_front_done_cb cb, void *arg, uint64_t *out_token)
 {
 	struct nkvx_call *call;
 	nkvx_exec_in_t local;		/* mutable copy: carries the bulk handles */
 	hg_handle_t handle = HG_HANDLE_NULL;
 	hg_return_t ret;
 	int rc;
+
+	if (out_token != NULL) {
+		*out_token = NKVX_CALL_TOKEN_NONE;
+	}
 
 	if (front == NULL || in == NULL || cb == NULL) {
 		return -EINVAL;
@@ -681,6 +685,15 @@ nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 		goto err_bulk;
 	}
 
+	/*
+	 * Slice C6c: hand back the cancel token (the call's front-unique call_id) so
+	 * a later per-command ABORT can target THIS call. A token by value (not a ctx
+	 * pointer) cannot dangle after the call completes + frees; nkvx_front_cancel
+	 * looks it up and no-ops if it is already gone.
+	 */
+	if (out_token != NULL) {
+		*out_token = call->call_id;
+	}
 	return 0;
 
 err_bulk:
@@ -688,6 +701,43 @@ err_bulk:
 	nkvx_bulk_release(front, call->result_sink);
 	free(call);
 	return -EIO;
+}
+
+int
+nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
+		   void *result_sink, uint32_t result_sink_len,
+		   nkvx_front_done_cb cb, void *arg)
+{
+	/* Token-less convenience wrapper (channel-destroy cancel_all does not need a
+	 * per-call token; the standalone front UT calls this form). */
+	return nkvx_front_forward_tok(front, in, result_sink, result_sink_len,
+				      cb, arg, NULL);
+}
+
+bool
+nkvx_front_cancel(struct nkvx_front *front, uint64_t token)
+{
+	struct nkvx_call *call;
+
+	if (front == NULL || token == NKVX_CALL_TOKEN_NONE) {
+		return false;
+	}
+	/*
+	 * Slice C6c live per-command cancel (bead spdk-v3w). Locate the targeted call
+	 * on the in-flight list by its front-unique call_id and route it through the
+	 * SAME two-phase begin-cancel handshake as nkvx_front_cancel_all() — never a
+	 * duplicate of the handshake logic. If the token matches no in-flight call the
+	 * call already completed (forward cb reaped + freed it) or was force-failed at
+	 * teardown: nothing to cancel, return false. The single-threaded-per-front
+	 * contract (see header) means the list cannot change under this walk.
+	 */
+	TAILQ_FOREACH(call, &front->inflight, link) {
+		if (call->call_id == token) {
+			nkvx_call_begin_cancel(call);	/* idempotent if already cancelling */
+			return true;
+		}
+	}
+	return false;
 }
 
 void

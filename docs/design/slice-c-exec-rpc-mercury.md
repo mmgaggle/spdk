@@ -608,14 +608,45 @@ defers releasing the DPTR/MR until the executor confirms its remote bulk view is
   PULLing. `nkvx_front_cancel_all` is now this handshake; the channel-destroy drain it backs is
   thereby UAF-safe.
 - **Scope:** the protocol + the channel-destroy teardown drain. Wiring the LIVE NVMe
-  ABORT-opcode to a per-command `begin_cancel` (needs per-io handle retention keyed by NVMe
-  cmd-id) is a deferred follow-on bead — independent of the protocol, which makes it safe.
+  ABORT-opcode to a per-command `begin_cancel` is §C6c below.
 - **Validate (nkvx_c6b_test.sh, both na+sm and ofi+tcp):** cancel an in-flight Exec mid-PUSH
   via an executor TICK-DEFERRAL stall hook (`NKVX_TEST_PUSH_STALL_TICKS`, NOT usleep —
   usleep freezes the single-threaded loop and blocks cancel processing); assert the sink
   poison is intact post-ack (NO late PUSH), the DPTR is reusable (byte-correct sha on a
   following Exec), exactly-once ABORTED, outstanding→0, executor up, valgrind 0/0. (On-verbs
   acceptance is C8, now unblocked.)
+
+**C6c — live per-command NVMe ABORT → per-Exec cancel (bead spdk-v3w).** C6b exposed the
+handshake only via `nkvx_front_cancel_all` (channel-destroy drain). C6c routes a tenant NVMe
+ABORT targeting one in-flight two-tier Exec to that same handshake for *that* command.
+- **Front token:** `nkvx_front_forward_tok` returns an opaque cancel **token** — the call's
+  front-unique `call_id` (a value, not a pointer, so it cannot dangle after the call frees);
+  `nkvx_front_cancel(front, token)` finds the in-flight call and routes it through the shared
+  `nkvx_call_begin_cancel` (no duplicated handshake; `cancel_all` still shares it). It returns
+  false if the call already resolved (nothing to cancel).
+- **kvdev retention:** `kvdev_rados` keeps a per-channel `{tenant cb_arg → token}` list for each
+  in-flight forward (the two-tier path allocates no `kvdev_rados_io`), inserted at submit and
+  reaped by a wrapping done-trampoline on completion (normal or ABORTED). The kvdev `fn_table`
+  gains an optional `abort(ch, cb_arg)` op; `kvdev_rados_exec_abort` matches by the opaque tenant
+  cb_arg and fires the per-command cancel, propagating its result (false → -ENOENT, "not
+  aborted", never a false success).
+- **NVMf glue:** KV namespaces have no bdev, so `nvmf_ctrlr_abort_request` special-cases
+  `CSI_KV` — it resolves the kvdev io_channel from **`req_to_abort->qpair->group`** (the TARGET's
+  poll group, the thread this abort runs on — NOT the ABORT admin command's group, which is a
+  different thread when admin/IO qpairs are on different poll groups) and calls
+  `nvmf_kvdev_ctrlr_abort_cmd` keyed by the kvdev cb_arg stashed on the request as `kvdev_io_ctx`
+  at Exec submit (cleared on every completion AND submit-failure path so no stale pointer can be
+  matched after reuse). It clears the ABORT CQE "not aborted" bit only on a confirmed cancel. The
+  original Exec still self-completes exactly once ABORTED; the abort command never completes the
+  target. The vfio-user transport completes the ABORT request on a synchronous (`COMPLETE`)
+  return, matching tcp/rdma.
+- **Thread model:** all three layers run on the target request's poll-group thread — the same
+  thread that drives the KV io_channel's Mercury front and the retention list — so no
+  cross-thread synchronization is introduced. The DPTR/MR is still released only at the C6b
+  two-phase join, so per-command abort is UAF-safe by the same proof.
+- **Scope/validate:** the wiring + build/unit coverage (nvmf `ctrlr`/`ctrlr_kvdev`, all transport
+  UTs, kvdev module UTs all pass). A real cross-DAC e2e ABORT of an in-flight 64 MiB two-tier
+  Exec is rig-gated/HITL (needs the hotplug rig).
 
 **C7 — large-object/result bulk RMA.**
 Scope: the front-sink/executor-push large-result path (§1.3): front registers the

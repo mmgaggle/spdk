@@ -4030,6 +4030,46 @@ nvmf_ctrlr_abort_request(struct spdk_nvmf_request *req)
 		return g_nvmf_custom_admin_cmd_hdlrs[SPDK_NVME_OPC_ABORT].hdlr(req);
 	}
 
+	/*
+	 * Key-Value namespaces are backed by a kvdev, not a bdev (Slice C6c). They
+	 * have no spdk_bdev, so spdk_nvmf_request_get_bdev() below would fail and the
+	 * ABORT would always report "command not aborted". Route a KV target to the
+	 * kvdev abort path instead: ask the backend to cancel the in-flight Exec (the
+	 * only long-running KV op). The original command's own completion still fires
+	 * (ABORTED), so we do NOT complete req_to_abort here — only set the ABORT
+	 * command's success/not-aborted bit and complete THIS abort request. This runs
+	 * on the TARGET (aborted) request's poll-group thread (per the "wrong thread on
+	 * ABORT retry" fix), which is the thread that owns req_to_abort's KV io_channel
+	 * — so the channel must be resolved from req_to_abort->qpair->group (NOT
+	 * req->qpair->group, which is the ABORT admin command's group, a different
+	 * thread when admin and I/O qpairs are on different poll groups). Mirrors the
+	 * bdev path below, which passes req_to_abort to spdk_nvmf_request_get_bdev().
+	 */
+	{
+		struct spdk_nvmf_ctrlr *ctrlr = req->qpair->ctrlr;
+		struct spdk_nvmf_ns *ns = nvmf_ctrlr_get_ns(ctrlr,
+				req_to_abort->cmd->nvme_cmd.nsid);
+
+		if (ns != NULL && ns->csi == SPDK_NVME_CSI_KV && ns->kvdev != NULL) {
+			struct spdk_nvmf_poll_group *group = req_to_abort->qpair->group;
+			struct spdk_nvmf_subsystem_pg_ns_info *ns_info;
+			struct spdk_nvme_cpl *rsp = &req->rsp->nvme_cpl;
+
+			assert(group != NULL && group->sgroups != NULL);
+			assert(group->thread == spdk_get_thread());
+			ns_info = &group->sgroups[ctrlr->subsys->id].ns_info[
+					req_to_abort->cmd->nvme_cmd.nsid - 1];
+
+			/* cdw0 bit0 defaults to 1 ("not aborted", set by nvmf_ctrlr_abort);
+			 * clear it only when the backend accepted the cancel, mirroring the
+			 * bdev path (nvmf_bdev_ctrlr_complete_abort_cmd). */
+			if (nvmf_kvdev_ctrlr_abort_cmd(ns, ns_info->channel, req_to_abort)) {
+				rsp->cdw0 &= ~1U;	/* command successfully aborted */
+			}
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+	}
+
 	rc = spdk_nvmf_request_get_bdev(req_to_abort->cmd->nvme_cmd.nsid, req_to_abort,
 					&bdev, &desc, &ch);
 	if (rc != 0) {

@@ -5298,7 +5298,17 @@ nvmf_vfio_user_qpair_abort_request(struct spdk_nvmf_qpair *qpair,
 	}
 
 	req->req_to_abort = req_to_abort;
-	nvmf_ctrlr_abort_request(req);
+	/*
+	 * nvmf_ctrlr_abort_request() returns COMPLETE when it handled the abort
+	 * synchronously (e.g. the KV/kvdev path, Slice C6c) and ASYNCHRONOUS when a
+	 * deferred completion will fire later (the bdev path). On COMPLETE we must
+	 * complete this abort request ourselves — mirroring tcp/rdma, which fall
+	 * through to spdk_nvmf_request_complete() on a non-ASYNCHRONOUS return.
+	 * Without this the KV ABORT command is never completed and the host hangs.
+	 */
+	if (nvmf_ctrlr_abort_request(req) != SPDK_NVMF_REQUEST_EXEC_STATUS_ASYNCHRONOUS) {
+		spdk_nvmf_request_complete(req);
+	}
 }
 
 static void

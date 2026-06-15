@@ -121,11 +121,16 @@ kvdev_rados_nkvx_front_forward(struct nkvx_front *front,
 			       uint64_t caps,
 			       const void *input, uint32_t input_len,
 			       void *output_buf, uint32_t output_buf_len,
-			       spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+			       spdk_kvdev_io_completion_cb cb_fn, void *cb_arg,
+			       uint64_t *out_token)
 {
 	struct kvdev_rados_nkvx_fwd_ctx *ctx;
 	nkvx_exec_in_t in;
 	int rc;
+
+	if (out_token != NULL) {
+		*out_token = KVDEV_RADOS_NKVX_TOKEN_NONE;
+	}
 
 	/* key_len is a uint8_t and SPDK_KVDEV_EXEC_KEY_MAX_LEN == 255, so it cannot
 	 * exceed the cap; only the empty-key case is invalid here. */
@@ -170,13 +175,19 @@ kvdev_rados_nkvx_front_forward(struct nkvx_front *front,
 	 * XOR pushes), and the done-cb's memcpy is a no-op on the push path (inline
 	 * is empty). Large input is likewise registered from in.input_inline.
 	 */
-	rc = nkvx_front_forward(front, &in, output_buf, output_buf_len,
-				kvdev_rados_nkvx_front_done, ctx);
+	rc = nkvx_front_forward_tok(front, &in, output_buf, output_buf_len,
+				    kvdev_rados_nkvx_front_done, ctx, out_token);
 	if (rc != 0) {
 		free(ctx);
 		return rc;
 	}
 	return 0;
+}
+
+bool
+kvdev_rados_nkvx_front_cancel(struct nkvx_front *front, uint64_t token)
+{
+	return nkvx_front_cancel(front, token);
 }
 
 void

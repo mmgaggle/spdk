@@ -131,9 +131,36 @@ struct kvdev_rados_io_channel {
 	 */
 	struct nkvx_front	*front;
 	struct spdk_poller	*front_poller;
+	/*
+	 * Slice C6c (bead spdk-v3w): per-command cancel-token retention for in-flight
+	 * two-tier Exec forwards. A two-tier Exec does NOT allocate a kvdev_rados_io
+	 * (it forwards the tenant cb_fn/cb_arg straight to the front); to let a live
+	 * NVMe ABORT cancel the ONE forward it targets, each forward is tracked here as
+	 * { tenant cb_arg (the abort key), front cancel token }. Inserted at submission,
+	 * removed when the forward completes (normal OR aborted) via the wrapping done
+	 * trampoline kvdev_rados_nkvx_fwd_done. The list is per-reactor-thread (the
+	 * channel is single-threaded), so no locking; the tenant cb_arg uniquely
+	 * identifies one in-flight command, so it is the abort lookup key.
+	 */
+	TAILQ_HEAD(, kvdev_rados_nkvx_pending) nkvx_pending;
 #endif
 	TAILQ_HEAD(, kvdev_rados_io) inflight;
 };
+
+#ifdef SPDK_CONFIG_MERCURY
+/*
+ * Slice C6c per-command cancel-token retention entry (one in-flight two-tier
+ * Exec forward). Allocated at forward submission, freed when the forward's done
+ * trampoline fires. Keyed for abort lookup by the tenant's opaque cb_arg.
+ */
+struct kvdev_rados_nkvx_pending {
+	void					*tenant_cb_arg;	/* abort lookup key */
+	spdk_kvdev_io_completion_cb		tenant_cb_fn;	/* real tenant completion */
+	struct kvdev_rados_io_channel		*ch;		/* owning channel */
+	uint64_t				token;		/* front cancel token */
+	TAILQ_ENTRY(kvdev_rados_nkvx_pending)	link;
+};
+#endif
 
 enum kvdev_rados_op {
 	KVDEV_RADOS_OP_STORE,
@@ -1738,6 +1765,130 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
 	return kvdev_rados_nkvx_start_data_phase(io);
 }
 
+#ifdef SPDK_CONFIG_MERCURY
+/*
+ * Slice C6c (bead spdk-v3w): completion trampoline that wraps the tenant cb_fn
+ * for a TRACKED two-tier Exec forward. The forward has terminally completed
+ * (normal result, transport error, OR an ABORTED from a per-command/teardown
+ * cancel): drop this command's cancel-token retention entry, then fire the real
+ * tenant completion. Runs on the reactor thread from the front progress poller
+ * (same thread that inserted the entry — no locking). After this point the token
+ * is stale, so a racing ABORT for the same cb_arg finds nothing and no-ops.
+ */
+static void
+kvdev_rados_nkvx_fwd_done(void *cb_arg, int status, uint32_t value_len)
+{
+	struct kvdev_rados_nkvx_pending *p = cb_arg;
+	struct kvdev_rados_io_channel *ch = p->ch;
+	spdk_kvdev_io_completion_cb tenant_cb_fn = p->tenant_cb_fn;
+	void *tenant_cb_arg = p->tenant_cb_arg;
+
+	TAILQ_REMOVE(&ch->nkvx_pending, p, link);
+	free(p);
+
+	tenant_cb_fn(tenant_cb_arg, status, value_len);
+}
+
+/*
+ * Slice C6c: submit a two-tier Exec forward WITH per-command cancel retention.
+ * Allocates a pending entry keyed by the tenant cb_arg, forwards via the bridge
+ * (which hands back a cancel token), and links the entry so a live NVMe ABORT
+ * (kvdev_rados_exec_abort) can find and cancel THIS one forward. On any path
+ * where the forward did not become a trackable in-flight call (synchronous
+ * failure, or a forward that terminally completed inline via cb_fn) the entry is
+ * dropped and the tenant cb_fn is invoked directly by the bridge — no stale
+ * token is ever retained. Returns 0 (the tenant io is always completed via a
+ * callback, mirroring the untracked path).
+ */
+static int
+kvdev_rados_nkvx_exec_forward(struct kvdev_rados_io_channel *ch,
+			      const void *key, uint8_t key_len,
+			      uint32_t op_id, bool read_only, uint8_t runtime,
+			      const char *module_key, const char *module_ns,
+			      const uint8_t *sha256, bool sha256_valid,
+			      uint64_t caps,
+			      const void *input, uint32_t input_len,
+			      void *output_buf, uint32_t output_buf_len,
+			      spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_rados_nkvx_pending *p;
+	uint64_t token = KVDEV_RADOS_NKVX_TOKEN_NONE;
+	int frc;
+
+	p = calloc(1, sizeof(*p));
+	if (p == NULL) {
+		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		return 0;
+	}
+	p->ch = ch;
+	p->tenant_cb_fn = cb_fn;
+	p->tenant_cb_arg = cb_arg;
+
+	/*
+	 * Insert the retention entry BEFORE forwarding: the forward's done trampoline
+	 * (kvdev_rados_nkvx_fwd_done) can only fire from a later progress tick on THIS
+	 * thread, never synchronously inside the forward, so the entry is always on the
+	 * list before any completion can try to remove it. On a synchronous submission
+	 * failure the bridge returns negative WITHOUT calling our trampoline, so we
+	 * unwind the entry and complete the tenant here.
+	 */
+	TAILQ_INSERT_TAIL(&ch->nkvx_pending, p, link);
+
+	frc = kvdev_rados_nkvx_front_forward(ch->front, key, key_len, op_id, read_only,
+					     runtime, module_key, module_ns,
+					     sha256, sha256_valid, caps,
+					     input, input_len, output_buf, output_buf_len,
+					     kvdev_rados_nkvx_fwd_done, p, &token);
+	if (frc != 0) {
+		/* Not submitted: no trampoline will fire. Unwind retention and complete. */
+		TAILQ_REMOVE(&ch->nkvx_pending, p, link);
+		free(p);
+		cb_fn(cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, frc), 0);
+		return 0;
+	}
+	p->token = token;
+	return 0;
+}
+
+/*
+ * Slice C6c per-command (tenant NVMe ABORT) abort entrypoint. Find the in-flight
+ * two-tier Exec forward submitted with this opaque \p cb_arg and route it through
+ * the UAF-safe per-command cancel handshake (the executor stops PUSHing into the
+ * tenant DPTR before it is released). The tenant io then completes ABORTED from
+ * the forward's done trampoline exactly once.
+ *
+ * Returns 0 if a matching in-flight forward was found and entered cancel,
+ * -ENOENT if no in-flight forward matches (already completed, never a two-tier
+ * Exec, or not an Exec at all). NB this aborts ONLY two-tier (remote-executor)
+ * Execs; single-tier in-process Execs and non-Exec ops have no cancel handle and
+ * report -ENOENT (the command is left to run to natural completion, as today).
+ */
+static int
+kvdev_rados_exec_abort(struct spdk_io_channel *_ch, void *cb_arg)
+{
+	struct kvdev_rados_io_channel *ch = spdk_io_channel_get_ctx(_ch);
+	struct kvdev_rados_nkvx_pending *p;
+
+	if (ch->front == NULL) {
+		return -ENOENT;	/* single-tier channel: no remote forward to cancel */
+	}
+
+	TAILQ_FOREACH(p, &ch->nkvx_pending, link) {
+		if (p->tenant_cb_arg == cb_arg) {
+			/* Route through the shared two-phase begin-cancel. Idempotent: a
+			 * duplicate ABORT for the same command re-enters harmlessly. The
+			 * retention entry stays until the forward's trampoline reaps it (the
+			 * tenant cb fires ABORTED there), so a second ABORT still matches.
+			 * Propagate the result: false means the front call already resolved
+			 * (not yet reaped) and nothing was actually cancelled — report
+			 * not-aborted rather than lying "aborted" to the host. */
+			return kvdev_rados_nkvx_front_cancel(ch->front, p->token) ? 0 : -ENOENT;
+		}
+	}
+	return -ENOENT;
+}
+#endif /* SPDK_CONFIG_MERCURY */
+
 /*
  * KV Exec (ADR-0005, structured binding per ADR-0010/0012/0014): the NVMf layer
  * resolves the data-plane op_id against the per-namespace allowlist and passes
@@ -1828,20 +1979,16 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 		 * verified wasm binding (key-only, design §2) to the remote executor
 		 * instead of running it in-process. The executor re-validates sha256. */
 		if (ch->front != NULL) {
-			/* Per-command (tenant ABORT-opcode) abort is OUT OF SCOPE here: it
-			 * needs the executor-side cancel protocol (bead spdk-5ia). The
-			 * channel-destroy teardown drain (below) cancels by walking the
-			 * front's in-flight list, so no per-io abort handle is retained. */
-			int frc = kvdev_rados_nkvx_front_forward(ch->front, key, key_len,
+			/* Slice C6c (bead spdk-v3w): submit WITH per-command cancel
+			 * retention so a live NVMe ABORT can cancel THIS forward via the
+			 * executor-side handshake (kvdev_rados_exec_abort). The helper always
+			 * completes the tenant io through a callback. */
+			return kvdev_rados_nkvx_exec_forward(ch, key, key_len,
 					op_id, read_only, (uint8_t)binding->runtime,
 					binding->module_key, binding->module_namespace,
 					binding->sha256, true, binding->caps,
 					input, input_len, output_buf, output_buf_len,
 					cb_fn, cb_arg);
-			if (frc != 0) {
-				cb_fn(cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, frc), 0);
-			}
-			return 0;
 		}
 #endif
 		return kvdev_rados_nkvx_exec(ch, key, key_len, module, binding,
@@ -1888,16 +2035,13 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 		 * sha256_valid=false (mirrors what this front received; the executor
 		 * routes it to its built-ins, design §2.2). */
 		if (ch->front != NULL) {
-			int frc = kvdev_rados_nkvx_front_forward(ch->front, key, key_len,
+			/* Slice C6c: tracked submit (per-command ABORT-cancellable). */
+			return kvdev_rados_nkvx_exec_forward(ch, key, key_len,
 					op_id, read_only, (uint8_t)SPDK_KV_EXEC_RUNTIME_CLS,
 					module, KVDEV_RADOS_NKVX_CLS_NAMESPACE,
 					NULL, false, 0,
 					input, input_len, output_buf, output_buf_len,
 					cb_fn, cb_arg);
-			if (frc != 0) {
-				cb_fn(cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, frc), 0);
-			}
-			return 0;
 		}
 #endif
 		return kvdev_rados_nkvx_exec(ch, key, key_len, module, NULL,
@@ -2008,6 +2152,9 @@ kvdev_rados_create_channel_cb(void *io_device, void *ctx_buf)
 
 	ch->rdev = io_device;
 	TAILQ_INIT(&ch->inflight);
+#ifdef SPDK_CONFIG_MERCURY
+	TAILQ_INIT(&ch->nkvx_pending);	/* Slice C6c per-command cancel retention */
+#endif
 	/* 0 period -> poll every reactor tick; aios complete out of band. */
 	ch->poller = SPDK_POLLER_REGISTER(kvdev_rados_poll, ch, 0);
 	if (ch->poller == NULL) {
@@ -2115,6 +2262,10 @@ kvdev_rados_destroy_channel_cb(void *io_device, void *ctx_buf)
 		spdk_poller_unregister(&ch->front_poller);
 		kvdev_rados_nkvx_front_destroy(ch->front);
 		ch->front = NULL;
+		/* The cancel_all + fail_all_pending drain above fires every forward's
+		 * tenant cb through kvdev_rados_nkvx_fwd_done, which reaps its retention
+		 * entry; the per-command list must therefore be empty now. */
+		assert(TAILQ_EMPTY(&ch->nkvx_pending));
 	}
 #endif
 }
@@ -2172,6 +2323,13 @@ static const struct spdk_kvdev_fn_table kvdev_rados_fn_table = {
 	.exist		= kvdev_rados_exist,
 	.list		= kvdev_rados_list,
 	.exec		= kvdev_rados_exec,
+#ifdef SPDK_CONFIG_MERCURY
+	/* Slice C6c: per-command (tenant NVMe ABORT) cancel of an in-flight two-tier
+	 * Exec forward. Only present under CONFIG_MERCURY: a non-Mercury build has no
+	 * remote forward to cancel, so the abort op stays NULL (-> -ENOTSUP -> "command
+	 * not aborted") and single-tier Execs run to natural completion as before. */
+	.abort		= kvdev_rados_exec_abort,
+#endif
 };
 
 /*

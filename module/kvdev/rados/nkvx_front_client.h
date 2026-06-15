@@ -27,6 +27,9 @@
 
 #include "nkvx_exec_rpc.h"	/* nkvx_exec_in_t, status enum, contract procs */
 
+#include <stdbool.h>	/* bool (nkvx_front_cancel return) */
+#include <stdint.h>	/* uint64_t cancel token */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -126,6 +129,48 @@ void nkvx_front_get_bulk_stats(const struct nkvx_front *front,
 int nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 		       void *result_sink, uint32_t result_sink_len,
 		       nkvx_front_done_cb cb, void *arg);
+
+/**
+ * Like nkvx_front_forward(), but also hand back an opaque CANCEL TOKEN for the
+ * call it submitted (Slice C6c, bead spdk-v3w). On success \p out_token (when
+ * non-NULL) is set to the front-unique handle for this in-flight Exec; a later
+ * nkvx_front_cancel(front, token) routes THAT specific call through the same
+ * two-phase begin-cancel handshake nkvx_front_cancel_all() uses. The token is a
+ * plain value (the call's front-unique call_id), NOT a pointer into the call
+ * ctx, so retaining it cannot dangle after the call completes and frees: a
+ * cancel against an already-completed (or never-submitted) token is a safe
+ * no-op. \p out_token is left 0 (== NKVX_CALL_TOKEN_NONE) on a submission
+ * failure. Pass out_token == NULL to behave exactly like nkvx_front_forward().
+ *
+ * The per-io retention this token enables is what lets a live NVMe ABORT find
+ * and cancel the one in-flight Exec it targets (vs. cancel_all at channel
+ * destroy).
+ */
+int nkvx_front_forward_tok(struct nkvx_front *front, const nkvx_exec_in_t *in,
+			   void *result_sink, uint32_t result_sink_len,
+			   nkvx_front_done_cb cb, void *arg, uint64_t *out_token);
+
+/** Sentinel "no call" cancel token (a valid token is always nonzero). */
+#define NKVX_CALL_TOKEN_NONE 0ull
+
+/**
+ * Cancel the ONE in-flight Exec identified by \p token (Slice C6c, bead
+ * spdk-v3w) — the live per-command (tenant NVMe ABORT) path. Looks the call up
+ * on \p front's in-flight list by its front-unique call_id and, if still in
+ * flight, routes it through the SAME two-phase begin-cancel handshake as
+ * nkvx_front_cancel_all() (forward nkvx_cancel + HG_Cancel the Exec forward; the
+ * DPTR/MR is released only at the ack/forward join — UAF-safe, see
+ * nkvx_front_cancel_all). Idempotent and race-safe:
+ *   - token == NKVX_CALL_TOKEN_NONE, or no matching in-flight call (it already
+ *     completed/was reaped, or was never submitted): a no-op, returns false.
+ *   - a call mid-cancel already: begin_cancel is itself idempotent, returns true.
+ * The caller still drives nkvx_front_progress() to resolve the handshake and
+ * fire the tenant done-cb (with ABORTED) exactly once.
+ *
+ * \return true if a matching in-flight call was found and (re)entered cancel;
+ *         false if there was nothing to cancel.
+ */
+bool nkvx_front_cancel(struct nkvx_front *front, uint64_t token);
 
 /**
  * Cancel EVERY in-flight Exec on \p front (channel-destroy teardown drain).

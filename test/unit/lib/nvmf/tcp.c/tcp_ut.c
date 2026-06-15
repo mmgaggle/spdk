@@ -62,6 +62,9 @@ DEFINE_STUB_V(nvmf_kvdev_ctrlr_identify_ctrlr,
 DEFINE_STUB(nvmf_kvdev_ctrlr_process_io_cmd, int,
 	    (struct spdk_nvmf_ns *ns, struct spdk_io_channel *ch, struct spdk_nvmf_request *req),
 	    SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE);
+DEFINE_STUB(nvmf_kvdev_ctrlr_abort_cmd, bool,
+	    (struct spdk_nvmf_ns *ns, struct spdk_io_channel *ch,
+	     struct spdk_nvmf_request *req_to_abort), false);
 
 DEFINE_STUB(spdk_nvmf_subsystem_listener_allowed,
 	    bool,

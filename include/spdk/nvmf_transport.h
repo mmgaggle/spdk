@@ -119,6 +119,13 @@ struct spdk_nvmf_request {
 	spdk_nvmf_nvme_passthru_cmd_cb	cmd_cb_fn;
 	struct spdk_nvmf_request	*first_fused_req;
 	struct spdk_nvmf_request	*req_to_abort;
+	/*
+	 * KV (Slice C6c): for an in-flight Key-Value command, the opaque kvdev
+	 * cb_arg it was submitted with (the per-request nvmf_kvdev_request). A tenant
+	 * NVMe ABORT targeting this command uses it to ask the kvdev backend to cancel
+	 * the in-flight op (spdk_kvdev_abort). NULL for non-KV commands / once cleared.
+	 */
+	void				*kvdev_io_ctx;
 	struct spdk_poller		*poller;
 	struct spdk_bdev_io		*zcopy_bdev_io; /* Contains the bdev_io when using ZCOPY */
 
@@ -133,7 +140,7 @@ struct spdk_nvmf_request {
 	uint32_t			orig_nsid;
 	STAILQ_ENTRY(spdk_nvmf_request)	reservation_link;
 };
-SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 832, "Incorrect size");
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_request) == 840, "Incorrect size");
 
 enum spdk_nvmf_qpair_state {
 	SPDK_NVMF_QPAIR_UNINITIALIZED = 0,

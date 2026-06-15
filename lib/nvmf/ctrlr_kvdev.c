@@ -163,9 +163,51 @@ nvmf_kvdev_complete(struct nvmf_kvdev_request *kv_req, int kvstatus, uint32_t va
 		break;
 	}
 
+	/*
+	 * Slice C6c: this command is terminating; drop the abort back-pointer so a
+	 * racing ABORT cannot hand a now-freed kv_req to the kvdev backend. (Both run
+	 * on the same thread, so once this completion runs no abort can still target
+	 * this kv_req.)
+	 */
+	req->kvdev_io_ctx = NULL;
+
 	free(kv_req->bounce);
 	free(kv_req);
 	spdk_nvmf_request_complete(req);
+}
+
+/*
+ * Slice C6c (bead spdk-v3w): tenant NVMe ABORT against a Key-Value namespace.
+ * \p req_to_abort is the in-flight KV command the host asked to abort; \p ch is
+ * its namespace io_channel. If it is an in-flight KV Exec (the only abortable KV
+ * op) we ask the kvdev backend to cancel it via spdk_kvdev_abort, keyed by the
+ * opaque kvdev cb_arg we stashed on the request at submit. The original Exec's
+ * own completion (nvmf_kvdev_exec_done) still fires exactly once — with ABORTED
+ * mapped to NVMe "command aborted" — so this routine MUST NOT complete it.
+ *
+ * \return true if the backend accepted the cancel request (the host's ABORT
+ *         should report "command aborted"), false if there was nothing to abort
+ *         (already completed / not an abortable KV op / backend has no abort op),
+ *         in which case the caller reports "command not aborted".
+ */
+bool
+nvmf_kvdev_ctrlr_abort_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel *ch,
+			   struct spdk_nvmf_request *req_to_abort)
+{
+	void *kv_io_ctx = req_to_abort->kvdev_io_ctx;
+	int rc;
+
+	if (kv_io_ctx == NULL) {
+		/* Not an in-flight abortable KV op (e.g. already completed, or a
+		 * short-lived op that never registered an abort ctx). */
+		return false;
+	}
+
+	rc = spdk_kvdev_abort(ns->kvdev_desc, ch, kv_io_ctx);
+	/* 0: backend entered cancel (its completion fires ABORTED later). -ENOTSUP:
+	 * backend cannot abort. -ENOENT: it already completed (the cb_arg is stale).
+	 * Any nonzero -> "command not aborted". */
+	return rc == 0;
 }
 
 static void
@@ -527,12 +569,22 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		input = exec_key + exec_key_len;
 		input_len = xfer_len - sizeof(uint16_t) - exec_key_len;
 
+		/*
+		 * Slice C6c: record the kvdev cb_arg on the request so a later tenant
+		 * NVMe ABORT targeting THIS command can ask the backend to cancel the
+		 * in-flight Exec (nvmf_kvdev_ctrlr_abort_cmd -> spdk_kvdev_abort). Set
+		 * BEFORE submit so a synchronous completion (which clears it) is ordered
+		 * correctly. KV Exec is the only long-running KV op that needs this.
+		 */
+		req->kvdev_io_ctx = kv_req;
+
 		rc = spdk_kvdev_exec(ns->kvdev_desc, ch, exec_key, exec_key_len, op_id,
 				     ns->kv_read_only, binding_arg, input, input_len,
 				     data, output_len, nvmf_kvdev_exec_done, kv_req);
 		if (rc == -ENOTSUP) {
 			/* Backend has no exec op (e.g. librados until KVX-3): report
 			 * an NVMe not-supported status. No completion will fire. */
+			req->kvdev_io_ctx = NULL;
 			free(kv_req->bounce);
 			free(kv_req);
 			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
@@ -578,7 +630,10 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 
 	if (rc != 0) {
 		/* The kvdev could not even accept the request; no completion will
-		 * fire, so complete it here. */
+		 * fire, so complete it here. Clear the abort ctx (the Exec path set
+		 * req->kvdev_io_ctx = kv_req before submit) so a later ABORT on this
+		 * reused request slot cannot match the freed kv_req pointer. */
+		req->kvdev_io_ctx = NULL;
 		free(kv_req->bounce);
 		free(kv_req);
 		rsp->status.sct = SPDK_NVME_SCT_GENERIC;

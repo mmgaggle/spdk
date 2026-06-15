@@ -403,6 +403,34 @@ struct spdk_kvdev_fn_table {
 		    const void *input, uint32_t input_len,
 		    void *output_buf, uint32_t output_buf_len,
 		    spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
+
+	/**
+	 * Abort an in-flight operation (KV Exec) on this channel that was submitted
+	 * with the opaque \c cb_arg (vendor extension, Slice C6c). OPTIONAL: a module
+	 * may leave this NULL, in which case spdk_kvdev_abort() returns -ENOTSUP and
+	 * the NVMf layer reports the NVMe ABORT command as "command not aborted"
+	 * (cdw0 bit0 = 1), i.e. the original command runs to natural completion.
+	 *
+	 * \c cb_arg is the SAME pointer the originating op was given: it uniquely
+	 * identifies one in-flight command on the channel, so it is the abort lookup
+	 * key (no separate handle). The op does NOT fire \c cb_arg's completion itself
+	 * — it only requests cancellation; the original op's own cb_fn still fires
+	 * exactly once (typically SPDK_KVDEV_IO_STATUS_ABORTED) on a later tick once
+	 * the cancellation resolves. This is therefore a non-blocking, best-effort
+	 * request: a slow backend cancel completes the original op asynchronously.
+	 *
+	 * Both calls run on the SAME io_channel/thread (the NVMf ABORT retry-thread
+	 * fix routes the abort onto the aborted request's thread), so no cross-thread
+	 * synchronization is needed at this layer.
+	 *
+	 * \param ch io_channel obtained from get_io_channel() — the channel the target
+	 *           command is in flight on.
+	 * \param cb_arg The opaque cb_arg the target op was submitted with.
+	 * \return 0 if a matching in-flight op was found and cancellation was
+	 *         requested; -ENOENT if no in-flight op matches (already completed, or
+	 *         not abortable); other negative errno on failure.
+	 */
+	int (*abort)(struct spdk_io_channel *ch, void *cb_arg);
 };
 
 /**
@@ -627,6 +655,23 @@ int spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 		    const void *input, uint32_t input_len,
 		    void *output_buf, uint32_t output_buf_len,
 		    spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
+
+/**
+ * Request cancellation of an in-flight op (KV Exec) on the descriptor's kvdev
+ * that was submitted with the opaque \c cb_arg (Slice C6c). Thin wrapper over the
+ * fn_table's optional \c abort op.
+ *
+ * The original op is NOT completed by this call; its own completion callback
+ * still fires exactly once (typically SPDK_KVDEV_IO_STATUS_ABORTED) once the
+ * cancellation resolves. Both this call and the target op run on the same
+ * io_channel/thread.
+ *
+ * \return 0 if a matching in-flight op was found and cancellation requested,
+ *         -ENOTSUP if the backend has no abort op, -ENOENT if no in-flight op
+ *         matches \c cb_arg, or another negative errno on failure.
+ */
+int spdk_kvdev_abort(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
+		     void *cb_arg);
 
 #ifdef __cplusplus
 }

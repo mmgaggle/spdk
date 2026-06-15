@@ -557,6 +557,8 @@ void nvmf_kvdev_ctrlr_identify_ctrlr(struct spdk_nvmf_ctrlr *ctrlr,
 				     struct spdk_nvme_kv_ctrlr_data *cdata);
 int nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel *ch,
 				    struct spdk_nvmf_request *req);
+bool nvmf_kvdev_ctrlr_abort_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel *ch,
+				struct spdk_nvmf_request *req_to_abort);
 
 int nvmf_subsystem_add_ctrlr(struct spdk_nvmf_subsystem *subsystem,
 			     struct spdk_nvmf_ctrlr *ctrlr);
