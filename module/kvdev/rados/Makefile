@@ -21,6 +21,22 @@ ifeq ($(CONFIG_WASM),y)
 CFLAGS += -I$(CURDIR)/wasmtime/include
 endif
 
+# Slice C inter-tier Exec RPC (ADR-0015, docs/design/slice-c-exec-rpc-mercury.md).
+# With --with-mercury the two-tier front (Mercury client + SPDK poller, C4), the
+# front bridge, and the shared RPC contract (C3) are compiled in, so nkvx Exec
+# can be forwarded to the standalone rados-nkvx executor (C2). Without it, none
+# of this builds and the kvdev runs single-tier (in-process), byte-identical to
+# a stock build (every Mercury site in the .c files is under SPDK_CONFIG_MERCURY).
+# The contract files compile under SPDK's -std=gnu11, which is load-bearing for
+# the wire-status static-asserts (see nkvx_exec_rpc.c). Mercury headers resolve
+# via pkg-config against the --with-mercury=DIR prefix; the matching link libs
+# are added in mk/spdk.modules.mk.
+ifeq ($(CONFIG_MERCURY),y)
+C_SRCS += nkvx_exec_rpc.c nkvx_front_client.c kvdev_rados_nkvx_front.c
+MERCURY_PKG_PATH := $(if $(CONFIG_MERCURY_DIR),$(CONFIG_MERCURY_DIR)/lib/pkgconfig:$(CONFIG_MERCURY_DIR)/lib64/pkgconfig:)$(PKG_CONFIG_PATH)
+CFLAGS += $(shell PKG_CONFIG_PATH=$(MERCURY_PKG_PATH) pkg-config --cflags mercury)
+endif
+
 SPDK_MAP_FILE = $(SPDK_ROOT_DIR)/mk/spdk_blank.map
 
 include $(SPDK_ROOT_DIR)/mk/spdk.lib.mk

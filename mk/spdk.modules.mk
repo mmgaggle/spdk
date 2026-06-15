@@ -81,6 +81,18 @@ BLOCKDEV_MODULES_PRIVATE_LIBS += -lrados -lrbd
 # librados-backed kvdev (ADR-0002/0004). Shares the --with-rbd toggle; -lrados
 # is already added above for bdev_rbd, so no extra private lib is needed here.
 KVDEV_MODULES_LIST += kvdev_rados
+# Slice C inter-tier Exec RPC (ADR-0015): with --with-mercury the rados kvdev's
+# two-tier front links Mercury (HG_*); libfabric (na_ofi) is pulled in
+# transitively by mercury.pc. Resolve against the --with-mercury=DIR prefix and
+# carry an rpath so the vendored install is found at runtime. Scoped here under
+# CONFIG_RBD because the rados kvdev is the only Mercury consumer.
+ifeq ($(CONFIG_MERCURY),y)
+MERCURY_PKG_PATH := $(if $(CONFIG_MERCURY_DIR),$(CONFIG_MERCURY_DIR)/lib/pkgconfig:$(CONFIG_MERCURY_DIR)/lib64/pkgconfig:)$(PKG_CONFIG_PATH)
+BLOCKDEV_MODULES_PRIVATE_LIBS += $(shell PKG_CONFIG_PATH=$(MERCURY_PKG_PATH) pkg-config --libs mercury)
+ifneq ($(CONFIG_MERCURY_DIR),)
+BLOCKDEV_MODULES_PRIVATE_LIBS += -Wl,-rpath,$(CONFIG_MERCURY_DIR)/lib
+endif
+endif
 endif
 
 ifeq ($(CONFIG_DAOS),y)

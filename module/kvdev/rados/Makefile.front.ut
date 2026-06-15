@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Intel Corporation. All rights reserved.
+#
+# Standalone build for the Slice C4 front Mercury client core round-trip test.
+# Not part of the SPDK build graph: it compiles the front client core
+# (nkvx_front_client.c) + the C3 contract (nkvx_exec_rpc.c) directly against
+# Mercury, proving the origin-side progress/forward/completion mechanism the
+# SPDK poller will drive — with no SPDK reactor. The integrated front links the
+# same nkvx_front_client.c into the rados module under CONFIG_MERCURY.
+#
+# Usage:
+#   make -f Makefile.front.ut [MERCURY_PREFIX=<mercury-install>]   # build test
+#   make -f Makefile.front.ut run                                  # build + loopback test
+#   make -f Makefile.front.ut clean
+# MERCURY_PREFIX defaults to the worktree's vendored install.
+
+SPDK_ROOT       ?= $(realpath $(CURDIR)/../../..)
+MERCURY_PREFIX  ?= $(SPDK_ROOT)/vendor/mercury-install
+
+MERCURY_CFLAGS  := $(shell PKG_CONFIG_PATH=$(MERCURY_PREFIX)/lib/pkgconfig pkg-config --cflags mercury)
+MERCURY_LIBS    := $(shell PKG_CONFIG_PATH=$(MERCURY_PREFIX)/lib/pkgconfig pkg-config --libs mercury)
+
+# -std=gnu11 matches SPDK's build and is load-bearing for the C3 wire-status
+# static-asserts (see nkvx_exec_rpc.c).
+CFLAGS  := -g -O0 -std=gnu11 -Wall -Wextra -Werror -I$(SPDK_ROOT)/include $(MERCURY_CFLAGS)
+LDFLAGS := $(MERCURY_LIBS) -Wl,-rpath,$(MERCURY_PREFIX)/lib
+
+BIN  := nkvx_front_client_test
+SRCS := nkvx_front_client_test.c nkvx_front_client.c nkvx_exec_rpc.c
+HDRS := nkvx_front_client.h nkvx_exec_rpc.h
+
+$(BIN): $(SRCS) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
+
+run: $(BIN)
+	MERCURY_PREFIX=$(MERCURY_PREFIX) ./nkvx_front_test.sh
+
+clean:
+	rm -f $(BIN)
+
+.PHONY: run clean

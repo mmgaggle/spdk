@@ -19,6 +19,19 @@
 #include "kvdev_rados_nkvx.h"
 #include "kvdev_rados_nkvx_wasm.h"
 
+#include "spdk/config.h"
+#ifdef SPDK_CONFIG_MERCURY
+/*
+ * Slice C4 two-tier front: when a kvdev_rados is configured with a remote
+ * executor address, nkvx Exec ops are forwarded over Mercury to the standalone
+ * rados-nkvx executor (Slice C2) instead of running in-process. All Mercury
+ * coupling lives behind this header (no <mercury.h> in this datapath file); the
+ * whole path compiles out when --with-mercury is off, keeping a stock build
+ * byte-identical. See docs/design/slice-c-exec-rpc-mercury.md §2/§4.
+ */
+#include "kvdev_rados_nkvx_front.h"
+#endif
+
 /*
  * librados-backed kvdev. See kvdev_rados.h / ADR-0002 / ADR-0004 for the model.
  *
@@ -91,6 +104,16 @@ struct kvdev_rados {
 	char				*namespace_name;
 	rados_t				*cluster_p;	/* into the registry entry */
 	rados_ioctx_t			io_ctx;		/* pool ioctx, namespace set */
+#ifdef SPDK_CONFIG_MERCURY
+	/*
+	 * Slice C4: when non-NULL, nkvx Exec is two-tier — forwarded to the remote
+	 * executor at this self-address (design §2) instead of run in-process. NULL
+	 * keeps the single-tier (in-process) path. Per-channel front clients are
+	 * created from this address (one per reactor thread; the Mercury context is
+	 * not shared across threads).
+	 */
+	char				*remote_executor;
+#endif
 	TAILQ_ENTRY(kvdev_rados)	tailq;
 };
 
@@ -99,6 +122,16 @@ static TAILQ_HEAD(, kvdev_rados) g_kvdevs = TAILQ_HEAD_INITIALIZER(g_kvdevs);
 struct kvdev_rados_io_channel {
 	struct kvdev_rados	*rdev;
 	struct spdk_poller	*poller;
+#ifdef SPDK_CONFIG_MERCURY
+	/*
+	 * Slice C4 two-tier front (present iff rdev->remote_executor). Each channel
+	 * owns its own Mercury front client + progress poller — per-reactor-thread,
+	 * so the Mercury context is never progressed concurrently (no locking). NULL
+	 * on the single-tier path.
+	 */
+	struct nkvx_front	*front;
+	struct spdk_poller	*front_poller;
+#endif
 	TAILQ_HEAD(, kvdev_rados_io) inflight;
 };
 
@@ -1789,6 +1822,24 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 		 * computes over the cold-fetched value and never writes it back, so
 		 * it is permitted on a read-only namespace. (A future write-capable
 		 * module class must consult read_only at its own mutation point.) */
+#ifdef SPDK_CONFIG_MERCURY
+		/* Two-tier (Slice C4): the front gates above are authoritative
+		 * (design §2.2); only the terminal dispatch differs — forward the
+		 * verified wasm binding (key-only, design §2) to the remote executor
+		 * instead of running it in-process. The executor re-validates sha256. */
+		if (ch->front != NULL) {
+			int frc = kvdev_rados_nkvx_front_forward(ch->front, key, key_len,
+					op_id, read_only, (uint8_t)binding->runtime,
+					binding->module_key, binding->module_namespace,
+					binding->sha256, true, binding->caps,
+					input, input_len, output_buf, output_buf_len,
+					cb_fn, cb_arg);
+			if (frc != 0) {
+				cb_fn(cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, frc), 0);
+			}
+			return 0;
+		}
+#endif
 		return kvdev_rados_nkvx_exec(ch, key, key_len, module, binding,
 					     input, input_len,
 					     output_buf, output_buf_len, cb_fn, cb_arg);
@@ -1827,6 +1878,24 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 		}
 		/* Built-in: no verified binding (mod arg stays NULL in the executor). The
 		 * executor is read-only by contract, so it is permitted on a read-only ns. */
+#ifdef SPDK_CONFIG_MERCURY
+		/* Two-tier (Slice C4): forward the built-in as the wire form the
+		 * executor expects — runtime=CLS, module_ns="nkvx", module_key=<name>,
+		 * sha256_valid=false (mirrors what this front received; the executor
+		 * routes it to its built-ins, design §2.2). */
+		if (ch->front != NULL) {
+			int frc = kvdev_rados_nkvx_front_forward(ch->front, key, key_len,
+					op_id, read_only, (uint8_t)SPDK_KV_EXEC_RUNTIME_CLS,
+					module, KVDEV_RADOS_NKVX_CLS_NAMESPACE,
+					NULL, false, 0,
+					input, input_len, output_buf, output_buf_len,
+					cb_fn, cb_arg);
+			if (frc != 0) {
+				cb_fn(cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, frc), 0);
+			}
+			return 0;
+		}
+#endif
 		return kvdev_rados_nkvx_exec(ch, key, key_len, module, NULL,
 					     input, input_len,
 					     output_buf, output_buf_len, cb_fn, cb_arg);
@@ -1915,6 +1984,19 @@ kvdev_rados_list(struct spdk_io_channel *_ch, const void *start_key, uint8_t sta
 
 /* ---- channel / lifecycle ------------------------------------------------- */
 
+#ifdef SPDK_CONFIG_MERCURY
+/* Per-channel Mercury progress poller (design §4.2): drive HG_Progress/HG_Trigger
+ * non-blocking on the reactor thread so RPC completions fire here. */
+static int
+kvdev_rados_front_poll(void *arg)
+{
+	struct kvdev_rados_io_channel *ch = arg;
+	int n = kvdev_rados_nkvx_front_progress(ch->front);
+
+	return (n > 0) ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+}
+#endif
+
 static int
 kvdev_rados_create_channel_cb(void *io_device, void *ctx_buf)
 {
@@ -1927,6 +2009,28 @@ kvdev_rados_create_channel_cb(void *io_device, void *ctx_buf)
 	if (ch->poller == NULL) {
 		return -ENOMEM;
 	}
+
+#ifdef SPDK_CONFIG_MERCURY
+	/* Two-tier (Slice C4): stand up this channel's front client + progress
+	 * poller when a remote executor is configured. The executor (Slice C2) must
+	 * be up and listening before the first channel is created (bootstrap, OQ-8). */
+	if (ch->rdev->remote_executor != NULL) {
+		int rc = kvdev_rados_nkvx_front_create(ch->rdev->remote_executor, &ch->front);
+		if (rc != 0) {
+			SPDK_ERRLOG("nkvx: front client to executor '%s' failed: %s\n",
+				    ch->rdev->remote_executor, spdk_strerror(-rc));
+			spdk_poller_unregister(&ch->poller);
+			return rc;
+		}
+		ch->front_poller = SPDK_POLLER_REGISTER(kvdev_rados_front_poll, ch, 0);
+		if (ch->front_poller == NULL) {
+			kvdev_rados_nkvx_front_destroy(ch->front);
+			ch->front = NULL;
+			spdk_poller_unregister(&ch->poller);
+			return -ENOMEM;
+		}
+	}
+#endif
 	return 0;
 }
 
@@ -1945,6 +2049,21 @@ kvdev_rados_destroy_channel_cb(void *io_device, void *ctx_buf)
 		kvdev_rados_io_finish(io);
 	}
 	spdk_poller_unregister(&ch->poller);
+#ifdef SPDK_CONFIG_MERCURY
+	if (ch->front != NULL) {
+		/*
+		 * NOTE (Slice C6a): graceful cancellation/teardown of an nkvx_exec
+		 * still in flight at channel-destroy time (HG_Cancel + bulk handle
+		 * release, UAF-safe) is C6a's scope. Two-tier forwards do not sit on
+		 * the librados inflight list drained above, so a destroy racing an
+		 * outstanding RPC is not yet handled here. On the testbed teardown
+		 * path the front is quiesced first.
+		 */
+		spdk_poller_unregister(&ch->front_poller);
+		kvdev_rados_nkvx_front_destroy(ch->front);
+		ch->front = NULL;
+	}
+#endif
 }
 
 static struct spdk_io_channel *
@@ -1968,6 +2087,9 @@ kvdev_rados_free(struct kvdev_rados *rdev)
 	free(rdev->cluster_name);
 	free(rdev->pool_name);
 	free(rdev->namespace_name);
+#ifdef SPDK_CONFIG_MERCURY
+	free(rdev->remote_executor);
+#endif
 	free(rdev->kvdev.name);
 	free(rdev);
 }
@@ -2060,6 +2182,17 @@ kvdev_rados_create(const struct kvdev_rados_opts *opts, struct spdk_kvdev **_kvd
 			goto err;
 		}
 	}
+#ifdef SPDK_CONFIG_MERCURY
+	/* Two-tier (Slice C4): an optional remote executor address selects the
+	 * Mercury-forwarded nkvx Exec path; absent -> single-tier (in-process). */
+	if (opts->remote_executor) {
+		rdev->remote_executor = strdup(opts->remote_executor);
+		if (rdev->remote_executor == NULL) {
+			rc = -ENOMEM;
+			goto err;
+		}
+	}
+#endif
 
 	rc = kvdev_rados_get_cluster(rdev->cluster_name, &rdev->cluster_p);
 	if (rc < 0) {
@@ -2212,6 +2345,11 @@ kvdev_rados_write_config_json(struct spdk_json_write_ctx *w)
 		if (!spdk_uuid_is_null(&rdev->kvdev.uuid)) {
 			spdk_json_write_named_uuid(w, "uuid", &rdev->kvdev.uuid);
 		}
+#ifdef SPDK_CONFIG_MERCURY
+		if (rdev->remote_executor) {
+			spdk_json_write_named_string(w, "remote_executor", rdev->remote_executor);
+		}
+#endif
 		spdk_json_write_object_end(w);
 		spdk_json_write_object_end(w);
 	}

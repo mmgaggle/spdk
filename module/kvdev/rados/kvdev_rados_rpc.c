@@ -204,6 +204,11 @@ struct rpc_kvdev_rados_create {
 	char			*namespace_name;
 	struct spdk_uuid	uuid;
 	uint32_t		max_value_len;
+#ifdef SPDK_CONFIG_MERCURY
+	/* Slice C4: optional remote executor self-address (two-tier Exec over
+	 * Mercury). Only present in a --with-mercury build (stock byte-identical). */
+	char			*remote_executor;
+#endif
 };
 
 static void
@@ -213,6 +218,9 @@ free_rpc_kvdev_rados_create(struct rpc_kvdev_rados_create *r)
 	free(r->cluster_name);
 	free(r->pool_name);
 	free(r->namespace_name);
+#ifdef SPDK_CONFIG_MERCURY
+	free(r->remote_executor);
+#endif
 }
 
 static const struct spdk_json_object_decoder rpc_kvdev_rados_create_decoders[] = {
@@ -222,6 +230,9 @@ static const struct spdk_json_object_decoder rpc_kvdev_rados_create_decoders[] =
 	{"namespace", offsetof(struct rpc_kvdev_rados_create, namespace_name), spdk_json_decode_string, true},
 	{"uuid", offsetof(struct rpc_kvdev_rados_create, uuid), spdk_json_decode_uuid, true},
 	{"max_value_len", offsetof(struct rpc_kvdev_rados_create, max_value_len), spdk_json_decode_uint32, true},
+#ifdef SPDK_CONFIG_MERCURY
+	{"remote_executor", offsetof(struct rpc_kvdev_rados_create, remote_executor), spdk_json_decode_string, true},
+#endif
 };
 
 static void
@@ -247,6 +258,9 @@ rpc_kvdev_rados_create(struct spdk_jsonrpc_request *request,
 	opts.namespace_name = req.namespace_name;
 	opts.uuid = req.uuid;
 	opts.max_value_len = req.max_value_len;
+#ifdef SPDK_CONFIG_MERCURY
+	opts.remote_executor = req.remote_executor;
+#endif
 
 	rc = kvdev_rados_create(&opts, &kvdev);
 	if (rc != 0) {

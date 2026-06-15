@@ -6,6 +6,7 @@
 #define SPDK_KVDEV_RADOS_H
 
 #include "spdk/stdinc.h"
+#include "spdk/config.h"
 #include "spdk/uuid.h"
 #include "spdk/kvdev.h"
 #include "spdk/json.h"
@@ -95,6 +96,16 @@ struct kvdev_rados_opts {
 	struct spdk_uuid	uuid;
 	/* Max value length in bytes. 0 selects the ADR-0002 default (64 MB). */
 	uint32_t		max_value_len;
+#ifdef SPDK_CONFIG_MERCURY
+	/*
+	 * Slice C4 (ADR-0015): optional remote executor self-address (as published
+	 * by the standalone rados-nkvx service, e.g. "ofi+tcp://10.110.0.2:7000").
+	 * When set, nkvx Exec is forwarded over Mercury to that executor (two-tier)
+	 * instead of run in-process. NULL keeps the single-tier path. Compiled in
+	 * only with --with-mercury, so a stock build is byte-identical.
+	 */
+	const char		*remote_executor;
+#endif
 };
 
 /**
