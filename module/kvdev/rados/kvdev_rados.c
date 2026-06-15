@@ -1828,6 +1828,10 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 		 * verified wasm binding (key-only, design §2) to the remote executor
 		 * instead of running it in-process. The executor re-validates sha256. */
 		if (ch->front != NULL) {
+			/* Per-command (tenant ABORT-opcode) abort is OUT OF SCOPE here: it
+			 * needs the executor-side cancel protocol (bead spdk-5ia). The
+			 * channel-destroy teardown drain (below) cancels by walking the
+			 * front's in-flight list, so no per-io abort handle is retained. */
 			int frc = kvdev_rados_nkvx_front_forward(ch->front, key, key_len,
 					op_id, read_only, (uint8_t)binding->runtime,
 					binding->module_key, binding->module_namespace,
@@ -2052,13 +2056,62 @@ kvdev_rados_destroy_channel_cb(void *io_device, void *ctx_buf)
 #ifdef SPDK_CONFIG_MERCURY
 	if (ch->front != NULL) {
 		/*
-		 * NOTE (Slice C6a): graceful cancellation/teardown of an nkvx_exec
-		 * still in flight at channel-destroy time (HG_Cancel + bulk handle
-		 * release, UAF-safe) is C6a's scope. Two-tier forwards do not sit on
-		 * the librados inflight list drained above, so a destroy racing an
-		 * outstanding RPC is not yet handled here. On the testbed teardown
-		 * path the front is quiesced first.
+		 * Slice C6a channel-destroy teardown of two-tier Exec forwards. These live
+		 * on the front's own in-flight list (not ch->inflight); a forward in flight
+		 * has the tenant DPTR registered as a bulk handle. We must reach
+		 * outstanding==0 (every call ctx freed / removed) before destroying the
+		 * front, both so the tenant io completion fires (never hangs) and so the
+		 * front is not finalized over a live in-flight list / leaked ctxs.
+		 *
+		 * BEST-EFFORT, NOT fully UAF-safe (bead spdk-5ia): HG_Cancel is ORIGIN-side
+		 * only — the executor has no do-not-PUSH awareness and may still PUSH into a
+		 * result_sink after we cancel. That residual cross-process late PUSH is
+		 * acceptable ONLY because this is channel destroy (front AND executor torn
+		 * down, the DPTR not reused per-command). A safe per-command abort needs the
+		 * executor-side cancel protocol (spdk-5ia).
+		 *
+		 * Teardown procedure:
+		 *   1. Cancel ALL once (idempotent; origin-side withdraw of every forward).
+		 *   2. BOUNDED drain: progress with a small timeout up to a wall-clock
+		 *      budget (no busy-spin, no infinite loop on a wedged/dead executor).
+		 *   3. If the drain did NOT reach 0 within the budget (or progress failed),
+		 *      FORCE-complete every remaining call (tenant cb FAILED + detach) so
+		 *      the io completes and outstanding hits 0 — no hang, no leaked ctxs.
 		 */
+		uint64_t hz = spdk_get_ticks_hz();
+		/* ~250 ms wall-clock budget: generous vs. a healthy origin-side cancel
+		 * (which is prompt on sm/tcp), tight enough not to stall destroy on a dead
+		 * executor. hz==0 (no TSC calibration) degrades to the iteration cap. */
+		uint64_t deadline = hz ? spdk_get_ticks() + hz / 4 : 0;
+		unsigned iter_cap = 200;	/* ~400 ms hard cap (2 ms/tick) if clock unusable */
+
+		kvdev_rados_nkvx_front_cancel_all(ch->front);
+		while (kvdev_rados_nkvx_front_outstanding(ch->front) > 0) {
+			/* Block briefly per tick (teardown path) so we are not pinning the
+			 * core; cancellations resolve to terminal completions here. */
+			if (kvdev_rados_nkvx_front_drain_progress(ch->front, 2) < 0) {
+				break;	/* fatal progress error: force-complete below */
+			}
+			if (deadline) {
+				if (spdk_get_ticks() >= deadline) {
+					break;
+				}
+			} else if (--iter_cap == 0) {
+				break;
+			}
+		}
+		if (kvdev_rados_nkvx_front_outstanding(ch->front) > 0) {
+			/* Wedged/dead executor: do NOT silently destroy with live calls.
+			 * Force-complete the tenant side (FAILED) and detach so no io hangs
+			 * and no ctx leaks; handle teardown is left to HG_Finalize below
+			 * (memory-safe — see nkvx_front_fail_all_pending). */
+			SPDK_WARNLOG("nkvx front: %u Exec forward(s) did not drain within the "
+				     "channel-destroy budget; force-completing FAILED "
+				     "(executor wedged?)\n",
+				     kvdev_rados_nkvx_front_outstanding(ch->front));
+			kvdev_rados_nkvx_front_fail_all_pending(ch->front,
+								SPDK_KVDEV_IO_STATUS_FAILED);
+		}
 		spdk_poller_unregister(&ch->front_poller);
 		kvdev_rados_nkvx_front_destroy(ch->front);
 		ch->front = NULL;

@@ -400,6 +400,21 @@ nkvx_run_wasm(struct nkvx_executor *ex, const char *oid,
 		if (gate != SPDK_KVDEV_IO_STATUS_SUCCESS) {
 			/* Hash mismatch -> INVALID; runtime unavailable -> NOT_SUPPORTED.
 			 * Unverified bytes are NEVER compiled or run. */
+			if (gate == SPDK_KVDEV_IO_STATUS_INVALID) {
+				/*
+				 * OQ-6 telemetry (design §3): a hash mismatch collapses to INVALID
+				 * at the tenant (indistinguishable from a malformed request, which
+				 * is acceptable — the tenant cannot fix either). Emit a DISTINCT
+				 * executor-side line so an operator can tell a provisioning bug /
+				 * tamper (fetched module bytes != bound sha256) from a bad request.
+				 * No new tenant-visible status.
+				 */
+				fprintf(stderr, "nkvx_executor: HASH_MISMATCH module_ns=%s module_key=%s "
+					"(fetched %zu bytes do NOT match bound sha256) -> INVALID; "
+					"unverified bytes NOT run (ADR-0010)\n",
+					in->module_ns ? in->module_ns : "(null)",
+					in->module_key ? in->module_key : "(null)", mod_len);
+			}
 			free(mod_buf);
 			return nkvx_result_set(res, (enum spdk_kvdev_io_status)gate, 0, NULL, 0);
 		}

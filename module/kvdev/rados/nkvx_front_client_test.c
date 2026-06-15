@@ -35,6 +35,7 @@
 
 struct done_state {
 	bool				called;
+	int				calls;		/* C6a: exactly-once check */
 	enum spdk_kvdev_io_status	status;
 	uint32_t			result_len;
 	uint32_t			result_inline_len;
@@ -51,6 +52,7 @@ on_done(void *arg, enum spdk_kvdev_io_status status, uint32_t result_len,
 	st->status = status;
 	st->result_len = result_len;
 	st->result_inline_len = result_inline_len;
+	st->calls++;
 
 	/*
 	 * Mirror the real bridge (kvdev_rados_nkvx_front_done): an inline result is
@@ -115,9 +117,12 @@ main(int argc, char **argv)
 	const char *expect_sha_hex = NULL;	/* expected sha256 of delivered bytes */
 	int iters = 1;				/* C7.2: repeat N forwards on one front+sink */
 	int distinct = 1;			/* C7.2: round-robin N distinct sink buffers */
+	int cancel = 0;				/* C6a: cancel each forward after submitting */
+	int cancel_after = 0;			/* C6a: progress ticks before the cancel */
 
 	enum { OPT_KEY = 256, OPT_RUNTIME, OPT_MODULE, OPT_MODULE_NS, OPT_OSIZE,
-	       OPT_EXPECT_RESULT, OPT_SHA256, OPT_EXPECT_SHA, OPT_ITERS, OPT_DISTINCT };
+	       OPT_EXPECT_RESULT, OPT_SHA256, OPT_EXPECT_SHA, OPT_ITERS, OPT_DISTINCT,
+	       OPT_CANCEL, OPT_CANCEL_AFTER };
 	static const struct option opts[] = {
 		{ "listen",        required_argument, NULL, 'l' },
 		{ "target",        required_argument, NULL, 't' },
@@ -133,6 +138,8 @@ main(int argc, char **argv)
 		{ "expect-sha256", required_argument, NULL, OPT_EXPECT_SHA },
 		{ "iters",         required_argument, NULL, OPT_ITERS },
 		{ "distinct",      required_argument, NULL, OPT_DISTINCT },
+		{ "cancel",        no_argument,       NULL, OPT_CANCEL },
+		{ "cancel-after",  required_argument, NULL, OPT_CANCEL_AFTER },
 		{ NULL,            0,                 NULL, 0 },
 	};
 	int c;
@@ -152,11 +159,13 @@ main(int argc, char **argv)
 		case OPT_EXPECT_SHA: expect_sha_hex = optarg; break;
 		case OPT_ITERS: iters = atoi(optarg); break;
 		case OPT_DISTINCT: distinct = atoi(optarg); break;
+		case OPT_CANCEL: cancel = 1; break;
+		case OPT_CANCEL_AFTER: cancel = 1; cancel_after = atoi(optarg); break;
 		default:
 			fprintf(stderr, "usage: %s --listen NA (--target ADDR | --addr-file PATH) "
 				"[--key K] [--runtime N] [--module M] [--module-ns NS] [--osize N] "
 				"[--sha256 HEX] [--expect N] [--expect-result N] [--expect-sha256 HEX] "
-				"[--iters N]\n",
+				"[--iters N] [--cancel] [--cancel-after N]\n",
 				argv[0]);
 			return 2;
 		}
@@ -289,6 +298,25 @@ main(int argc, char **argv)
 			goto done;
 		}
 
+		/*
+		 * Slice C6a abort path (channel-destroy teardown drain): cancel the
+		 * in-flight Exec via nkvx_front_cancel_all() — exactly the production
+		 * teardown primitive (the per-token cancel surface was DE-SHIPPED: ABA-
+		 * unsafe and no safe caller; per-command abort needs bead spdk-5ia). There
+		 * is exactly ONE forward in flight here, so cancel_all aborts it. Optionally
+		 * after a few progress ticks (--cancel-after). Cancellation resolves through
+		 * the normal completion (cb fires exactly once); the result is ABORTED if
+		 * the cancel won the race, or the real status if the Exec finished first.
+		 * Either is acceptable — the load-bearing checks are exactly-once, no leak
+		 * (valgrind), bulk released, drained (outstanding==0), and a reusable DPTR.
+		 */
+		if (cancel) {
+			for (int i = 0; i < cancel_after && !st.called; i++) {
+				(void)nkvx_front_progress(front, 0);
+			}
+			nkvx_front_cancel_all(front);
+		}
+
 		/* Drive progress exactly as the SPDK poller will, until the cb fires. */
 		for (int i = 0; i < 200000 && !st.called; i++) {
 			int prog = nkvx_front_progress(front, 100);
@@ -300,8 +328,38 @@ main(int argc, char **argv)
 		}
 
 		if (!st.called) {
-			fprintf(stderr, "test: FAIL iter %d (completion never fired)\n", it);
+			fprintf(stderr, "test: FAIL iter %d (completion never fired — "
+				"cancel must resolve through the normal completion path)\n", it);
 			goto done;
+		}
+		/*
+		 * C6a: the done-cb must have fired EXACTLY once and the in-flight slot must
+		 * be drained (the call ctx + bulk refs released — the UAF-safe teardown).
+		 */
+		if (st.calls != 1) {
+			fprintf(stderr, "test: FAIL iter %d (done-cb fired %d times, expected 1)\n",
+				it, st.calls);
+			goto done;
+		}
+		if (nkvx_front_outstanding(front) != 0) {
+			fprintf(stderr, "test: FAIL iter %d (%u forward(s) still in flight after "
+				"completion)\n", it, nkvx_front_outstanding(front));
+			goto done;
+		}
+		if (cancel) {
+			/* The cancel either won the race (ABORTED) or lost it (the Exec
+			 * completed first with its real status == expect). Both acceptable. */
+			if ((int)st.status != SPDK_KVDEV_IO_STATUS_ABORTED &&
+			    (int)st.status != expect) {
+				fprintf(stderr, "test: FAIL iter %d (cancel: status %d not ABORTED(%d) "
+					"nor expected %d)\n", it, (int)st.status,
+					SPDK_KVDEV_IO_STATUS_ABORTED, expect);
+				goto done;
+			}
+			printf("test: cancel iter %d -> status=%d (%s)\n", it, (int)st.status,
+			       (int)st.status == SPDK_KVDEV_IO_STATUS_ABORTED ?
+			       "ABORTED — cancel won" : "completed — cancel lost race");
+			continue;	/* skip result_len / sha checks on the abort path */
 		}
 		if ((int)st.status != expect) {
 			fprintf(stderr, "test: FAIL iter %d (status %d != expected %d)\n",
@@ -340,7 +398,7 @@ main(int argc, char **argv)
 	printf("test: bulk cache hits=%llu misses=%llu evicts=%llu\n",
 	       (unsigned long long)bs.hits, (unsigned long long)bs.misses,
 	       (unsigned long long)bs.evicts);
-	if (iters > 1 && distinct == 1 && osize > (int)NKVX_INLINE_MAX) {
+	if (!cancel && iters > 1 && distinct == 1 && osize > (int)NKVX_INLINE_MAX) {
 		if (bs.misses != 1 || bs.hits != (uint64_t)(iters - 1) || bs.evicts != 0) {
 			fprintf(stderr, "test: FAIL (cache reuse: expected misses=1 hits=%d "
 				"evicts=0 for one recurring DPTR)\n", iters - 1);

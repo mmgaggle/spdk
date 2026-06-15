@@ -52,6 +52,17 @@ void kvdev_rados_nkvx_front_destroy(struct nkvx_front *front);
 int kvdev_rados_nkvx_front_progress(struct nkvx_front *front);
 
 /**
+ * BLOCKING progress for the channel-destroy teardown drain ONLY (Slice C6a):
+ * advance Mercury for up to \p timeout_ms and fire ready completions. Unlike the
+ * non-blocking poller tick, a small block here lets cancelled forwards reach a
+ * terminal completion without busy-spinning the (being-destroyed) reactor.
+ *
+ * \return completions fired (>= 0), or negative on a fatal progress error.
+ */
+int kvdev_rados_nkvx_front_drain_progress(struct nkvx_front *front,
+					  unsigned int timeout_ms);
+
+/**
  * Forward ONE nkvx Exec to the remote executor (design §2, key-only). The wire
  * fields mirror what kvdev_rados_exec() resolved from the binding:
  *   - WASM route: runtime=WASM, (module_key, module_ns) locator, sha256 (+valid),
@@ -85,6 +96,35 @@ int kvdev_rados_nkvx_front_forward(struct nkvx_front *front,
 				   const void *input, uint32_t input_len,
 				   void *output_buf, uint32_t output_buf_len,
 				   spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
+
+/**
+ * Cancel ALL in-flight two-tier Exec forwards on \p front (Slice C6a
+ * channel-destroy teardown drain). BEST-EFFORT, origin-side only: HG_Cancel
+ * drives each forward to a terminal completion, but the executor may still PUSH
+ * into the result_sink afterwards (no executor-side cancel awareness — bead
+ * spdk-5ia). Safe only at channel-destroy (front+executor torn down); NOT a
+ * per-command abort. The caller progresses until
+ * kvdev_rados_nkvx_front_outstanding() reaches 0.
+ */
+void kvdev_rados_nkvx_front_cancel_all(struct nkvx_front *front);
+
+/**
+ * Number of two-tier Exec forwards currently in flight on \p front (Slice C6a).
+ * Used by channel-destroy to drain: cancel all, then progress until this is 0.
+ */
+unsigned kvdev_rados_nkvx_front_outstanding(struct nkvx_front *front);
+
+/**
+ * TEARDOWN-ONLY forced completion of every still-in-flight forward when the
+ * bounded cancel+drain did not reach 0 (a wedged/dead executor). Fires each
+ * tenant cb_fn with \p status (so the io completes instead of hanging) and
+ * detaches the call so kvdev_rados_nkvx_front_outstanding() reaches 0 for a clean
+ * destroy. Handle/ctx teardown is deferred to the eventual Mercury completion /
+ * HG_Finalize (memory-safe; see nkvx_front_fail_all_pending). The cross-process
+ * late-PUSH residual is bead spdk-5ia.
+ */
+void kvdev_rados_nkvx_front_fail_all_pending(struct nkvx_front *front,
+					     enum spdk_kvdev_io_status status);
 
 #ifdef __cplusplus
 }

@@ -128,6 +128,57 @@ int nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 		       nkvx_front_done_cb cb, void *arg);
 
 /**
+ * Cancel EVERY in-flight Exec on \p front (channel-destroy teardown drain).
+ *
+ * BEST-EFFORT, ORIGIN-SIDE ONLY (NOT a full UAF guarantee): HG_Cancel() cancels
+ * the ORIGIN-side send/recv on each handle so the forward resolves to a terminal
+ * completion (HG_CANCELED -> ABORTED) from a later progress tick, where the bulk
+ * handles are released and the call ctx freed. It does NOT reach into the
+ * executor: the executor has no do-not-PUSH awareness and may still PUSH into the
+ * registered result_sink AFTER the origin cancels (tracked by bead spdk-5ia).
+ * This is therefore safe ONLY at channel-destroy teardown, where the front AND
+ * the executor are being torn down and the DPTR is not reused per-command. SAFE
+ * per-command abort and on-the-verbs teardown require the executor-side cancel
+ * protocol (bead spdk-5ia) and are NOT provided here.
+ *
+ * Idempotent. The caller progresses until nkvx_front_outstanding() reaches 0
+ * (bounded — HG_Cancel forces each forward to a terminal NA completion), then, if
+ * the bound is exceeded, uses nkvx_front_fail_all_pending() before fini.
+ */
+void nkvx_front_cancel_all(struct nkvx_front *front);
+
+/**
+ * Number of Exec forwards currently in flight on \p front (submitted, cb not yet
+ * fired). For the channel-destroy drain: cancel all outstanding and progress
+ * until this reaches 0 before nkvx_front_fini().
+ */
+unsigned nkvx_front_outstanding(const struct nkvx_front *front);
+
+/**
+ * TEARDOWN-ONLY forced completion of every still-in-flight Exec (channel-destroy
+ * last resort). For each in-flight call: fire its done-cb ONCE with \p status
+ * (the tenant io completes FAILED instead of hanging), release its bulk handles
+ * to the cache, and remove it from the in-flight list so nkvx_front_outstanding()
+ * reaches 0 before fini — no leaked call ctxs, no Mercury finalize over a live
+ * in-flight list as far as our bookkeeping is concerned.
+ *
+ * MEMORY-SAFETY: this does NOT free the call ctx nor HG_Destroy the handle here.
+ * A cancelled-but-not-yet-drained forward may still have a Mercury completion
+ * pending (it carries the call as info->arg); freeing the ctx now would be a UAF
+ * when that completion later triggers. Instead the call is detached (its tenant
+ * cb is marked already-fired) and left for the normal forward completion to reap
+ * (release-handles + HG_Destroy + free) without re-firing the tenant cb. The
+ * handle teardown is thus left to HG_Finalize / the eventual trigger, which is
+ * the documented-safe path (Mercury holds its own forward-side ref on the handle;
+ * HG_Destroy on a non-terminal handle only drops OUR ref).
+ *
+ * Use ONLY after cancel_all + a bounded progress drain failed to reach 0 (a
+ * wedged/dead executor). The cross-process late-PUSH residual is bead spdk-5ia.
+ */
+void nkvx_front_fail_all_pending(struct nkvx_front *front,
+				 enum spdk_kvdev_io_status status);
+
+/**
  * Drive Mercury progress once (design §4.2): advance the network for up to
  * \p timeout_ms, then trigger any ready completions (firing nkvx_front_done_cb
  * on this thread). The SPDK poller calls this with timeout_ms == 0 (non-blocking,

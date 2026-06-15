@@ -46,6 +46,12 @@ kvdev_rados_nkvx_front_done(void *arg, enum spdk_kvdev_io_status status,
 		memcpy(ctx->host_out, result_inline, n);
 	}
 
+	/*
+	 * status is passed straight through (correct: ABORTED maps to the tenant
+	 * ABORTED_BY_REQUEST). NB a cancel-induced ABORTED (channel-destroy teardown)
+	 * shares the tenant CQE status with a resource-cap ABORTED — telemetry only,
+	 * no functional difference at the tenant.
+	 */
 	ctx->cb_fn(ctx->cb_arg, status, result_len);
 	free(ctx);
 }
@@ -93,6 +99,16 @@ kvdev_rados_nkvx_front_progress(struct nkvx_front *front)
 {
 	/* Non-blocking: timeout 0 so the reactor poller never stalls (design §4.2). */
 	return nkvx_front_progress(front, 0);
+}
+
+int
+kvdev_rados_nkvx_front_drain_progress(struct nkvx_front *front, unsigned int timeout_ms)
+{
+	/* Channel-destroy ONLY: the channel is being torn down (no more datapath on
+	 * this reactor), so a small BLOCKING progress is fine and is what avoids the
+	 * busy-spin of timeout-0 polling while we wait for cancelled forwards to reach
+	 * a terminal completion. Never called on the hot datapath. */
+	return nkvx_front_progress(front, timeout_ms);
 }
 
 int
@@ -161,4 +177,23 @@ kvdev_rados_nkvx_front_forward(struct nkvx_front *front,
 		return rc;
 	}
 	return 0;
+}
+
+void
+kvdev_rados_nkvx_front_cancel_all(struct nkvx_front *front)
+{
+	nkvx_front_cancel_all(front);
+}
+
+unsigned
+kvdev_rados_nkvx_front_outstanding(struct nkvx_front *front)
+{
+	return nkvx_front_outstanding(front);
+}
+
+void
+kvdev_rados_nkvx_front_fail_all_pending(struct nkvx_front *front,
+					enum spdk_kvdev_io_status status)
+{
+	nkvx_front_fail_all_pending(front, status);
 }
