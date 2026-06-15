@@ -134,9 +134,11 @@ main(int argc, char **argv)
 	const char *module_ns = "kvpool";
 	int osize = 4096;
 	int expect_result = -1;			/* >=0: also assert result_len == this */
+	const char *sha256_hex = NULL;		/* 64 hex chars -> 32-byte bound hash */
 	int rc = 1;
 
-	enum { OPT_KEY = 256, OPT_RUNTIME, OPT_MODULE, OPT_MODULE_NS, OPT_OSIZE, OPT_EXPECT_RESULT };
+	enum { OPT_KEY = 256, OPT_RUNTIME, OPT_MODULE, OPT_MODULE_NS, OPT_OSIZE,
+	       OPT_EXPECT_RESULT, OPT_SHA256 };
 	static const struct option opts[] = {
 		{ "listen",        required_argument, NULL, 'l' },
 		{ "target",        required_argument, NULL, 't' },
@@ -148,6 +150,7 @@ main(int argc, char **argv)
 		{ "module-ns",     required_argument, NULL, OPT_MODULE_NS },
 		{ "osize",         required_argument, NULL, OPT_OSIZE },
 		{ "expect-result", required_argument, NULL, OPT_EXPECT_RESULT },
+		{ "sha256",        required_argument, NULL, OPT_SHA256 },
 		{ "help",          no_argument,       NULL, 'h' },
 		{ NULL,            0,                 NULL, 0 },
 	};
@@ -164,6 +167,7 @@ main(int argc, char **argv)
 		case OPT_MODULE_NS: module_ns = optarg; break;
 		case OPT_OSIZE: osize = atoi(optarg); break;
 		case OPT_EXPECT_RESULT: expect_result = atoi(optarg); break;
+		case OPT_SHA256: sha256_hex = optarg; break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 2;
 		}
@@ -172,6 +176,23 @@ main(int argc, char **argv)
 	if (key_len == 0 || key_len > SPDK_KVDEV_EXEC_KEY_MAX_LEN) {
 		fprintf(stderr, "client: --key must be 1..%d bytes\n", SPDK_KVDEV_EXEC_KEY_MAX_LEN);
 		return 2;
+	}
+	unsigned char sha256[SPDK_KV_EXEC_SHA256_LEN];
+	if (sha256_hex != NULL) {
+		if (strlen(sha256_hex) != SPDK_KV_EXEC_SHA256_LEN * 2) {
+			fprintf(stderr, "client: --sha256 must be %d hex chars\n",
+				SPDK_KV_EXEC_SHA256_LEN * 2);
+			return 2;
+		}
+		for (int i = 0; i < SPDK_KV_EXEC_SHA256_LEN; i++) {
+			unsigned byte;
+
+			if (sscanf(sha256_hex + i * 2, "%2x", &byte) != 1) {
+				fprintf(stderr, "client: --sha256 not valid hex\n");
+				return 2;
+			}
+			sha256[i] = (unsigned char)byte;
+		}
 	}
 
 	char addr_buf[512];
@@ -236,7 +257,12 @@ main(int argc, char **argv)
 	in.caps = 0;
 	in.key_len = (uint8_t)key_len;
 	memcpy(in.key, key, key_len);
-	in.sha256_valid = 0;
+	if (sha256_hex != NULL) {
+		memcpy(in.sha256, sha256, SPDK_KV_EXEC_SHA256_LEN);
+		in.sha256_valid = 1;
+	} else {
+		in.sha256_valid = 0;
+	}
 	in.module_key = (char *)module_key;
 	in.module_ns = (char *)module_ns;
 	in.osize = (uint32_t)osize;

@@ -21,6 +21,7 @@
 #include <rados/librados.h>
 
 #include "spdk/kvdev.h"		/* enum spdk_kvdev_io_status, runtime enum, key max */
+#include "kvdev_rados_nkvx_wasm.h"	/* reused wasm runtime + TB4 object cache (C5a.2) */
 
 struct nkvx_executor {
 	rados_t		cluster;
@@ -109,6 +110,17 @@ nkvx_executor_close(struct nkvx_executor *ex)
 	if (ex == NULL) {
 		return;
 	}
+	/*
+	 * Drop the wasm runtime's process-wide caches and join the epoch ticker
+	 * thread (spdk-0k1) — the teardown the SPDK module does in module_fini. The
+	 * executor owns these globals, so release them here so a stop/restart leaks
+	 * neither the cached object/warm/module entries nor the ticker thread.
+	 * No-ops in a --without-wasm stub build.
+	 */
+	kvdev_rados_nkvx_wasm_cache_reset();
+	kvdev_rados_nkvx_wasm_module_cache_reset();
+	kvdev_rados_nkvx_wasm_runtime_teardown();
+
 	if (ex->ioctx != NULL) {
 		rados_ioctx_destroy(ex->ioctx);
 	}
@@ -223,6 +235,231 @@ nkvx_run_builtin(struct nkvx_executor *ex, const char *oid, const char *module,
 	return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED, 0, NULL, 0);
 }
 
+/*
+ * Object cold-fill callback (Slice C5a.2): invoked by run_cached ONLY on a TB4
+ * object-cache MISS to populate the (page-rounded) cache slot from RADOS. On a
+ * cache HIT this never runs — the cold-fill-once property the TB4 acceptance
+ * proof asserts (kvdev_rados_nkvx_wasm.h:154-157).
+ */
+struct nkvx_obj_fill {
+	rados_ioctx_t	ioctx;
+	const char	*oid;
+};
+
+static int
+nkvx_obj_fill(void *buf, size_t cap, size_t *out_len, void *arg)
+{
+	struct nkvx_obj_fill *f = arg;
+	int n = rados_read(f->ioctx, f->oid, buf, cap, 0);
+
+	if (n < 0) {
+		return n;	/* negative errno; run_cached discards the slot */
+	}
+	*out_len = (size_t)n;
+	return 0;
+}
+
+/*
+ * Cold-fetch the module object (the verified .wasm bytes) from its locator. The
+ * locator namespace is "pool" or "pool/namespace"; the module object name is
+ * module_key. Returns 0 and sets buf_out + len_out (caller frees buf_out), or a
+ * negative errno (notably -ENOENT for a missing module object).
+ */
+static int
+nkvx_fetch_module(struct nkvx_executor *ex, const char *module_ns,
+		  const char *module_key, void **buf_out, size_t *len_out)
+{
+	char pool[256];
+	const char *ns = NULL;
+	const char *slash = strchr(module_ns, '/');
+	rados_ioctx_t mctx;
+	uint64_t size = 0;
+	time_t mtime = 0;
+	void *buf;
+	int rc, n;
+
+	if (slash != NULL) {
+		size_t pl = (size_t)(slash - module_ns);
+
+		if (pl == 0 || pl >= sizeof(pool)) {
+			return -EINVAL;
+		}
+		memcpy(pool, module_ns, pl);
+		pool[pl] = '\0';
+		ns = slash + 1;
+	} else {
+		int w = snprintf(pool, sizeof(pool), "%s", module_ns);
+
+		if (w < 0 || (size_t)w >= sizeof(pool)) {
+			return -EINVAL;
+		}
+	}
+
+	rc = rados_ioctx_create(ex->cluster, pool, &mctx);
+	if (rc < 0) {
+		return rc;
+	}
+	if (ns != NULL && ns[0] != '\0') {
+		rados_ioctx_set_namespace(mctx, ns);
+	}
+
+	rc = rados_stat(mctx, module_key, &size, &mtime);
+	if (rc < 0) {
+		rados_ioctx_destroy(mctx);
+		return rc;
+	}
+	buf = malloc(size ? size : 1);
+	if (buf == NULL) {
+		rados_ioctx_destroy(mctx);
+		return -ENOMEM;
+	}
+	n = rados_read(mctx, module_key, buf, size, 0);
+	rados_ioctx_destroy(mctx);
+	if (n < 0) {
+		free(buf);
+		return n;
+	}
+
+	*buf_out = buf;
+	*len_out = (size_t)n;
+	return 0;
+}
+
+/*
+ * Run a real wasm module (Slice C5a.2): fetch + sha256-verify the module (the
+ * deny-by-default ADR-0010 anchor, enforced inside the wasm core), then run it
+ * over the object identified by oid through the TB4 object cache — cold-fill-once
+ * on a miss, served zero-copy on a hit. Mirrors the wasm branch of the canonical
+ * kvdev_rados_nkvx_run_module (kvdev_rados_nkvx.c:563-592), synchronous here.
+ */
+static int
+nkvx_run_wasm(struct nkvx_executor *ex, const char *oid,
+	      const nkvx_exec_in_t *in, nkvx_exec_out_t *out)
+{
+	struct kvdev_rados_nkvx_module mod;
+	struct kvdev_rados_nkvx_wasm_stats stats;
+	static const char wasm_pfx[] = "wasm:";
+	const char *name;
+	void *mod_buf = NULL;
+	size_t mod_len = 0;
+	void *out_buf = NULL;
+	void *pin;
+	uint32_t osize = in->osize;
+	uint32_t rlen = 0;
+	uint32_t deliver;
+	int kvst;
+
+	/* Deny-by-default (ADR-0010): a wasm binding MUST carry a bound sha256 and a
+	 * module locator. The front already gated this; re-check defensively. */
+	if (!in->sha256_valid || in->module_key == NULL || in->module_key[0] == '\0' ||
+	    in->module_ns == NULL || in->module_ns[0] == '\0') {
+		return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
+	}
+
+	/* Run name = exported function / warm-cache label = module_key sans "wasm:". */
+	name = in->module_key;
+	if (strncmp(name, wasm_pfx, sizeof(wasm_pfx) - 1) == 0) {
+		name += sizeof(wasm_pfx) - 1;
+	}
+	if (name[0] == '\0') {
+		return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
+	}
+
+	memset(&mod, 0, sizeof(mod));
+	memcpy(mod.sha256, in->sha256, SPDK_KV_EXEC_SHA256_LEN);
+	mod.caps = in->caps;
+
+	/*
+	 * Fetch the module only on a compiled-module cache MISS; on a hit the wasm
+	 * core serves the cached compiled artifact keyed by sha256 (no refetch). On a
+	 * miss, run the HARD deny-by-default hash gate (ADR-0010) explicitly BEFORE
+	 * any run — exactly as the front datapath does on the reactor
+	 * (kvdev_rados.c:832-842, kvdev_rados_nkvx_wasm_module_verify). This both maps
+	 * a mismatch to INVALID (design §3) and closes the warm-instance bypass: an
+	 * uncached (e.g. wrong) sha never reaches the (name,oid)-keyed warm cache.
+	 * A cached sha was already verified when it was first admitted.
+	 */
+	if (!kvdev_rados_nkvx_wasm_module_cached(mod.sha256)) {
+		int rc = nkvx_fetch_module(ex, in->module_ns, in->module_key,
+					   &mod_buf, &mod_len);
+		if (rc < 0) {
+			/* Missing/unreadable module object: a bad locator/binding. */
+			return nkvx_set_result(out,
+				(rc == -ENOENT) ? SPDK_KVDEV_IO_STATUS_INVALID
+						: SPDK_KVDEV_IO_STATUS_FAILED, 0, NULL, 0);
+		}
+		int gate = kvdev_rados_nkvx_wasm_module_verify(mod.sha256, mod_buf, mod_len);
+		if (gate != SPDK_KVDEV_IO_STATUS_SUCCESS) {
+			/* Hash mismatch -> INVALID; runtime unavailable -> NOT_SUPPORTED.
+			 * Unverified bytes are NEVER compiled or run. */
+			free(mod_buf);
+			return nkvx_set_result(out, (enum spdk_kvdev_io_status)gate, 0, NULL, 0);
+		}
+		mod.bytes = mod_buf;
+		mod.bytes_len = mod_len;
+	}
+
+	if (osize > 0) {
+		out_buf = malloc(osize);
+		if (out_buf == NULL) {
+			free(mod_buf);
+			return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_NOMEM, 0, NULL, 0);
+		}
+	}
+
+	/*
+	 * TB4: probe-and-pin first; a hit runs zero-copy off the cached object with
+	 * NO librados (proving cold-fill-once). A miss stats the object (cheap) then
+	 * run_cached cold-fills it via nkvx_obj_fill exactly once.
+	 */
+	pin = kvdev_rados_nkvx_wasm_cache_pin(oid);
+	if (pin != NULL) {
+		kvst = kvdev_rados_nkvx_wasm_run_pinned(name, &mod, pin, out_buf, osize, &rlen);
+		kvdev_rados_nkvx_wasm_cache_unpin(pin);
+	} else {
+		uint64_t size = 0;
+		time_t mtime = 0;
+		int rc = rados_stat(ex->ioctx, oid, &size, &mtime);
+
+		if (rc == -ENOENT) {
+			free(out_buf);
+			free(mod_buf);
+			return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_KEY_NOT_EXIST, 0, NULL, 0);
+		}
+		if (rc < 0) {
+			free(out_buf);
+			free(mod_buf);
+			return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_FAILED, 0, NULL, 0);
+		}
+		struct nkvx_obj_fill fill = { .ioctx = ex->ioctx, .oid = oid };
+
+		kvst = kvdev_rados_nkvx_wasm_run_cached(name, &mod, oid, (size_t)size,
+						        nkvx_obj_fill, &fill,
+						        out_buf, osize, &rlen);
+	}
+	free(mod_buf);
+
+	kvdev_rados_nkvx_wasm_get_stats(&stats);
+	fprintf(stderr, "nkvx_executor: wasm '%s' done status=%d result_len=%u "
+		"cold_fills=%llu content_hits=%llu warm_hits=%llu\n",
+		name, kvst, rlen,
+		(unsigned long long)stats.cold_fills,
+		(unsigned long long)stats.content_hits,
+		(unsigned long long)stats.warm_hits);
+
+	deliver = (osize < rlen) ? osize : rlen;
+	if (deliver > NKVX_INLINE_MAX) {
+		/* Large result -> front-sink bulk PUSH (Slice C7); not wired yet. */
+		fprintf(stderr, "nkvx_executor: wasm result %u > inline max %u — "
+			"NOT_SUPPORTED (Slice C7)\n", deliver, NKVX_INLINE_MAX);
+		free(out_buf);
+		return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED, 0, NULL, 0);
+	}
+	nkvx_set_result(out, (enum spdk_kvdev_io_status)kvst, rlen, out_buf, deliver);
+	free(out_buf);
+	return 0;
+}
+
 int
 nkvx_executor_run(struct nkvx_executor *ex, const nkvx_exec_in_t *in,
 		  nkvx_exec_out_t *out)
@@ -254,9 +491,7 @@ nkvx_executor_run(struct nkvx_executor *ex, const nkvx_exec_in_t *in,
 	}
 
 	if (in->runtime == (uint8_t)SPDK_KV_EXEC_RUNTIME_WASM) {
-		/* C5a.2 lands the wasm pipeline; until then decline cleanly. */
-		nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED, 0, NULL, 0);
-		return 0;
+		return nkvx_run_wasm(ex, oid, in, out);
 	}
 
 	nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
