@@ -62,8 +62,10 @@ int kvdev_rados_nkvx_front_progress(struct nkvx_front *front);
  * On success (return 0) the RPC is in flight and \p cb_fn fires exactly once from
  * a later progress tick (on the reactor thread): up to \p output_buf_len bytes of
  * the inline result are copied into \p output_buf, then
- * cb_fn(cb_arg, status, TRUE_result_len) runs. The request fields/buffers are
- * consumed synchronously, so the caller may return immediately.
+ * cb_fn(cb_arg, status, TRUE_result_len) runs. The request is submitted
+ * asynchronously: the output buffer (result sink) and, for large input, the
+ * input buffer must remain valid until \p cb_fn fires (the bridge's callers
+ * already keep the io's buffers alive until completion, which satisfies this).
  *
  * On a synchronous submission failure returns negative and \p cb_fn is NOT
  * called (the caller completes the io). Large input (> NKVX_INLINE_MAX) needs the

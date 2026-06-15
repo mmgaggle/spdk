@@ -45,9 +45,11 @@ struct nkvx_front;
  * \param result_len     TRUE result length (may exceed osize; truncation
  *                       semantics, design §1.2). Valid only when status maps to
  *                       a delivered result; 0 otherwise.
- * \param result_inline  inline result bytes (NULL when none / delivered via a
- *                       result_sink bulk in a later slice). Borrowed — valid
- *                       only for the duration of the callback; copy if needed.
+ * \param result_inline  inline result bytes (NULL when none, or when the result
+ *                       was delivered straight into the caller's sink buffer via
+ *                       a result_sink bulk PUSH — in which case the bytes are
+ *                       already in that buffer and nothing is passed here).
+ *                       Borrowed — valid only for the callback; copy if needed.
  * \param result_inline_len  number of valid bytes at result_inline.
  */
 typedef void (*nkvx_front_done_cb)(void *arg,
@@ -73,18 +75,40 @@ int nkvx_front_init(const char *na_init, const char *target_addr,
 void nkvx_front_fini(struct nkvx_front *front);
 
 /**
- * Forward ONE nkvx_exec request (async). The request fields are consumed
- * synchronously (encoded into the SEND) before returning, so the caller may
- * free/reuse \p in immediately. The bulk handles in \p in (input_bulk,
- * result_sink) are contract-only here (transfer is Slice C7); pass HG_BULK_NULL.
+ * Forward ONE nkvx_exec request (async), with the large-payload bulk RMA wired
+ * (Slice C7, design §1.3). The scalar/inline fields of \p in are encoded
+ * synchronously into the SEND before returning, so the \p in struct itself may
+ * be freed/reused on return. The large-payload SOURCE BUFFERS, however, must
+ * outlive the RPC: \p result_sink AND, for large input (input_len >
+ * NKVX_INLINE_MAX), the buffer \p in->input_inline points at. Both are
+ * registered as bulk handles the executor accesses ASYNCHRONOUSLY during the
+ * call (it PULLs the input and PUSHes the result on later progress ticks) and
+ * are released only when \p cb fires. The caller MUST leave \p in's bulk handles HG_BULK_NULL — this
+ * function originates and owns them (the front is the registrable side):
+ *
+ *   - Large input: when in->input_len > NKVX_INLINE_MAX, \p in->input_inline is
+ *     registered as a READ-mode bulk and the executor PULLs it. (Small input
+ *     rides inline; in->input_inline carries it as before.)
+ *   - Large result: when \p result_sink_len > NKVX_INLINE_MAX, \p result_sink is
+ *     registered as a WRITE-mode bulk and shipped so the executor PUSHes the
+ *     result straight into it. The executor PUSHes only when the result actually
+ *     exceeds the inline cap; a small result still returns inline (the done-cb
+ *     then carries result_inline). \p result_sink is the caller's host output
+ *     buffer (the tenant DPTR) and \p result_sink_len its capacity (== osize);
+ *     pass (NULL, 0) for a guaranteed-small result.
+ *
+ * The bulk handles stay registered until the RPC completes and are released in
+ * the completion path, so \p result_sink and (for large input) the buffer at
+ * \p in->input_inline must remain valid until \p cb fires.
  *
  * On success the RPC is in flight and \p cb will fire exactly once from a later
- * nkvx_front_progress() call. On a synchronous submission failure (handle
- * create / forward), returns negative and \p cb is NOT called.
+ * nkvx_front_progress() call. On a synchronous submission failure (bulk register
+ * / handle create / forward), returns negative and \p cb is NOT called.
  *
  * \return 0 if the RPC was submitted; negative errno-style otherwise.
  */
 int nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
+		       void *result_sink, uint32_t result_sink_len,
 		       nkvx_front_done_cb cb, void *arg);
 
 /**

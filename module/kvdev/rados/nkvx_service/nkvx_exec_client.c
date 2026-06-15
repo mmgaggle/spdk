@@ -135,10 +135,11 @@ main(int argc, char **argv)
 	int osize = 4096;
 	int expect_result = -1;			/* >=0: also assert result_len == this */
 	const char *sha256_hex = NULL;		/* 64 hex chars -> 32-byte bound hash */
+	const char *input = NULL;		/* optional per-request inline input bytes */
 	int rc = 1;
 
 	enum { OPT_KEY = 256, OPT_RUNTIME, OPT_MODULE, OPT_MODULE_NS, OPT_OSIZE,
-	       OPT_EXPECT_RESULT, OPT_SHA256 };
+	       OPT_EXPECT_RESULT, OPT_SHA256, OPT_INPUT };
 	static const struct option opts[] = {
 		{ "listen",        required_argument, NULL, 'l' },
 		{ "target",        required_argument, NULL, 't' },
@@ -151,6 +152,7 @@ main(int argc, char **argv)
 		{ "osize",         required_argument, NULL, OPT_OSIZE },
 		{ "expect-result", required_argument, NULL, OPT_EXPECT_RESULT },
 		{ "sha256",        required_argument, NULL, OPT_SHA256 },
+		{ "input",         required_argument, NULL, OPT_INPUT },
 		{ "help",          no_argument,       NULL, 'h' },
 		{ NULL,            0,                 NULL, 0 },
 	};
@@ -168,6 +170,7 @@ main(int argc, char **argv)
 		case OPT_OSIZE: osize = atoi(optarg); break;
 		case OPT_EXPECT_RESULT: expect_result = atoi(optarg); break;
 		case OPT_SHA256: sha256_hex = optarg; break;
+		case OPT_INPUT: input = optarg; break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 2;
 		}
@@ -266,8 +269,10 @@ main(int argc, char **argv)
 	in.module_key = (char *)module_key;
 	in.module_ns = (char *)module_ns;
 	in.osize = (uint32_t)osize;
-	in.input_len = 0;
-	in.input_inline = NULL;
+	/* Optional inline input (exercises the proc decode/free of input_inline on the
+	 * executor — the path the C7 leak fix guards). Bulk input is not driven here. */
+	in.input_len = (input != NULL) ? (uint32_t)strlen(input) : 0;
+	in.input_inline = (void *)input;
 	in.input_bulk = HG_BULK_NULL;
 	in.result_sink = HG_BULK_NULL;
 

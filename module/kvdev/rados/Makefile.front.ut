@@ -23,7 +23,9 @@ MERCURY_LIBS    := $(shell PKG_CONFIG_PATH=$(MERCURY_PREFIX)/lib/pkgconfig pkg-c
 # -std=gnu11 matches SPDK's build and is load-bearing for the C3 wire-status
 # static-asserts (see nkvx_exec_rpc.c).
 CFLAGS  := -g -O0 -std=gnu11 -Wall -Wextra -Werror -I$(SPDK_ROOT)/include $(MERCURY_CFLAGS)
-LDFLAGS := $(MERCURY_LIBS) -Wl,-rpath,$(MERCURY_PREFIX)/lib
+# -lcrypto: the C7 driver sha256's the delivered result bytes to verify the bulk
+# PUSH landed correctly (content-hash, design §1.3 NORMATIVE-ordering check).
+LDFLAGS := $(MERCURY_LIBS) -lcrypto -Wl,-rpath,$(MERCURY_PREFIX)/lib
 
 BIN  := nkvx_front_client_test
 SRCS := nkvx_front_client_test.c nkvx_front_client.c nkvx_exec_rpc.c

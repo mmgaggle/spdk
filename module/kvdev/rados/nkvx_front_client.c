@@ -15,6 +15,7 @@
 #include <errno.h>
 
 #include <mercury.h>
+#include <mercury_bulk.h>
 
 struct nkvx_front {
 	hg_class_t	*cls;
@@ -27,6 +28,14 @@ struct nkvx_front {
 struct nkvx_call {
 	nkvx_front_done_cb	cb;
 	void			*arg;
+	/*
+	 * Bulk handles the front originated for this Exec (Slice C7). They must stay
+	 * registered for the whole RPC — the executor PULLs the input and PUSHes the
+	 * result during the call, all before it responds — so they are freed only
+	 * here, in the forward completion. HG_BULK_NULL when the payload rode inline.
+	 */
+	hg_bulk_t		input_bulk;
+	hg_bulk_t		result_sink;
 };
 
 /*
@@ -67,6 +76,15 @@ nkvx_front_forward_cb(const struct hg_cb_info *info)
 	HG_Free_output(handle, &out);
 
 out:
+	/* The executor is done with the bulk buffers by the time the forward
+	 * completes (it PULLs/PUSHes before responding), so release the handles. */
+	/* C7.2 seam: cache release of the handles acquired in nkvx_front_forward. */
+	if (call->input_bulk != HG_BULK_NULL) {
+		HG_Bulk_free(call->input_bulk);
+	}
+	if (call->result_sink != HG_BULK_NULL) {
+		HG_Bulk_free(call->result_sink);
+	}
 	HG_Destroy(handle);
 	free(call);
 	return HG_SUCCESS;
@@ -142,13 +160,22 @@ nkvx_front_fini(struct nkvx_front *front)
 
 int
 nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
+		   void *result_sink, uint32_t result_sink_len,
 		   nkvx_front_done_cb cb, void *arg)
 {
 	struct nkvx_call *call;
+	nkvx_exec_in_t local;		/* mutable copy: carries the bulk handles */
 	hg_handle_t handle = HG_HANDLE_NULL;
 	hg_return_t ret;
 
 	if (front == NULL || in == NULL || cb == NULL) {
+		return -EINVAL;
+	}
+
+	/* A large input must come with a source buffer to register as a READ bulk;
+	 * a large input_len with no input_inline would ship a request advertising
+	 * input it cannot deliver (neither inline nor via PULL). Reject it. */
+	if (in->input_len > NKVX_INLINE_MAX && in->input_inline == NULL) {
 		return -EINVAL;
 	}
 
@@ -158,27 +185,82 @@ nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 	}
 	call->cb = cb;
 	call->arg = arg;
+	call->input_bulk = HG_BULK_NULL;
+	call->result_sink = HG_BULK_NULL;
+
+	/*
+	 * Originate the front-side bulk handles (Slice C7, design §1.3): the front is
+	 * the registrable side, so it registers its own input buffer (READ) and host
+	 * output buffer (WRITE) and ships the handles. The encode below copies them
+	 * onto the wire; the executor PULLs/PUSHes against them mid-RPC.
+	 */
+	local = *in;
+	local.input_bulk = HG_BULK_NULL;
+	local.result_sink = HG_BULK_NULL;
+
+	if (in->input_len > NKVX_INLINE_MAX && in->input_inline != NULL) {
+		void *p = in->input_inline;
+		hg_size_t sz = in->input_len;
+
+		/* C7.2 seam: replace register-per-Exec with an MR/hg_bulk-handle-cache
+		 * acquire keyed by the DPTR address (design §4.3); the matching release
+		 * is in nkvx_front_forward_cb. */
+		ret = HG_Bulk_create(front->cls, 1, &p, &sz, HG_BULK_READ_ONLY,
+				     &call->input_bulk);
+		if (ret != HG_SUCCESS) {
+			free(call);
+			return -EIO;
+		}
+		local.input_bulk = call->input_bulk;
+	}
+
+	if (result_sink != NULL && result_sink_len > NKVX_INLINE_MAX) {
+		void *p = result_sink;
+		hg_size_t sz = result_sink_len;
+
+		/* C7.2 seam: replace register-per-Exec with an MR/hg_bulk-handle-cache
+		 * acquire keyed by the DPTR address (design §4.3); the matching release
+		 * is in nkvx_front_forward_cb. */
+		ret = HG_Bulk_create(front->cls, 1, &p, &sz, HG_BULK_WRITE_ONLY,
+				     &call->result_sink);
+		if (ret != HG_SUCCESS) {
+			if (call->input_bulk != HG_BULK_NULL) {
+				HG_Bulk_free(call->input_bulk);
+			}
+			free(call);
+			return -EIO;
+		}
+		local.result_sink = call->result_sink;
+	}
 
 	ret = HG_Create(front->ctx, front->addr, front->rpc_id, &handle);
 	if (ret != HG_SUCCESS) {
-		free(call);
-		return -EIO;
+		goto err_bulk;
 	}
 
 	/*
 	 * HG_Forward encodes the request into the SEND synchronously (the proc
-	 * runs now), so `in` may be freed/reused by the caller on return. The
-	 * const cast is safe: the encode path only reads. The completion fires
-	 * later from nkvx_front_progress() via nkvx_front_forward_cb().
+	 * runs now), so `local` may go out of scope on return; the registered bulk
+	 * handles, however, must outlive the RPC and are freed in the completion.
+	 * The completion fires later from nkvx_front_progress() via the forward cb.
 	 */
-	ret = HG_Forward(handle, nkvx_front_forward_cb, call, (void *)in);
+	ret = HG_Forward(handle, nkvx_front_forward_cb, call, &local);
 	if (ret != HG_SUCCESS) {
 		HG_Destroy(handle);
-		free(call);
-		return -EIO;
+		goto err_bulk;
 	}
 
 	return 0;
+
+err_bulk:
+	if (call->input_bulk != HG_BULK_NULL) {
+		HG_Bulk_free(call->input_bulk);
+	}
+	if (call->result_sink != HG_BULK_NULL) {
+		HG_Bulk_free(call->result_sink);
+	}
+	free(call);
+	return -EIO;
 }
 
 int

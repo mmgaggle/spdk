@@ -21,6 +21,7 @@
 #include <rados/librados.h>
 
 #include "spdk/kvdev.h"		/* enum spdk_kvdev_io_status, runtime enum, key max */
+#include "spdk/util.h"		/* spdk_min (declaration-only; safe for this standalone build) */
 #include "kvdev_rados_nkvx_wasm.h"	/* reused wasm runtime + TB4 object cache (C5a.2) */
 
 struct nkvx_executor {
@@ -128,29 +129,40 @@ nkvx_executor_close(struct nkvx_executor *ex)
 	free(ex);
 }
 
-/* Map a kvdev status + delivered bytes into the response envelope. Allocates
- * out->result_inline (freed by nkvx_exec_out_free); deliver bytes are copied
- * from src. */
+void
+nkvx_exec_result_free(struct nkvx_exec_result *res)
+{
+	if (res == NULL) {
+		return;
+	}
+	free(res->buf);
+	res->buf = NULL;
+	res->buf_len = 0;
+}
+
+/* Set the compute outcome: status, the TRUE result_len, and a freshly-allocated
+ * copy of the `deliver` bytes at src (the delivery-agnostic buffer the handler
+ * inlines or PUSHes, design §1.3). deliver==0 leaves buf NULL. */
 static int
-nkvx_set_result(nkvx_exec_out_t *out, enum spdk_kvdev_io_status status,
+nkvx_result_set(struct nkvx_exec_result *res, enum spdk_kvdev_io_status status,
 		uint32_t result_len, const void *src, uint32_t deliver)
 {
-	out->status = nkvx_status_to_wire(status);
-	out->result_len = result_len;
-	out->result_inline = NULL;
-	out->result_inline_len = 0;
+	res->status = status;
+	res->result_len = result_len;
+	res->buf = NULL;
+	res->buf_len = 0;
 
 	if (deliver == 0) {
 		return 0;
 	}
-	out->result_inline = malloc(deliver);
-	if (out->result_inline == NULL) {
-		out->status = nkvx_status_to_wire(SPDK_KVDEV_IO_STATUS_NOMEM);
-		out->result_len = 0;
+	res->buf = malloc(deliver);
+	if (res->buf == NULL) {
+		res->status = SPDK_KVDEV_IO_STATUS_NOMEM;
+		res->result_len = 0;
 		return 0;
 	}
-	memcpy(out->result_inline, src, deliver);
-	out->result_inline_len = deliver;
+	memcpy(res->buf, src, deliver);
+	res->buf_len = deliver;
 	return 0;
 }
 
@@ -164,7 +176,7 @@ nkvx_set_result(nkvx_exec_out_t *out, enum spdk_kvdev_io_status status,
  */
 static int
 nkvx_run_builtin(struct nkvx_executor *ex, const char *oid, const char *module,
-		 uint32_t osize, nkvx_exec_out_t *out)
+		 uint32_t osize, struct nkvx_exec_result *res)
 {
 	uint64_t size = 0;
 	time_t mtime = 0;
@@ -172,67 +184,63 @@ nkvx_run_builtin(struct nkvx_executor *ex, const char *oid, const char *module,
 
 	rc = rados_stat(ex->ioctx, oid, &size, &mtime);
 	if (rc == -ENOENT) {
-		return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_KEY_NOT_EXIST, 0, NULL, 0);
+		return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_KEY_NOT_EXIST, 0, NULL, 0);
 	}
 	if (rc < 0) {
 		fprintf(stderr, "nkvx_executor: rados_stat(%s) failed: %s\n", oid, strerror(-rc));
-		return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_FAILED, 0, NULL, 0);
+		return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_FAILED, 0, NULL, 0);
 	}
 
 	if (strcmp(module, "bytecount") == 0) {
 		uint64_t count = size;	/* object length, LE on this host's wire */
 		uint32_t result_len = (uint32_t)sizeof(count);
-		uint32_t deliver = (osize < result_len) ? osize : result_len;
+		uint32_t deliver = spdk_min(osize, result_len);
 		enum spdk_kvdev_io_status st = (result_len > osize) ?
 			SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL : SPDK_KVDEV_IO_STATUS_SUCCESS;
 
 		/* 8 B never exceeds NKVX_INLINE_MAX; always inline-deliverable. */
-		return nkvx_set_result(out, st, result_len, &count, deliver);
+		return nkvx_result_set(res, st, result_len, &count, deliver);
 	}
 
 	if (strcmp(module, "identity") == 0) {
 		uint32_t result_len = (size > UINT32_MAX) ? UINT32_MAX : (uint32_t)size;
-		uint32_t deliver = (osize < result_len) ? osize : result_len;
+		uint32_t deliver = spdk_min(osize, result_len);
 		enum spdk_kvdev_io_status st = (size > osize) ?
 			SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL : SPDK_KVDEV_IO_STATUS_SUCCESS;
 		char *buf;
 		int n;
 
 		/*
-		 * Large results need the front-sink bulk PUSH (Slice C7); until then
-		 * only inline-sized deliveries are supported. Report NOT_SUPPORTED so
-		 * the front maps it cleanly rather than silently truncating.
+		 * The full delivered size (up to osize, possibly 64 MiB) is materialized
+		 * here; the handler PUSHes it into the front's result_sink when it
+		 * exceeds NKVX_INLINE_MAX (Slice C7). The backend is delivery-agnostic.
 		 */
-		if (deliver > NKVX_INLINE_MAX) {
-			fprintf(stderr, "nkvx_executor: identity result %u > inline max %u; "
-				"large-result bulk is Slice C7 — NOT_SUPPORTED\n",
-				deliver, NKVX_INLINE_MAX);
-			return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED, 0, NULL, 0);
-		}
-
 		if (deliver == 0) {
-			return nkvx_set_result(out, st, result_len, NULL, 0);
+			return nkvx_result_set(res, st, result_len, NULL, 0);
 		}
 		buf = malloc(deliver);
 		if (buf == NULL) {
-			return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_NOMEM, 0, NULL, 0);
+			return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_NOMEM, 0, NULL, 0);
 		}
 		n = rados_read(ex->ioctx, oid, buf, deliver, 0);
 		if (n < 0) {
 			fprintf(stderr, "nkvx_executor: rados_read(%s) failed: %s\n",
 				oid, strerror(-n));
 			free(buf);
-			return nkvx_set_result(out,
+			return nkvx_result_set(res,
 				(n == -ENOENT) ? SPDK_KVDEV_IO_STATUS_KEY_NOT_EXIST
 					       : SPDK_KVDEV_IO_STATUS_FAILED, 0, NULL, 0);
 		}
-		nkvx_set_result(out, st, result_len, buf, (uint32_t)n);
-		free(buf);
+		/* Hand the buffer straight to the result (no second copy) — adopt it. */
+		res->status = st;
+		res->result_len = result_len;
+		res->buf = buf;
+		res->buf_len = (uint32_t)n;
 		return 0;
 	}
 
 	/* Unknown built-in: no static binding for this op. */
-	return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED, 0, NULL, 0);
+	return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED, 0, NULL, 0);
 }
 
 /*
@@ -334,7 +342,7 @@ nkvx_fetch_module(struct nkvx_executor *ex, const char *module_ns,
  */
 static int
 nkvx_run_wasm(struct nkvx_executor *ex, const char *oid,
-	      const nkvx_exec_in_t *in, nkvx_exec_out_t *out)
+	      const nkvx_exec_in_t *in, struct nkvx_exec_result *res)
 {
 	struct kvdev_rados_nkvx_module mod;
 	struct kvdev_rados_nkvx_wasm_stats stats;
@@ -353,7 +361,7 @@ nkvx_run_wasm(struct nkvx_executor *ex, const char *oid,
 	 * module locator. The front already gated this; re-check defensively. */
 	if (!in->sha256_valid || in->module_key == NULL || in->module_key[0] == '\0' ||
 	    in->module_ns == NULL || in->module_ns[0] == '\0') {
-		return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
+		return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
 	}
 
 	/* Run name = exported function / warm-cache label = module_key sans "wasm:". */
@@ -362,7 +370,7 @@ nkvx_run_wasm(struct nkvx_executor *ex, const char *oid,
 		name += sizeof(wasm_pfx) - 1;
 	}
 	if (name[0] == '\0') {
-		return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
+		return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
 	}
 
 	memset(&mod, 0, sizeof(mod));
@@ -384,7 +392,7 @@ nkvx_run_wasm(struct nkvx_executor *ex, const char *oid,
 					   &mod_buf, &mod_len);
 		if (rc < 0) {
 			/* Missing/unreadable module object: a bad locator/binding. */
-			return nkvx_set_result(out,
+			return nkvx_result_set(res,
 				(rc == -ENOENT) ? SPDK_KVDEV_IO_STATUS_INVALID
 						: SPDK_KVDEV_IO_STATUS_FAILED, 0, NULL, 0);
 		}
@@ -393,7 +401,7 @@ nkvx_run_wasm(struct nkvx_executor *ex, const char *oid,
 			/* Hash mismatch -> INVALID; runtime unavailable -> NOT_SUPPORTED.
 			 * Unverified bytes are NEVER compiled or run. */
 			free(mod_buf);
-			return nkvx_set_result(out, (enum spdk_kvdev_io_status)gate, 0, NULL, 0);
+			return nkvx_result_set(res, (enum spdk_kvdev_io_status)gate, 0, NULL, 0);
 		}
 		mod.bytes = mod_buf;
 		mod.bytes_len = mod_len;
@@ -403,7 +411,7 @@ nkvx_run_wasm(struct nkvx_executor *ex, const char *oid,
 		out_buf = malloc(osize);
 		if (out_buf == NULL) {
 			free(mod_buf);
-			return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_NOMEM, 0, NULL, 0);
+			return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_NOMEM, 0, NULL, 0);
 		}
 	}
 
@@ -424,12 +432,12 @@ nkvx_run_wasm(struct nkvx_executor *ex, const char *oid,
 		if (rc == -ENOENT) {
 			free(out_buf);
 			free(mod_buf);
-			return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_KEY_NOT_EXIST, 0, NULL, 0);
+			return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_KEY_NOT_EXIST, 0, NULL, 0);
 		}
 		if (rc < 0) {
 			free(out_buf);
 			free(mod_buf);
-			return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_FAILED, 0, NULL, 0);
+			return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_FAILED, 0, NULL, 0);
 		}
 		struct nkvx_obj_fill fill = { .ioctx = ex->ioctx, .oid = oid };
 
@@ -447,33 +455,37 @@ nkvx_run_wasm(struct nkvx_executor *ex, const char *oid,
 		(unsigned long long)stats.content_hits,
 		(unsigned long long)stats.warm_hits);
 
-	deliver = (osize < rlen) ? osize : rlen;
-	if (deliver > NKVX_INLINE_MAX) {
-		/* Large result -> front-sink bulk PUSH (Slice C7); not wired yet. */
-		fprintf(stderr, "nkvx_executor: wasm result %u > inline max %u — "
-			"NOT_SUPPORTED (Slice C7)\n", deliver, NKVX_INLINE_MAX);
+	deliver = spdk_min(osize, rlen);
+	/*
+	 * Adopt out_buf as the result (no second copy): the handler inlines it when
+	 * deliver <= NKVX_INLINE_MAX, else PUSHes it into the front's result_sink
+	 * (Slice C7). out_buf is osize bytes; only the first `deliver` are valid.
+	 */
+	if (deliver == 0) {
 		free(out_buf);
-		return nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED, 0, NULL, 0);
+		return nkvx_result_set(res, (enum spdk_kvdev_io_status)kvst, rlen, NULL, 0);
 	}
-	nkvx_set_result(out, (enum spdk_kvdev_io_status)kvst, rlen, out_buf, deliver);
-	free(out_buf);
+	res->status = (enum spdk_kvdev_io_status)kvst;
+	res->result_len = rlen;
+	res->buf = out_buf;		/* adopted; freed by nkvx_exec_result_free */
+	res->buf_len = deliver;
 	return 0;
 }
 
 int
 nkvx_executor_run(struct nkvx_executor *ex, const nkvx_exec_in_t *in,
-		  nkvx_exec_out_t *out)
+		  struct nkvx_exec_result *res)
 {
 	char oid[SPDK_KVDEV_EXEC_KEY_MAX_LEN * 2 + 1];
 
-	memset(out, 0, sizeof(*out));
+	memset(res, 0, sizeof(*res));
 
 	if (ex == NULL || in == NULL) {
-		nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_FAILED, 0, NULL, 0);
+		nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_FAILED, 0, NULL, 0);
 		return -EINVAL;
 	}
 	if (in->key_len == 0) {
-		nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
+		nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
 		return 0;
 	}
 
@@ -487,13 +499,13 @@ nkvx_executor_run(struct nkvx_executor *ex, const nkvx_exec_in_t *in,
 	if (in->runtime == (uint8_t)SPDK_KV_EXEC_RUNTIME_CLS &&
 	    in->module_ns != NULL && strcmp(in->module_ns, "nkvx") == 0 &&
 	    in->module_key != NULL) {
-		return nkvx_run_builtin(ex, oid, in->module_key, in->osize, out);
+		return nkvx_run_builtin(ex, oid, in->module_key, in->osize, res);
 	}
 
 	if (in->runtime == (uint8_t)SPDK_KV_EXEC_RUNTIME_WASM) {
-		return nkvx_run_wasm(ex, oid, in, out);
+		return nkvx_run_wasm(ex, oid, in, res);
 	}
 
-	nkvx_set_result(out, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
+	nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
 	return 0;
 }

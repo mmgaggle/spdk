@@ -117,18 +117,6 @@ kvdev_rados_nkvx_front_forward(struct nkvx_front *front,
 		return -EINVAL;
 	}
 
-	/*
-	 * Large input needs the front-origin bulk PULL path (Slice C7); not wired
-	 * yet. Report NOT_SUPPORTED through the normal completion so the tenant sees
-	 * INVALID_OPCODE rather than a torn request. Returns 0 (terminally handled).
-	 */
-	if (input_len > NKVX_INLINE_MAX) {
-		SPDK_WARNLOG("nkvx front: input_len %u > inline max %u; large-input bulk "
-			     "is Slice C7 — NOT_SUPPORTED\n", input_len, NKVX_INLINE_MAX);
-		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED, 0);
-		return 0;
-	}
-
 	ctx = calloc(1, sizeof(*ctx));
 	if (ctx == NULL) {
 		return -ENOMEM;
@@ -153,11 +141,21 @@ kvdev_rados_nkvx_front_forward(struct nkvx_front *front,
 	in.module_ns = (char *)module_ns;
 	in.osize = output_buf_len;
 	in.input_len = input_len;
-	in.input_inline = (void *)input;	/* borrowed; encoded synchronously */
-	in.input_bulk = HG_BULK_NULL;
-	in.result_sink = HG_BULK_NULL;
+	in.input_inline = (void *)input;	/* borrowed; registered/encoded synchronously */
+	in.input_bulk = HG_BULK_NULL;		/* originated by nkvx_front_forward */
+	in.result_sink = HG_BULK_NULL;		/* originated by nkvx_front_forward */
 
-	rc = nkvx_front_forward(front, &in, kvdev_rados_nkvx_front_done, ctx);
+	/*
+	 * Pass the tenant's host output buffer as the result sink (Slice C7): when it
+	 * can hold a large result (> NKVX_INLINE_MAX) the front client registers it
+	 * WRITE-mode and the executor PUSHes straight into it. A small result still
+	 * comes back inline and the done-cb copies it into host_out. Either way the
+	 * bytes land in this same buffer — no double delivery (the executor inlines
+	 * XOR pushes), and the done-cb's memcpy is a no-op on the push path (inline
+	 * is empty). Large input is likewise registered from in.input_inline.
+	 */
+	rc = nkvx_front_forward(front, &in, output_buf, output_buf_len,
+				kvdev_rados_nkvx_front_done, ctx);
 	if (rc != 0) {
 		free(ctx);
 		return rc;
