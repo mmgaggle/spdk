@@ -89,7 +89,8 @@ def add_parser(subparsers):
             pool_name=args.pool_name,
             namespace=args.namespace,
             uuid=args.uuid,
-            max_value_len=args.max_value_len))
+            max_value_len=args.max_value_len,
+            remote_executor=args.remote_executor))
 
     p = subparsers.add_parser('kvdev_rados_create', help='Create a librados-backed kvdev')
     p.add_argument('name', help='Name of the rados kvdev')
@@ -99,6 +100,9 @@ def add_parser(subparsers):
     p.add_argument('-u', '--uuid', dest='uuid', help='UUID of the kvdev (optional)')
     p.add_argument('-v', '--max-value-len', dest='max_value_len', type=int,
                    help='Maximum value length in bytes (0 for the 64 MB default)')
+    p.add_argument('--remote-executor', dest='remote_executor',
+                   help='rados-nkvx executor self-address for two-tier Exec over Mercury '
+                        '(Slice C4/C5; requires --with-mercury). Omit for single-tier (in-process).')
     p.set_defaults(func=kvdev_rados_create)
 
     def kvdev_rados_delete(args):
