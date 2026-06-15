@@ -121,10 +121,17 @@ main(int argc, char **argv)
 	int cancel_after = 0;			/* C6a: progress ticks before the cancel */
 	int poison_after_cancel = 0;		/* C6b: after an ABORTED cancel, poison the sink and
 						 * progress extra ticks; assert NO late PUSH overwrites it */
+	int input_len = 0;			/* F1 (spdk-8od): large-input Exec — input_len bytes of
+						 * registered input_bulk; with a small osize there is no
+						 * result_sink, so result_sink==NULL but input_bulk!=NULL */
+	int concurrent = 0;			/* F2 (spdk-8od): submit this many forwards CONCURRENTLY
+						 * (one front, same op_id -> distinct front call_ids), keep
+						 * all in flight, then cancel_all + drain */
 
 	enum { OPT_KEY = 256, OPT_RUNTIME, OPT_MODULE, OPT_MODULE_NS, OPT_OSIZE,
 	       OPT_EXPECT_RESULT, OPT_SHA256, OPT_EXPECT_SHA, OPT_ITERS, OPT_DISTINCT,
-	       OPT_CANCEL, OPT_CANCEL_AFTER, OPT_POISON_AFTER_CANCEL };
+	       OPT_CANCEL, OPT_CANCEL_AFTER, OPT_POISON_AFTER_CANCEL,
+	       OPT_INPUT_LEN, OPT_CONCURRENT };
 	static const struct option opts[] = {
 		{ "listen",        required_argument, NULL, 'l' },
 		{ "target",        required_argument, NULL, 't' },
@@ -143,6 +150,8 @@ main(int argc, char **argv)
 		{ "cancel",        no_argument,       NULL, OPT_CANCEL },
 		{ "cancel-after",  required_argument, NULL, OPT_CANCEL_AFTER },
 		{ "poison-after-cancel", required_argument, NULL, OPT_POISON_AFTER_CANCEL },
+		{ "input-len",     required_argument, NULL, OPT_INPUT_LEN },
+		{ "concurrent",    required_argument, NULL, OPT_CONCURRENT },
 		{ NULL,            0,                 NULL, 0 },
 	};
 	int c;
@@ -165,11 +174,14 @@ main(int argc, char **argv)
 		case OPT_CANCEL: cancel = 1; break;
 		case OPT_CANCEL_AFTER: cancel = 1; cancel_after = atoi(optarg); break;
 		case OPT_POISON_AFTER_CANCEL: poison_after_cancel = atoi(optarg); break;
+		case OPT_INPUT_LEN: input_len = atoi(optarg); break;
+		case OPT_CONCURRENT: concurrent = atoi(optarg); break;
 		default:
 			fprintf(stderr, "usage: %s --listen NA (--target ADDR | --addr-file PATH) "
 				"[--key K] [--runtime N] [--module M] [--module-ns NS] [--osize N] "
 				"[--sha256 HEX] [--expect N] [--expect-result N] [--expect-sha256 HEX] "
-				"[--iters N] [--cancel] [--cancel-after N] [--poison-after-cancel N]\n",
+				"[--iters N] [--cancel] [--cancel-after N] [--poison-after-cancel N] "
+				"[--input-len N] [--concurrent N]\n",
 				argv[0]);
 			return 2;
 		}
@@ -279,7 +291,152 @@ main(int argc, char **argv)
 	in.input_bulk = HG_BULK_NULL;
 	in.result_sink = HG_BULK_NULL;
 
+	/*
+	 * F1 (bead spdk-8od): a LARGE-INPUT Exec. When --input-len > NKVX_INLINE_MAX the
+	 * front registers in.input_inline as a READ-mode input_bulk and the executor PULLs
+	 * it; with a SMALL --osize (<= NKVX_INLINE_MAX) the result rides inline and NO
+	 * result_sink is registered. That is the exact F1 shape: result_sink == NULL but
+	 * input_bulk != NULL. The buffer must outlive the RPC (the executor PULLs it
+	 * asynchronously), so it lives here in main's frame until after the drain. The
+	 * backend never reads input bytes (executor.h), so the contents are immaterial;
+	 * we still fill them so a torn PULL would be observable in principle.
+	 */
+	unsigned char *inbuf = NULL;
+	if (input_len > 0) {
+		inbuf = malloc((size_t)input_len);
+		if (inbuf == NULL) {
+			fprintf(stderr, "test: out of memory for %d-byte input\n", input_len);
+			for (int b = 0; b < distinct; b++) {
+				free(sinks[b]);
+			}
+			free(sinks);
+			return 1;
+		}
+		memset(inbuf, 0x3C, (size_t)input_len);
+		in.input_len = (uint32_t)input_len;
+		in.input_inline = inbuf;
+	}
+
 	int ret = 1;
+
+	/*
+	 * ====================================================================
+	 * F2 (bead spdk-8od): same-op_id concurrent-cancel UAF guard. Submit `concurrent`
+	 * Execs on ONE front WITHOUT draining between them, so they are all in flight at
+	 * once. They share the SAME op_id (in.op_id == 0x4242), but the front assigns each
+	 * a DISTINCT front-unique client_call_id, which is what the executor keys its
+	 * cancel registry on. We keep them in flight via the executor PUSH-stall hook (the
+	 * caller sets NKVX_TEST_PUSH_STALL_TICKS and a large --osize so each registers a
+	 * result_sink and stalls pre-PUSH), then nkvx_front_cancel_all() and drain.
+	 *
+	 * REGRESSION SIGNAL: if the executor registry aliased the two same-op_id reqs (the
+	 * F2 bug — keyed on op_id, not client_call_id), the second cancel would match the
+	 * first req and the executor would ack the OTHER cancel ALREADY_DONE-as-duplicate,
+	 * so one of the two Execs would NOT get its own do-not-PUSH / ABORTED handshake.
+	 * With the fix each cancel finds its own req by client_call_id. The driver asserts
+	 * BOTH done-cbs fired EXACTLY once with ABORTED and outstanding drained to 0; the
+	 * shell harness additionally asserts the executor logged TWO DISTINCT cancelled
+	 * call_ids (no cross-abort / early ALREADY_DONE between the pair).
+	 * ====================================================================
+	 */
+	if (concurrent > 0) {
+		struct done_state *sts = calloc((size_t)concurrent, sizeof(*sts));
+		unsigned char **csinks = calloc((size_t)concurrent, sizeof(*csinks));
+		int k;
+
+		if (sts == NULL || csinks == NULL) {
+			fprintf(stderr, "test: out of memory for %d concurrent states\n", concurrent);
+			free(sts);
+			free(csinks);
+			goto done;
+		}
+		/* Each concurrent Exec gets its OWN sink DPTR (distinct buffers) so a per-call
+		 * cross-abort or late PUSH would be attributable; poison each up front. */
+		for (k = 0; k < concurrent; k++) {
+			csinks[k] = malloc((size_t)osize);
+			if (csinks[k] == NULL) {
+				fprintf(stderr, "test: out of memory for concurrent sink %d\n", k);
+				for (int j = 0; j < k; j++) {
+					free(csinks[j]);
+				}
+				free(csinks);
+				free(sts);
+				goto done;
+			}
+			memset(csinks[k], 0xA5, (size_t)osize);
+			sts[k].sink = csinks[k];
+			sts[k].sink_cap = (uint32_t)osize;
+		}
+
+		/* Submit ALL forwards FIRST (no drain between) so they are concurrently in
+		 * flight — same op_id, distinct front call_ids. */
+		for (k = 0; k < concurrent; k++) {
+			rc = nkvx_front_forward(front, &in, csinks[k], (uint32_t)osize,
+						on_done, &sts[k]);
+			if (rc != 0) {
+				fprintf(stderr, "test: concurrent forward %d failed: %d\n", k, rc);
+				goto f2_cleanup;
+			}
+		}
+		if (nkvx_front_outstanding(front) != (unsigned)concurrent) {
+			fprintf(stderr, "test: FAIL F2 (expected %d in flight, got %u)\n",
+				concurrent, nkvx_front_outstanding(front));
+			goto f2_cleanup;
+		}
+		printf("test: F2 submitted %d concurrent Execs (same op_id=0x%04x, distinct "
+		       "front call_ids), all in flight\n", concurrent, in.op_id);
+
+		/* A few ticks so each req reaches the executor and registers (PUSH stalled). */
+		for (int i = 0; i < cancel_after; i++) {
+			(void)nkvx_front_progress(front, 1);
+		}
+
+		/* Cancel ALL in-flight Execs (the channel-destroy primitive). Each must run
+		 * its OWN two-phase handshake against its OWN executor req. */
+		nkvx_front_cancel_all(front);
+
+		/* Drive progress until both halves of every join resolve (outstanding -> 0). */
+		for (int i = 0; i < 200000 && nkvx_front_outstanding(front) != 0; i++) {
+			if (nkvx_front_progress(front, 100) < 0) {
+				fprintf(stderr, "test: F2 progress failed\n");
+				goto f2_cleanup;
+			}
+		}
+		if (nkvx_front_outstanding(front) != 0) {
+			fprintf(stderr, "test: FAIL F2 (%u Exec(s) still in flight after "
+				"cancel_all + drain — a same-op_id cancel did not resolve)\n",
+				nkvx_front_outstanding(front));
+			goto f2_cleanup;
+		}
+
+		/* Each Exec's tenant cb must have fired EXACTLY once, with ABORTED. If the
+		 * registry aliased the pair, one cb would be missing or mis-statused. */
+		for (k = 0; k < concurrent; k++) {
+			if (!sts[k].called || sts[k].calls != 1) {
+				fprintf(stderr, "test: FAIL F2 (Exec %d done-cb fired %d time(s), "
+					"expected exactly 1 — same-op_id cancels aliased?)\n",
+					k, sts[k].calls);
+				goto f2_cleanup;
+			}
+			if ((int)sts[k].status != SPDK_KVDEV_IO_STATUS_ABORTED) {
+				fprintf(stderr, "test: FAIL F2 (Exec %d status %d != ABORTED(%d) — "
+					"a same-op_id cancel hit the wrong req)\n",
+					k, (int)sts[k].status, SPDK_KVDEV_IO_STATUS_ABORTED);
+				goto f2_cleanup;
+			}
+		}
+		printf("test: F2 PASS (%d concurrent same-op_id Execs each cancelled "
+		       "independently -> exactly-once ABORTED, drained)\n", concurrent);
+		ret = 0;
+
+f2_cleanup:
+		for (k = 0; k < concurrent; k++) {
+			free(csinks[k]);
+		}
+		free(csinks);
+		free(sts);
+		goto done;
+	}
 
 	/*
 	 * Run `iters` Execs SEQUENTIALLY on the SAME front, round-robining `distinct`
@@ -499,5 +656,6 @@ done:
 		free(sinks[b]);
 	}
 	free(sinks);
+	free(inbuf);
 	return ret;
 }

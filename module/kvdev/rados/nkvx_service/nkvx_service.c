@@ -78,6 +78,19 @@ static hg_class_t *g_hg_class;
  */
 static unsigned int g_test_push_stall_ticks;
 
+/*
+ * Slice C6b TEST hook (PULL side, bead spdk-8od): the symmetric tick-deferral for
+ * the large-INPUT PULL. When NKVX_TEST_PULL_STALL_TICKS is set, the executor holds
+ * back the input PULL for that many progress ticks so a cancel deterministically
+ * lands while a large-input Exec's PULL is registered-but-not-yet-on-the-wire (or,
+ * with HG_Bulk_cancel of the live PULL, mid-flight — Case c). This is the F1
+ * regression guard's lever: a large-input / inline-or-small-result Exec has a live
+ * input_bulk but NO result_sink, and the front must still run the cancel handshake
+ * (NOT skip phase 2 on result_sink==NULL alone). Same single-threaded tick-deferral
+ * as the PUSH hook — NOT usleep. Read once in main(). 0 == no-op.
+ */
+static unsigned int g_test_pull_stall_ticks;
+
 static void
 on_signal(int sig)
 {
@@ -141,6 +154,9 @@ struct nkvx_req {
 
 	unsigned int		stall_ticks;	/* TEST: progress ticks to defer the PUSH (g_test_push_stall_ticks) */
 	bool			push_pending;	/* TEST: PUSH deferred by stall_ticks, awaiting the countdown */
+
+	unsigned int		pull_stall_ticks; /* TEST: progress ticks to defer the input PULL (g_test_pull_stall_ticks) */
+	bool			pull_pending;	/* TEST: input PULL deferred by pull_stall_ticks, awaiting the countdown */
 };
 
 /*
@@ -245,8 +261,9 @@ nkvx_req_finish(struct nkvx_req *req)
 		cout.ack = req->had_push_canceled ? NKVX_CANCEL_PUSH_CANCELED
 						  : NKVX_CANCEL_ABORTED;
 		fprintf(stderr,
-			"nkvx_service: cancel ack op_id=%u case=%c (no PUSH after ack)\n",
-			req->op_id, req->had_push_canceled ? 'c' : 'b');
+			"nkvx_service: cancel ack op_id=%u call_id=%lu case=%c (no PUSH after ack)\n",
+			req->op_id, (unsigned long)req->call_id,
+			req->had_push_canceled ? 'c' : 'b');
 		ret = HG_Respond(req->cancel_handle, NULL, NULL, &cout);
 		if (ret != HG_SUCCESS) {
 			fprintf(stderr, "nkvx_service: cancel HG_Respond failed: %s\n",
@@ -473,6 +490,66 @@ nkvx_input_pulled_cb(const struct hg_cb_info *info)
 	return HG_SUCCESS;
 }
 
+/*
+ * Submit the large-input PULL from the front's READ-registered input_bulk (design
+ * §1.3). Factored out of nkvx_exec_handler so the bead spdk-8od TEST PULL stall hook
+ * can defer the actual transfer by a few progress ticks while keeping the do-not-PUSH
+ * gate and the op-id capture in ONE place — exactly mirroring nkvx_submit_result_push
+ * on the PUSH side. Continues from nkvx_input_pulled_cb. Returns 0 on success or
+ * -1 if the request was already terminated (failed) here.
+ */
+static int
+nkvx_submit_input_pull(struct nkvx_req *req)
+{
+	hg_class_t *cls = HG_Get_info(req->handle)->hg_class;
+	hg_size_t sz = req->in.input_len;
+	void *p;
+	hg_return_t ret;
+
+	/*
+	 * Slice C6b do-not-PUSH gate (bead spdk-8od): re-checked here because a cancel
+	 * may have arrived during the stall, before the PULL ever went on the wire. The
+	 * front has stopped waiting and is about to release the input MR; never PULL
+	 * from a buffer it may be reusing — finish ABORTED (routed through the ack
+	 * chokepoint, which acks the pending cancel). This is the PULL-side analogue of
+	 * the PUSH do-not-PUSH gate. */
+	if (req->do_not_push) {
+		fprintf(stderr, "nkvx_service: op_id=%u do_not_push set (case b) "
+			"— input PULL skipped, no late PULL\n", req->op_id);
+		nkvx_req_fail(req, SPDK_KVDEV_IO_STATUS_ABORTED);
+		return -1;
+	}
+
+	req->input_buf = malloc(req->in.input_len);
+	if (req->input_buf == NULL) {
+		nkvx_req_fail(req, SPDK_KVDEV_IO_STATUS_NOMEM);
+		return -1;
+	}
+	p = req->input_buf;
+	ret = HG_Bulk_create(cls, 1, &p, &sz, HG_BULK_WRITE_ONLY, &req->local_input);
+	if (ret != HG_SUCCESS) {
+		fprintf(stderr, "nkvx_service: HG_Bulk_create(input) failed: %s\n",
+			HG_Error_to_string(ret));
+		nkvx_req_fail(req, SPDK_KVDEV_IO_STATUS_FAILED);
+		return -1;
+	}
+	/* Slice C6b: capture the PULL op id (&req->push_op) and mark in-flight so a
+	 * cancel during the input PULL HG_Bulk_cancels it for prompt/symmetric
+	 * teardown (the cb clears push_in_flight). */
+	req->push_in_flight = true;
+	ret = HG_Bulk_transfer(req->ctx, nkvx_input_pulled_cb, req,
+			       HG_BULK_PULL, req->origin, req->in.input_bulk, 0,
+			       req->local_input, 0, sz, &req->push_op);
+	if (ret != HG_SUCCESS) {
+		req->push_in_flight = false;
+		fprintf(stderr, "nkvx_service: HG_Bulk_transfer(PULL) failed: %s\n",
+			HG_Error_to_string(ret));
+		nkvx_req_fail(req, SPDK_KVDEV_IO_STATUS_FAILED);
+		return -1;
+	}
+	return 0;	/* continue from nkvx_input_pulled_cb */
+}
+
 static hg_return_t
 nkvx_exec_handler(hg_handle_t handle)
 {
@@ -515,6 +592,7 @@ nkvx_exec_handler(hg_handle_t handle)
 	req->cancel_handle = HG_HANDLE_NULL;
 	req->push_op = HG_OP_ID_NULL;
 	req->stall_ticks = g_test_push_stall_ticks;
+	req->pull_stall_ticks = g_test_pull_stall_ticks;
 	nkvx_reg_insert(req);
 
 	if (g_executor == NULL) {
@@ -538,38 +616,23 @@ nkvx_exec_handler(hg_handle_t handle)
 	 * input_bulk into a local buffer BEFORE running. Small input rode inline.
 	 */
 	if (req->in.input_bulk != HG_BULK_NULL && req->in.input_len > NKVX_INLINE_MAX) {
-		hg_class_t *cls = info->hg_class;
-		hg_size_t sz = req->in.input_len;
-		void *p;
-
-		req->input_buf = malloc(req->in.input_len);
-		if (req->input_buf == NULL) {
-			nkvx_req_fail(req, SPDK_KVDEV_IO_STATUS_NOMEM);
-			return HG_SUCCESS;
+		/*
+		 * Bead spdk-8od TEST PULL stall hook (tick-deferral): hold the input PULL
+		 * back for pull_stall_ticks progress ticks so a cancel deterministically
+		 * lands while the req is registered but the PULL is not yet on the wire
+		 * (Case b — do_not_push). The progress loop decrements the countdown and
+		 * submits at 0 (or skips it if a cancel set do_not_push meanwhile). This is
+		 * the F1 regression lever: a large-input / inline-result Exec has a live
+		 * input_bulk but NO result_sink, so the front MUST still run the cancel
+		 * handshake. A no-op unless NKVX_TEST_PULL_STALL_TICKS was set. */
+		if (req->pull_stall_ticks > 0) {
+			req->pull_pending = true;
+			fprintf(stderr, "nkvx_service: op_id=%u input PULL stalled %u tick(s) (test)\n",
+				req->op_id, req->pull_stall_ticks);
+			return HG_SUCCESS;	/* continue from the stall-tick countdown */
 		}
-		p = req->input_buf;
-		ret = HG_Bulk_create(cls, 1, &p, &sz, HG_BULK_WRITE_ONLY, &req->local_input);
-		if (ret != HG_SUCCESS) {
-			fprintf(stderr, "nkvx_service: HG_Bulk_create(input) failed: %s\n",
-				HG_Error_to_string(ret));
-			nkvx_req_fail(req, SPDK_KVDEV_IO_STATUS_FAILED);
-			return HG_SUCCESS;
-		}
-		/* Slice C6b: capture the PULL op id (&req->push_op) and mark in-flight so a
-		 * cancel during the input PULL HG_Bulk_cancels it for prompt/symmetric
-		 * teardown (the cb clears push_in_flight). */
-		req->push_in_flight = true;
-		ret = HG_Bulk_transfer(req->ctx, nkvx_input_pulled_cb, req,
-				       HG_BULK_PULL, req->origin, req->in.input_bulk, 0,
-				       req->local_input, 0, sz, &req->push_op);
-		if (ret != HG_SUCCESS) {
-			req->push_in_flight = false;
-			fprintf(stderr, "nkvx_service: HG_Bulk_transfer(PULL) failed: %s\n",
-				HG_Error_to_string(ret));
-			nkvx_req_fail(req, SPDK_KVDEV_IO_STATUS_FAILED);
-			return HG_SUCCESS;
-		}
-		return HG_SUCCESS;	/* continue from nkvx_input_pulled_cb */
+		(void)nkvx_submit_input_pull(req);
+		return HG_SUCCESS;	/* continue from nkvx_input_pulled_cb (or already failed) */
 	}
 
 	nkvx_req_run_and_deliver(req);
@@ -658,8 +721,8 @@ nkvx_cancel_handler(hg_handle_t handle)
 		/* (c) A bulk op (result PUSH or input PULL) is on the wire: cancel it. The
 		 * cb resolves HG_CANCELED (or HG_SUCCESS if it raced to completion) and
 		 * routes to nkvx_req_finish, which acks post-quiesce. */
-		fprintf(stderr, "nkvx_service: cancel op_id=%u case=c (PUSH in flight) "
-			"— HG_Bulk_cancel\n", req->op_id);
+		fprintf(stderr, "nkvx_service: cancel op_id=%u call_id=%lu case=c (PUSH in flight) "
+			"— HG_Bulk_cancel\n", req->op_id, (unsigned long)req->call_id);
 		ret = HG_Bulk_cancel(req->push_op);
 		if (ret != HG_SUCCESS) {
 			/* The cancel could not be issued; the bulk cb will still fire
@@ -675,8 +738,8 @@ nkvx_cancel_handler(hg_handle_t handle)
 		 * do-not-PUSH. The gate in run_and_deliver / nkvx_submit_result_push (or a
 		 * stalled PUSH whose countdown expires) finishes it ABORTED, and the
 		 * chokepoint sends the ABORTED ack. */
-		fprintf(stderr, "nkvx_service: cancel op_id=%u case=b (no PUSH in flight) "
-			"— do_not_push\n", req->op_id);
+		fprintf(stderr, "nkvx_service: cancel op_id=%u call_id=%lu case=b (no PUSH in flight) "
+			"— do_not_push\n", req->op_id, (unsigned long)req->call_id);
 		req->do_not_push = true;
 	}
 	return HG_SUCCESS;
@@ -744,26 +807,55 @@ publish_self_addr(hg_class_t *hg, const char *addr_file)
 }
 
 /*
- * Slice C6b TEST stall hook: per progress tick, advance the deferral countdown of
- * any PUSH-stalled req and, at 0, submit its PUSH (or skip it if a cancel set
- * do_not_push in the meantime — which finishes it ABORTED). Submitting/finishing
- * may remove the req from g_inflight, so walk it safely. A no-op unless
- * NKVX_TEST_PUSH_STALL_TICKS was set (g_test_push_stall_ticks).
+ * Slice C6b / bead spdk-8od TEST stall hook: per progress tick, advance the deferral
+ * countdown of any PUSH-stalled OR input-PULL-stalled req and, at 0, submit its PUSH
+ * / PULL (or skip it if a cancel set do_not_push in the meantime — which finishes it
+ * ABORTED). Submitting/finishing may remove the req from g_inflight, so walk it
+ * safely. A no-op unless NKVX_TEST_PUSH_STALL_TICKS or NKVX_TEST_PULL_STALL_TICKS was
+ * set. A given req is in at most one of the two stall states (PULL precedes the run
+ * which precedes the PUSH), so the two branches never both fire for the same req.
  */
 static void
 nkvx_service_tick_stalls(void)
 {
 	struct nkvx_req *req, *next;
 
-	if (g_test_push_stall_ticks == 0) {
+	if (g_test_push_stall_ticks == 0 && g_test_pull_stall_ticks == 0) {
 		return;
 	}
 	req = TAILQ_FIRST(&g_inflight);
 	while (req != NULL) {
 		next = TAILQ_NEXT(req, reg_link);
-		if (req->push_pending) {
+		if (req->pull_pending) {
+			/* bead spdk-8od PULL-side tick-deferral (mirrors the PUSH branch). */
 			if (req->do_not_push) {
-				/* A cancel landed during the stall (Case b): never PUSH. */
+				/* A cancel landed during the PULL stall (Case b): never PULL. */
+				req->pull_pending = false;
+				fprintf(stderr, "nkvx_service: op_id=%u do_not_push set during "
+					"stall (case b) — input PULL skipped, no late PULL\n",
+					req->op_id);
+				nkvx_req_fail(req, SPDK_KVDEV_IO_STATUS_ABORTED);
+			} else if (req->pull_stall_ticks > 0) {
+				req->pull_stall_ticks--;
+			} else {
+				/* Countdown expired with no cancel: submit the real PULL now. */
+				req->pull_pending = false;
+				(void)nkvx_submit_input_pull(req);
+			}
+		} else if (req->push_pending) {
+			if (req->do_not_push && req->stall_ticks == 0) {
+				/*
+				 * A cancel landed during the stall (Case b): never PUSH. We let the
+				 * remaining stall_ticks drain FIRST (the else-if below still runs
+				 * while do_not_push is set) so the req stays REGISTERED for the rest
+				 * of the stall window before we reap it ABORTED. This faithfully
+				 * models a req whose (now-cancelled) transfer would still have held
+				 * the executor's remote view for its duration, and — load-bearing for
+				 * the F2 same-op_id guard (bead spdk-8od) — keeps BOTH same-op_id reqs
+				 * registered long enough that a concurrent second cancel is looked up
+				 * against a still-live registry (so a buggy op_id-keyed registry
+				 * visibly aliases). The no-late-PUSH invariant is unaffected: the PUSH
+				 * is never submitted. */
 				req->push_pending = false;
 				fprintf(stderr, "nkvx_service: op_id=%u do_not_push set during "
 					"stall (case b) — PUSH skipped, no late PUSH\n", req->op_id);
@@ -899,6 +991,16 @@ main(int argc, char **argv)
 				g_test_push_stall_ticks = (unsigned int)v;
 				fprintf(stderr, "nkvx_service: TEST PUSH stall = %u tick(s)\n",
 					g_test_push_stall_ticks);
+			}
+		}
+		/* bead spdk-8od: the symmetric PULL-side stall (F1 input-bulk cancel guard). */
+		st = getenv("NKVX_TEST_PULL_STALL_TICKS");
+		if (st != NULL) {
+			long v = strtol(st, NULL, 10);
+			if (v > 0) {
+				g_test_pull_stall_ticks = (unsigned int)v;
+				fprintf(stderr, "nkvx_service: TEST PULL stall = %u tick(s)\n",
+					g_test_pull_stall_ticks);
 			}
 		}
 	}
