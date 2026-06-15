@@ -27,6 +27,16 @@ CFLAGS  := -g -O0 -std=gnu11 -Wall -Wextra -Werror -I$(SPDK_ROOT)/include $(MERC
 # PUSH landed correctly (content-hash, design §1.3 NORMATIVE-ordering check).
 LDFLAGS := $(MERCURY_LIBS) -lcrypto -Wl,-rpath,$(MERCURY_PREFIX)/lib
 
+# Slice C8 (bead spdk-xmu.8): `make ASAN=1` instruments the FRONT driver
+# (origin-side cancel/teardown) with AddressSanitizer too, so the abort path is
+# ASan-clean on BOTH tiers (front + executor) under the C8 harness. Same caveat
+# as the executor Makefile: the ASan and normal builds share the output path
+# (nkvx_front_client_test), so they are not co-resident.
+ifeq ($(ASAN),1)
+CFLAGS  += -fsanitize=address -fno-omit-frame-pointer
+LDFLAGS += -fsanitize=address
+endif
+
 BIN  := nkvx_front_client_test
 SRCS := nkvx_front_client_test.c nkvx_front_client.c nkvx_exec_rpc.c
 HDRS := nkvx_front_client.h nkvx_exec_rpc.h

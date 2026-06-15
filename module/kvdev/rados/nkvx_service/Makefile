@@ -30,6 +30,19 @@ CFLAGS  := -g -O0 -std=gnu11 -Wall -Wextra -Werror -Wno-comment \
            -I$(SPDK_ROOT)/include -I$(RADOS_DIR) -I$(RADOS_DIR)/wasmtime/include $(MERCURY_CFLAGS)
 LDFLAGS := $(MERCURY_LIBS) -Wl,-rpath,$(MERCURY_PREFIX)/lib
 
+# Slice C8 (bead spdk-xmu.8): ASan build of the executor for the on-rig verbs
+# acceptance run (abort/cancel ASan-clean over verbs). `make ASAN=1` adds
+# AddressSanitizer + frame pointers to BOTH compile and link so the produced
+# nkvx_service is the instrumented binary the C8 harness drives under verbs.
+# Off-rig we dry-validate the same binary on na+sm:// and ofi+tcp://127.0.0.1.
+# The ASan build lands in the SAME path (nkvx_service) — a normal `make` (no
+# ASAN=1) overwrites it back to the uninstrumented binary, so the two builds are
+# not co-resident; the C8 harness rebuilds with the flavor it needs.
+ifeq ($(ASAN),1)
+CFLAGS  += -fsanitize=address -fno-omit-frame-pointer
+LDFLAGS += -fsanitize=address
+endif
+
 CONTRACT := $(RADOS_DIR)/nkvx_exec_rpc.c
 HEADER   := $(RADOS_DIR)/nkvx_exec_rpc.h
 
