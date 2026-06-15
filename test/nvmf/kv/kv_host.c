@@ -199,6 +199,16 @@ main(int argc, char **argv)
 	opts.opts_size = sizeof(opts);
 	spdk_env_opts_init(&opts);
 	opts.name = "kv_host";
+	/* On a host without configured hugepages (e.g. a shared rig running the
+	 * target with --no-huge), let the harness drive the initiator the same way
+	 * via KV_HOST_NO_HUGE=1 + optional KV_HOST_MEM_MB. */
+	if (getenv("KV_HOST_NO_HUGE") != NULL) {
+		const char *mb = getenv("KV_HOST_MEM_MB");
+
+		opts.no_huge = true;
+		opts.mem_size = mb != NULL ? atoi(mb) : 1024;
+		opts.hugepage_single_segments = false;
+	}
 	if (spdk_env_init(&opts) < 0) {
 		fprintf(stderr, "Unable to initialize SPDK env\n");
 		return 1;

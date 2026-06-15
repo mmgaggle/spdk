@@ -2454,6 +2454,261 @@ test_nkvx_dispatch_without_thread_fails(void)
 	kvdev_rados_nkvx_stop();
 }
 
+/* ==========================================================================
+ * spdk-k3z: cross-consumer RESULT cache.
+ *
+ * These tests exercise the executor's result-cache API directly (the same
+ * key/lookup/insert the reactor-side datapath calls in kvdev_rados.c, just driven
+ * without librados). They prove the acceptance criteria DETERMINISTICALLY:
+ *   - cross-consumer hit: an IDENTICAL (module, object content, input) request
+ *     misses once (compute) then hits (no recompute); a measured hit rate is
+ *     reported;
+ *   - a DIFFERENT input  -> MISS (no stale hit);
+ *   - a CHANGED OBJECT (different content under the SAME oid) -> MISS / no stale;
+ *   - the DISABLED knob path -> lookup always misses (recompute), insert no-ops,
+ *     and the recomputed answer is identical.
+ *
+ * "Compute" here is the bytecount built-in (object length as LE u64): a pure,
+ * deterministic function of the object bytes, so a cache hit MUST reproduce the
+ * recompute byte-for-byte.
+ * ========================================================================== */
+
+/* Recompute the bytecount built-in's answer for (object) into out[8]; returns the
+ * true result length and status, exactly as a real off-reactor run would. */
+static int
+nkvx_recompute_bytecount(const void *object, size_t object_len,
+			 void *out, uint32_t out_len, uint32_t *result_len)
+{
+	return kvdev_rados_nkvx_run_module(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL,
+					   NULL, NULL, object, object_len,
+					   out, out_len, result_len);
+}
+
+/*
+ * The cross-consumer flow the datapath runs: build the key from the object
+ * CONTENT + input; on a lookup MISS recompute and insert; on a HIT serve the
+ * memoized bytes. Returns the served (status,len,bytes) and whether it was a hit.
+ */
+static bool
+nkvx_result_consume(const char *module, const uint8_t *mod_sha256,
+		    const void *object, size_t object_len,
+		    const void *input, size_t input_len,
+		    uint8_t out[8], uint32_t *out_len, int *status)
+{
+	struct kvdev_rados_nkvx_result_key key;
+	bool hit;
+
+	CU_ASSERT(kvdev_rados_nkvx_result_key(module, mod_sha256, object, object_len,
+					      input, input_len, &key) == 0);
+
+	hit = kvdev_rados_nkvx_result_lookup(&key, out, 8, out_len, status);
+	if (!hit) {
+		*status = nkvx_recompute_bytecount(object, object_len, out, 8, out_len);
+		kvdev_rados_nkvx_result_insert(&key, *status, *out_len, out, 8);
+	}
+	return hit;
+}
+
+/* Cross-consumer HIT + correctness: same (module,object,input) from two distinct
+ * "consumers" -> 1st miss/compute, 2nd hit/no-recompute, identical answer. */
+static void
+test_nkvx_result_cache_cross_consumer_hit(void)
+{
+	static const uint8_t obj[] = "the-object-bytes-1234567890";
+	static const uint8_t input[] = "req-input-A";
+	uint8_t a[8] = {0}, b[8] = {0};
+	uint32_t alen = 0, blen = 0;
+	int astatus = 0, bstatus = 0;
+	struct kvdev_rados_nkvx_result_stats st;
+	bool hit_a, hit_b;
+
+	setenv(KVDEV_RADOS_NKVX_RESULT_CACHE_ENV, "1", 1);
+	kvdev_rados_nkvx_result_cache_reset();
+	CU_ASSERT(kvdev_rados_nkvx_result_cache_enabled());
+
+	/* Consumer #1: MISS -> compute + insert. */
+	hit_a = nkvx_result_consume(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL,
+				    obj, sizeof(obj), input, sizeof(input),
+				    a, &alen, &astatus);
+	CU_ASSERT(!hit_a);
+	CU_ASSERT(astatus == SPDK_KVDEV_IO_STATUS_SUCCESS);
+	CU_ASSERT(alen == 8);
+	CU_ASSERT(*(uint64_t *)a == (uint64_t)sizeof(obj));	/* bytecount correctness */
+
+	/* Consumer #2 (DISTINCT consumer, same request): HIT -> served WITHOUT
+	 * recompute. The memoized answer is byte-identical to consumer #1's. */
+	hit_b = nkvx_result_consume(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL,
+				    obj, sizeof(obj), input, sizeof(input),
+				    b, &blen, &bstatus);
+	CU_ASSERT(hit_b);
+	CU_ASSERT(bstatus == astatus);
+	CU_ASSERT(blen == alen);
+	CU_ASSERT(memcmp(a, b, 8) == 0);
+
+	kvdev_rados_nkvx_result_get_stats(&st);
+	CU_ASSERT(st.hits == 1);
+	CU_ASSERT(st.misses == 1);
+	CU_ASSERT(st.inserts == 1);
+	printf("\n    k3z cross-consumer: 2 identical requests from distinct consumers -> "
+	       "1 miss/compute + 1 HIT/no-recompute; hit-rate=%.0f%% (hits=%" PRIu64
+	       " misses=%" PRIu64 ")\n",
+	       100.0 * (double)st.hits / (double)(st.hits + st.misses), st.hits, st.misses);
+
+	unsetenv(KVDEV_RADOS_NKVX_RESULT_CACHE_ENV);
+	kvdev_rados_nkvx_result_cache_reset();
+}
+
+/* A DIFFERENT input is a genuine MISS (no stale hit), and yields its own entry. */
+static void
+test_nkvx_result_cache_different_input_misses(void)
+{
+	static const uint8_t obj[] = "shared-object-bytes";
+	uint8_t out[8] = {0};
+	uint32_t len = 0;
+	int status = 0;
+	struct kvdev_rados_nkvx_result_stats st;
+
+	setenv(KVDEV_RADOS_NKVX_RESULT_CACHE_ENV, "1", 1);
+	kvdev_rados_nkvx_result_cache_reset();
+
+	/* Prime with input A. */
+	CU_ASSERT(!nkvx_result_consume(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL,
+				       obj, sizeof(obj), "AAAA", 4, out, &len, &status));
+	/* Same object, DIFFERENT input -> MISS (logically different request). */
+	CU_ASSERT(!nkvx_result_consume(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL,
+				       obj, sizeof(obj), "BBBB", 4, out, &len, &status));
+	/* Re-issue input A -> now a HIT (proves A was cached and B did not clobber it). */
+	CU_ASSERT(nkvx_result_consume(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL,
+				      obj, sizeof(obj), "AAAA", 4, out, &len, &status));
+
+	kvdev_rados_nkvx_result_get_stats(&st);
+	CU_ASSERT(st.misses == 2);	/* A, then B */
+	CU_ASSERT(st.hits == 1);	/* A re-issue */
+	CU_ASSERT(st.inserts == 2);
+	printf("\n    k3z different-input: input A primed, input B MISSED (not a stale A hit), "
+	       "A re-issue HIT\n");
+
+	unsetenv(KVDEV_RADOS_NKVX_RESULT_CACHE_ENV);
+	kvdev_rados_nkvx_result_cache_reset();
+}
+
+/*
+ * THE adversarial-reviewer case: the SAME oid is overwritten with DIFFERENT
+ * CONTENT. Because the key uses object CONTENT identity (not the bare oid), the
+ * second request MISSES and recomputes — it never returns the stale first result.
+ * This is what makes the result cache coherent with an in-place Store.
+ */
+static void
+test_nkvx_result_cache_changed_object_no_stale(void)
+{
+	static const uint8_t v1[] = "version-one";			/* len 12 incl NUL */
+	static const uint8_t v2[] = "version-two-is-longer-here";	/* different content+len */
+	static const uint8_t input[] = "x";
+	uint8_t out1[8] = {0}, out2[8] = {0};
+	uint32_t len1 = 0, len2 = 0;
+	int s1 = 0, s2 = 0;
+	struct kvdev_rados_nkvx_result_stats st;
+
+	setenv(KVDEV_RADOS_NKVX_RESULT_CACHE_ENV, "1", 1);
+	kvdev_rados_nkvx_result_cache_reset();
+
+	/* Compute over v1, cache it. */
+	CU_ASSERT(!nkvx_result_consume(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL,
+				       v1, sizeof(v1), input, sizeof(input),
+				       out1, &len1, &s1));
+	CU_ASSERT(*(uint64_t *)out1 == (uint64_t)sizeof(v1));
+
+	/* Same oid in the datapath, but the CONTENT changed (v2). The key is over the
+	 * content, so this MISSES and recomputes the v2 answer — NOT the stale v1. */
+	CU_ASSERT(!nkvx_result_consume(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL,
+				       v2, sizeof(v2), input, sizeof(input),
+				       out2, &len2, &s2));
+	CU_ASSERT(*(uint64_t *)out2 == (uint64_t)sizeof(v2));
+	CU_ASSERT(memcmp(out1, out2, 8) != 0);	/* distinct answers, no stale hit */
+
+	kvdev_rados_nkvx_result_get_stats(&st);
+	CU_ASSERT(st.misses == 2);
+	CU_ASSERT(st.hits == 0);
+	printf("\n    k3z changed-object: same oid, content v1->v2 -> 2nd request MISSED and "
+	       "recomputed (no stale v1 result)\n");
+
+	unsetenv(KVDEV_RADOS_NKVX_RESULT_CACHE_ENV);
+	kvdev_rados_nkvx_result_cache_reset();
+}
+
+/* The DISABLED knob: lookup always misses, insert is a no-op, and the recomputed
+ * answer is identical to the enabled path (correctness preserved, just no memo). */
+static void
+test_nkvx_result_cache_disabled_recomputes(void)
+{
+	static const uint8_t obj[] = "disabled-knob-object";
+	static const uint8_t input[] = "in";
+	uint8_t en[8] = {0}, dis1[8] = {0}, dis2[8] = {0};
+	uint32_t lenE = 0, lenD1 = 0, lenD2 = 0;
+	int sE = 0, sD1 = 0, sD2 = 0;
+	struct kvdev_rados_nkvx_result_stats st;
+
+	/* Reference answer with the cache ENABLED. */
+	setenv(KVDEV_RADOS_NKVX_RESULT_CACHE_ENV, "1", 1);
+	kvdev_rados_nkvx_result_cache_reset();
+	nkvx_result_consume(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL, obj, sizeof(obj),
+			    input, sizeof(input), en, &lenE, &sE);
+
+	/* Now DISABLE and issue the SAME request twice. */
+	setenv(KVDEV_RADOS_NKVX_RESULT_CACHE_ENV, "0", 1);
+	kvdev_rados_nkvx_result_cache_reset();
+	CU_ASSERT(!kvdev_rados_nkvx_result_cache_enabled());
+
+	CU_ASSERT(!nkvx_result_consume(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL,
+				       obj, sizeof(obj), input, sizeof(input),
+				       dis1, &lenD1, &sD1));
+	/* Even a SECOND identical request misses (disabled => nothing memoized). */
+	CU_ASSERT(!nkvx_result_consume(KVDEV_RADOS_NKVX_MODULE_BYTECOUNT, NULL,
+				       obj, sizeof(obj), input, sizeof(input),
+				       dis2, &lenD2, &sD2));
+
+	/* Recomputed answers identical to the enabled path. */
+	CU_ASSERT(sD1 == sE && sD2 == sE);
+	CU_ASSERT(lenD1 == lenE && lenD2 == lenE);
+	CU_ASSERT(memcmp(dis1, en, 8) == 0 && memcmp(dis2, en, 8) == 0);
+
+	kvdev_rados_nkvx_result_get_stats(&st);
+	CU_ASSERT(st.inserts == 0);	/* disabled => never memoized */
+	CU_ASSERT(st.hits == 0);
+	printf("\n    k3z disabled-knob: SPDK_NKVX_RESULT_CACHE=0 -> 2 identical requests both "
+	       "recomputed (inserts=0, hits=0), answers identical to enabled path\n");
+
+	unsetenv(KVDEV_RADOS_NKVX_RESULT_CACHE_ENV);
+	kvdev_rados_nkvx_result_cache_reset();
+}
+
+/* Module IDENTITY is part of the key: a verified-wasm sha256 vs a built-in
+ * (NULL sha256) of the same NAME must NOT alias, and two different sha256 must
+ * not alias. Pure key-level proof (no run needed). */
+static void
+test_nkvx_result_cache_module_identity_in_key(void)
+{
+	static const uint8_t obj[] = "obj";
+	uint8_t shaA[SPDK_KV_EXEC_SHA256_LEN];
+	uint8_t shaB[SPDK_KV_EXEC_SHA256_LEN];
+	struct kvdev_rados_nkvx_result_key k_builtin, k_wasmA, k_wasmB;
+
+	memset(shaA, 0xAA, sizeof(shaA));
+	memset(shaB, 0xBB, sizeof(shaB));
+
+	CU_ASSERT(kvdev_rados_nkvx_result_key("wasm:bytecount", NULL, obj, sizeof(obj),
+					      NULL, 0, &k_builtin) == 0);
+	CU_ASSERT(kvdev_rados_nkvx_result_key("wasm:bytecount", shaA, obj, sizeof(obj),
+					      NULL, 0, &k_wasmA) == 0);
+	CU_ASSERT(kvdev_rados_nkvx_result_key("wasm:bytecount", shaB, obj, sizeof(obj),
+					      NULL, 0, &k_wasmB) == 0);
+
+	/* built-in (no sha) != verified-wasm (sha), and different sha differ. */
+	CU_ASSERT(memcmp(k_builtin.digest, k_wasmA.digest, SPDK_KV_EXEC_SHA256_LEN) != 0);
+	CU_ASSERT(memcmp(k_wasmA.digest, k_wasmB.digest, SPDK_KV_EXEC_SHA256_LEN) != 0);
+	printf("\n    k3z module-identity: built-in, wasm/shaA, wasm/shaB all key distinctly\n");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2500,6 +2755,11 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nkvx_5wi_dispatch_compile_offreactor);
 	CU_ADD_TEST(suite, test_nkvx_5wi_stop_drains_inflight_compiles);
 	CU_ADD_TEST(suite, test_nkvx_dispatch_without_thread_fails);
+	CU_ADD_TEST(suite, test_nkvx_result_cache_cross_consumer_hit);
+	CU_ADD_TEST(suite, test_nkvx_result_cache_different_input_misses);
+	CU_ADD_TEST(suite, test_nkvx_result_cache_changed_object_no_stale);
+	CU_ADD_TEST(suite, test_nkvx_result_cache_disabled_recomputes);
+	CU_ADD_TEST(suite, test_nkvx_result_cache_module_identity_in_key);
 
 	/* One SPDK thread stands in for the reactor; the executor worker is a real
 	 * separate pthread, so the off-reactor thread-id check is meaningful. */

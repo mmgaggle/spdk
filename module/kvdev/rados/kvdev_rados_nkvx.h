@@ -141,6 +141,115 @@ void nkvx_vg_scrub_frame_top(void *frame_base);
 struct kvdev_rados_nkvx_worker;
 
 /*
+ * spdk-k3z: cross-consumer RESULT cache.
+ *
+ * A NEW, distinct cache from the sha256 compiled-module cache, the oid-keyed
+ * content-addressed OBJECT cache (TB4), and the (module,oid) warm-instance cache.
+ * It memoizes the COMPUTED RESULT of an Exec so that an identical (runtime, module
+ * identity, object CONTENT identity, canonicalized request incl. input bytes)
+ * issued by ANY consumer is served WITHOUT re-running the module off-reactor.
+ *
+ * Why object CONTENT identity (not the bare oid): an oid can be overwritten in
+ * place (Store) — keying on the oid alone would return a STALE result for new
+ * content. We key on a sha256 of the actual object bytes the module will run on,
+ * consistent with the TB4 content-addressed object cache's invalidation-on-write
+ * intent: different content => different key => MISS, never a stale hit.
+ *
+ * The lookup happens ON THE REACTOR, BEFORE the off-reactor dispatch (mirroring
+ * the spdk-fbm cache-probe short-circuit), so a HIT completes with NO off-reactor
+ * work. The insert happens on the reactor in the run completion after a miss.
+ *
+ * Disable knob: env var SPDK_NKVX_RESULT_CACHE=0 turns the cache OFF (every Exec
+ * recomputes; results are identical, just not memoized). Read once, lazily.
+ */
+#define KVDEV_RADOS_NKVX_RESULT_CACHE_ENV "SPDK_NKVX_RESULT_CACHE"
+
+/* LRU cap (entries) for the result cache; env-overridable. 0 disables the cap. */
+#define KVDEV_RADOS_NKVX_RESULT_CACHE_MAX_COUNT_ENV "SPDK_NKVX_RESULT_CACHE_MAX_COUNT"
+#define KVDEV_RADOS_NKVX_RESULT_CACHE_MAX_COUNT_DEFAULT 1024u
+
+/* sha256 digest length reused for all result-cache hashes. */
+#include "spdk/kvdev.h"		/* SPDK_KV_EXEC_SHA256_LEN */
+
+/*
+ * A fully-formed result-cache key. The 32-byte digest is computed by
+ * kvdev_rados_nkvx_result_key from the canonical component stream
+ * (runtime/module/module-sha256/object-content-sha256/input). The caller
+ * (reactor side) builds it once it has the object bytes in hand and uses it for
+ * both the probe and (on a miss) the insert.
+ */
+struct kvdev_rados_nkvx_result_key {
+	uint8_t digest[SPDK_KV_EXEC_SHA256_LEN];
+};
+
+/*
+ * Build the canonical result-cache key digest from its components. All inputs are
+ * folded length-prefixed into a single sha256 so logically-identical requests
+ * collide and logically-different ones (different module, module hash, object
+ * content, or input) do not.
+ *
+ * \param module        module name (the text after "nkvx:", e.g. "bytecount" or
+ *                       "wasm:checksum"); also encodes the runtime (wasm: prefix).
+ * \param mod_sha256    bound module content hash (32 B) for verified wasm, or NULL
+ *                       for built-in C modules (which carry no untrusted bytes).
+ * \param object        object bytes the module will run on (content identity).
+ * \param object_len    length of \c object.
+ * \param input         per-request input bytes (may be NULL).
+ * \param input_len     length of \c input.
+ * \param out_key       receives the computed key.
+ *
+ * Returns 0 on success, negative errno on a digest failure (caller then treats it
+ * as "uncacheable" and just recomputes — never a wrong answer).
+ */
+int kvdev_rados_nkvx_result_key(const char *module,
+				const uint8_t *mod_sha256,
+				const void *object, size_t object_len,
+				const void *input, size_t input_len,
+				struct kvdev_rados_nkvx_result_key *out_key);
+
+/*
+ * Probe the result cache. Runs ON THE REACTOR before dispatch. On a HIT, copies
+ * the memoized result into \c out (up to \c out_len), sets \c *result_len to the
+ * TRUE result length and \c *kvstatus to the memoized status, and returns true —
+ * the caller completes the Exec immediately with NO off-reactor work. On a MISS
+ * (or when the cache is disabled) returns false and touches nothing.
+ */
+bool kvdev_rados_nkvx_result_lookup(const struct kvdev_rados_nkvx_result_key *key,
+				    void *out, uint32_t out_len,
+				    uint32_t *result_len, int *kvstatus);
+
+/*
+ * Insert a computed result under \c key. Runs ON THE REACTOR in the run
+ * completion after a miss. Only SUCCESS / BUFFER_TOO_SMALL results (deterministic
+ * outcomes of running the module) are memoized with their bytes; transient
+ * failures are never cached. No-op when the cache is disabled. \c result is the
+ * TRUE result the module produced (\c result_bytes may be shorter if the host
+ * buffer truncated it — only the bytes actually present are stored, with the true
+ * length recorded so a later hit reports the same truncation).
+ */
+void kvdev_rados_nkvx_result_insert(const struct kvdev_rados_nkvx_result_key *key,
+				    int kvstatus, uint32_t result_len,
+				    const void *result_bytes, uint32_t result_bytes_len);
+
+/* True iff the result cache is enabled (env knob). Read-once, lazily. */
+bool kvdev_rados_nkvx_result_cache_enabled(void);
+
+/* Drop every result-cache entry (test teardown / shutdown). */
+void kvdev_rados_nkvx_result_cache_reset(void);
+
+/*
+ * Test/observability counters for the result cache. hits/misses drive the
+ * measured hit-rate; inserts/evictions prove bounded growth.
+ */
+struct kvdev_rados_nkvx_result_stats {
+	uint64_t	hits;
+	uint64_t	misses;
+	uint64_t	inserts;
+	uint64_t	evictions;
+};
+void kvdev_rados_nkvx_result_get_stats(struct kvdev_rados_nkvx_result_stats *out);
+
+/*
  * Start/stop the executor worker pool (one dedicated pthread in TB1). Called
  * from module_init/module_fini. Idempotent.
  */

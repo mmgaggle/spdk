@@ -231,6 +231,15 @@ void *kvdev_rados_nkvx_wasm_cache_pin(const char *obj_key);
 void kvdev_rados_nkvx_wasm_cache_unpin(void *handle);
 
 /*
+ * spdk-k3z: read the OBJECT CONTENT bytes behind a pin so a caller can compute a
+ * content hash (e.g. the result-cache key) without a refetch. The caller must
+ * hold the pin across the read and must NOT retain the returned pointer past the
+ * unpin. Sets *bytes/*len to the pinned object (NULL/0 if the handle is NULL or
+ * not filled). NULL-safe.
+ */
+void kvdev_rados_nkvx_wasm_pin_object(void *handle, const void **bytes, size_t *len);
+
+/*
  * Run module \c name against a PINNED object (the handle from cache_pin), serving
  * exactly that version with NO librados refetch and NO cold fill. Same status
  * contract as run_cached. The caller still owns the pin and must unpin after.

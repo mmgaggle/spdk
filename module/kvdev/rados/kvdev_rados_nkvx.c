@@ -14,6 +14,8 @@
 #include "kvdev_rados_nkvx.h"
 #include "kvdev_rados_nkvx_wasm.h"
 
+#include <openssl/evp.h>
+
 /*
  * rados-nkvx executor worker (TB1). See kvdev_rados_nkvx.h for scope.
  *
@@ -97,6 +99,360 @@ static struct {
 	.mutex = PTHREAD_MUTEX_INITIALIZER,
 	.cond = PTHREAD_COND_INITIALIZER,
 };
+
+/* ==========================================================================
+ * spdk-k3z: cross-consumer RESULT cache.
+ *
+ * Distinct from the compiled-module (sha256), object (TB4), and warm-instance
+ * caches. Keyed by a sha256 over (runtime+module || module-content-sha256 ||
+ * object-content-sha256 || input) so that an identical request from ANY consumer
+ * is served from the memoized COMPUTED RESULT with no off-reactor module run.
+ *
+ * Concurrency: the lookup/insert/reset all run ON THE REACTOR (reactor-side
+ * probe-before-dispatch + reactor-side insert in the run completion), but the
+ * cache carries its own mutex anyway so the deterministic off-reactor unit test
+ * (which drives it from a single thread) and any future multi-reactor caller stay
+ * race-free.
+ * ========================================================================== */
+
+struct nkvx_result_entry {
+	struct kvdev_rados_nkvx_result_key	key;
+	int					kvstatus;
+	uint32_t				result_len;	/* TRUE module result length */
+	uint32_t				bytes_len;	/* bytes actually stored (<= result_len) */
+	uint8_t					*bytes;		/* malloc'd copy of the result */
+	TAILQ_ENTRY(nkvx_result_entry)		link;		/* LRU: head=oldest, tail=newest */
+};
+
+static struct {
+	pthread_mutex_t				mutex;
+	TAILQ_HEAD(, nkvx_result_entry)		entries;
+	uint64_t				count;
+	uint64_t				max_count;
+	bool					inited;
+	/* Disable knob, read once from the env. */
+	int					enabled;	/* -1 unknown, 0 off, 1 on */
+	struct kvdev_rados_nkvx_result_stats	stats;
+} g_nkvx_result = {
+	.mutex = PTHREAD_MUTEX_INITIALIZER,
+	.enabled = -1,
+};
+
+/* Lazily read the env knobs (enabled + cap). Caller holds g_nkvx_result.mutex. */
+static void
+nkvx_result_init_once(void)
+{
+	const char *env;
+
+	if (g_nkvx_result.inited) {
+		return;
+	}
+	TAILQ_INIT(&g_nkvx_result.entries);
+
+	g_nkvx_result.enabled = 1;
+	env = getenv(KVDEV_RADOS_NKVX_RESULT_CACHE_ENV);
+	if (env != NULL && (env[0] == '0' || env[0] == 'n' || env[0] == 'N' ||
+			    env[0] == 'f' || env[0] == 'F')) {
+		g_nkvx_result.enabled = 0;
+	}
+
+	g_nkvx_result.max_count = KVDEV_RADOS_NKVX_RESULT_CACHE_MAX_COUNT_DEFAULT;
+	env = getenv(KVDEV_RADOS_NKVX_RESULT_CACHE_MAX_COUNT_ENV);
+	if (env != NULL) {
+		char *end = NULL;
+		unsigned long long v = strtoull(env, &end, 10);
+
+		if (end != env) {
+			g_nkvx_result.max_count = (uint64_t)v;	/* 0 => unbounded */
+		}
+	}
+	g_nkvx_result.inited = true;
+}
+
+bool
+kvdev_rados_nkvx_result_cache_enabled(void)
+{
+	bool en;
+
+	pthread_mutex_lock(&g_nkvx_result.mutex);
+	nkvx_result_init_once();
+	en = g_nkvx_result.enabled == 1;
+	pthread_mutex_unlock(&g_nkvx_result.mutex);
+	return en;
+}
+
+void
+kvdev_rados_nkvx_result_get_stats(struct kvdev_rados_nkvx_result_stats *out)
+{
+	if (out == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&g_nkvx_result.mutex);
+	nkvx_result_init_once();
+	*out = g_nkvx_result.stats;
+	pthread_mutex_unlock(&g_nkvx_result.mutex);
+}
+
+void
+kvdev_rados_nkvx_result_cache_reset(void)
+{
+	struct nkvx_result_entry *e;
+
+	pthread_mutex_lock(&g_nkvx_result.mutex);
+	nkvx_result_init_once();
+	while ((e = TAILQ_FIRST(&g_nkvx_result.entries)) != NULL) {
+		TAILQ_REMOVE(&g_nkvx_result.entries, e, link);
+		free(e->bytes);
+		free(e);
+	}
+	g_nkvx_result.count = 0;
+	memset(&g_nkvx_result.stats, 0, sizeof(g_nkvx_result.stats));
+	/*
+	 * Re-read the env knobs on reset so a test (or a runtime reconfigure) can
+	 * toggle the disable knob / cap and have it take effect at a clean boundary.
+	 * Production only ever resets at teardown, so this is harmless there.
+	 */
+	g_nkvx_result.inited = false;
+	nkvx_result_init_once();
+	pthread_mutex_unlock(&g_nkvx_result.mutex);
+}
+
+/*
+ * Fold one length-prefixed component into the running digest. The 8-byte LE
+ * length prefix makes the encoding injective: no concatenation of one field can
+ * be mistaken for a different split of the components, so logically-different
+ * requests cannot collide by aliasing field boundaries.
+ */
+static int
+nkvx_result_hash_update(EVP_MD_CTX *ctx, const void *buf, size_t len)
+{
+	uint64_t le = (uint64_t)len;
+	uint8_t lenbuf[8];
+	int i;
+
+	for (i = 0; i < 8; i++) {
+		lenbuf[i] = (uint8_t)(le >> (8 * i));
+	}
+	if (EVP_DigestUpdate(ctx, lenbuf, sizeof(lenbuf)) != 1) {
+		return -1;
+	}
+	if (len > 0 && buf != NULL && EVP_DigestUpdate(ctx, buf, len) != 1) {
+		return -1;
+	}
+	return 0;
+}
+
+int
+kvdev_rados_nkvx_result_key(const char *module,
+			    const uint8_t *mod_sha256,
+			    const void *object, size_t object_len,
+			    const void *input, size_t input_len,
+			    struct kvdev_rados_nkvx_result_key *out_key)
+{
+	EVP_MD_CTX *ctx;
+	uint8_t obj_hash[SPDK_KV_EXEC_SHA256_LEN];
+	uint8_t mod_marker;
+	unsigned int mdlen = 0;
+	int rc = -EIO;
+
+	if (module == NULL || out_key == NULL) {
+		return -EINVAL;
+	}
+
+	/*
+	 * Object CONTENT identity: hash the actual bytes (not the oid). This is the
+	 * load-bearing correctness property — an oid overwritten with different
+	 * content yields a different object hash, so a result computed over the old
+	 * content can never be returned for the new content (no stale hit).
+	 */
+	if (EVP_Digest(object_len > 0 ? object : "", object_len, obj_hash, &mdlen,
+		       EVP_sha256(), NULL) != 1 || mdlen != SPDK_KV_EXEC_SHA256_LEN) {
+		return -EIO;
+	}
+
+	ctx = EVP_MD_CTX_new();
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+	if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+		goto out;
+	}
+
+	/* runtime + module name (the "wasm:" prefix distinguishes the runtime). */
+	if (nkvx_result_hash_update(ctx, module, strlen(module)) != 0) {
+		goto out;
+	}
+	/*
+	 * Module IDENTITY: the bound content sha256 for verified wasm. Built-in C
+	 * modules carry no untrusted bytes (their identity IS their name, already
+	 * folded above); mark that distinctly so a built-in and a hypothetical wasm
+	 * module of the same name never alias.
+	 */
+	mod_marker = mod_sha256 != NULL ? 1 : 0;
+	if (nkvx_result_hash_update(ctx, &mod_marker, 1) != 0) {
+		goto out;
+	}
+	if (mod_sha256 != NULL &&
+	    nkvx_result_hash_update(ctx, mod_sha256, SPDK_KV_EXEC_SHA256_LEN) != 0) {
+		goto out;
+	}
+	/* object content identity */
+	if (nkvx_result_hash_update(ctx, obj_hash, sizeof(obj_hash)) != 0) {
+		goto out;
+	}
+	/* canonicalized request: the per-invocation input bytes */
+	if (nkvx_result_hash_update(ctx, input, input_len) != 0) {
+		goto out;
+	}
+
+	if (EVP_DigestFinal_ex(ctx, out_key->digest, &mdlen) != 1 ||
+	    mdlen != SPDK_KV_EXEC_SHA256_LEN) {
+		goto out;
+	}
+	rc = 0;
+out:
+	EVP_MD_CTX_free(ctx);
+	return rc;
+}
+
+/* Caller holds the mutex. Linear scan (keys are 32 B, cache is small/bounded). */
+static struct nkvx_result_entry *
+nkvx_result_lookup_locked(const struct kvdev_rados_nkvx_result_key *key)
+{
+	struct nkvx_result_entry *e;
+
+	TAILQ_FOREACH(e, &g_nkvx_result.entries, link) {
+		if (memcmp(e->key.digest, key->digest, SPDK_KV_EXEC_SHA256_LEN) == 0) {
+			return e;
+		}
+	}
+	return NULL;
+}
+
+bool
+kvdev_rados_nkvx_result_lookup(const struct kvdev_rados_nkvx_result_key *key,
+			       void *out, uint32_t out_len,
+			       uint32_t *result_len, int *kvstatus)
+{
+	struct nkvx_result_entry *e;
+
+	if (key == NULL) {
+		return false;
+	}
+
+	pthread_mutex_lock(&g_nkvx_result.mutex);
+	nkvx_result_init_once();
+	if (g_nkvx_result.enabled != 1) {
+		pthread_mutex_unlock(&g_nkvx_result.mutex);
+		return false;
+	}
+
+	e = nkvx_result_lookup_locked(key);
+	if (e == NULL) {
+		g_nkvx_result.stats.misses++;
+		pthread_mutex_unlock(&g_nkvx_result.mutex);
+		return false;
+	}
+
+	/* LRU touch: move to the tail (most-recently-used). */
+	TAILQ_REMOVE(&g_nkvx_result.entries, e, link);
+	TAILQ_INSERT_TAIL(&g_nkvx_result.entries, e, link);
+
+	/* Reproduce the memoized outcome EXACTLY, including any truncation: copy the
+	 * stored bytes (which fit the original host buffer) clamped to this caller's
+	 * buffer, but always report the TRUE result length so truncation is detected
+	 * identically to a recompute. */
+	if (result_len != NULL) {
+		*result_len = e->result_len;
+	}
+	if (kvstatus != NULL) {
+		*kvstatus = e->kvstatus;
+	}
+	if (out != NULL && out_len > 0 && e->bytes_len > 0) {
+		uint32_t copy = e->bytes_len < out_len ? e->bytes_len : out_len;
+
+		memcpy(out, e->bytes, copy);
+	}
+	g_nkvx_result.stats.hits++;
+	pthread_mutex_unlock(&g_nkvx_result.mutex);
+	return true;
+}
+
+void
+kvdev_rados_nkvx_result_insert(const struct kvdev_rados_nkvx_result_key *key,
+			       int kvstatus, uint32_t result_len,
+			       const void *result_bytes, uint32_t result_bytes_len)
+{
+	struct nkvx_result_entry *e;
+	uint8_t *copy = NULL;
+
+	if (key == NULL) {
+		return;
+	}
+	/* Only memoize DETERMINISTIC outcomes of actually running the module. A
+	 * transient/environmental failure (NOMEM, runtime unavailable, ...) must NOT
+	 * be cached as if it were the module's answer. */
+	if (kvstatus != SPDK_KVDEV_IO_STATUS_SUCCESS &&
+	    kvstatus != SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL) {
+		return;
+	}
+
+	pthread_mutex_lock(&g_nkvx_result.mutex);
+	nkvx_result_init_once();
+	if (g_nkvx_result.enabled != 1) {
+		pthread_mutex_unlock(&g_nkvx_result.mutex);
+		return;
+	}
+
+	/* Idempotent: a concurrent/duplicate insert just refreshes LRU position. */
+	e = nkvx_result_lookup_locked(key);
+	if (e != NULL) {
+		TAILQ_REMOVE(&g_nkvx_result.entries, e, link);
+		TAILQ_INSERT_TAIL(&g_nkvx_result.entries, e, link);
+		pthread_mutex_unlock(&g_nkvx_result.mutex);
+		return;
+	}
+
+	if (result_bytes_len > 0 && result_bytes != NULL) {
+		copy = malloc(result_bytes_len);
+		if (copy == NULL) {
+			/* Out of memory: skip caching, never a wrong answer. */
+			pthread_mutex_unlock(&g_nkvx_result.mutex);
+			return;
+		}
+		memcpy(copy, result_bytes, result_bytes_len);
+	}
+
+	e = calloc(1, sizeof(*e));
+	if (e == NULL) {
+		free(copy);
+		pthread_mutex_unlock(&g_nkvx_result.mutex);
+		return;
+	}
+	e->key = *key;
+	e->kvstatus = kvstatus;
+	e->result_len = result_len;
+	e->bytes = copy;
+	e->bytes_len = copy != NULL ? result_bytes_len : 0;
+	TAILQ_INSERT_TAIL(&g_nkvx_result.entries, e, link);
+	g_nkvx_result.count++;
+	g_nkvx_result.stats.inserts++;
+
+	/* LRU eviction from the head (oldest) when past the cap (0 == unbounded). */
+	while (g_nkvx_result.max_count != 0 && g_nkvx_result.count > g_nkvx_result.max_count) {
+		struct nkvx_result_entry *victim = TAILQ_FIRST(&g_nkvx_result.entries);
+
+		if (victim == NULL) {
+			break;
+		}
+		TAILQ_REMOVE(&g_nkvx_result.entries, victim, link);
+		free(victim->bytes);
+		free(victim);
+		g_nkvx_result.count--;
+		g_nkvx_result.stats.evictions++;
+	}
+	pthread_mutex_unlock(&g_nkvx_result.mutex);
+}
 
 /*
  * spdk-5pq: valgrind-only longjmp-taint scrubber for the small COMPILER-OWNED slots

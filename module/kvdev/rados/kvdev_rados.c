@@ -168,6 +168,18 @@ struct kvdev_rados_io {
 	struct spdk_io_channel		*nkvx_compile_ch;
 	struct kvdev_rados_nkvx_module	nkvx_mod;
 	bool				nkvx_has_mod;	/* a verified binding is present */
+	/*
+	 * spdk-k3z RESULT-cache state. The per-request input bytes are copied at Exec
+	 * entry (the caller's input buffer is not guaranteed to outlive the async
+	 * cold-fill) so the result-cache key — built on the reactor once the object
+	 * content is in hand, right before the off-reactor dispatch — can fold them in.
+	 * nkvx_result_key_valid marks that a key was built and a MISS occurred, so the
+	 * run completion knows to memoize the freshly-computed result under it.
+	 */
+	void				*nkvx_input;
+	uint32_t			nkvx_input_len;
+	struct kvdev_rados_nkvx_result_key nkvx_result_key;
+	bool				nkvx_result_key_valid;
 	bool				nkvx_in_module_fetch;	/* this aio IS the module read */
 	char				nkvx_mod_key[SPDK_KVDEV_EXEC_KEY_MAX_LEN + 1];
 	char				nkvx_mod_ns[256];	/* module pool[/namespace] locator */
@@ -605,10 +617,96 @@ kvdev_rados_nkvx_io_done(void *done_arg, int kvstatus, uint32_t out_len)
 {
 	struct kvdev_rados_io *io = done_arg;
 
+	/*
+	 * spdk-k3z: this run was dispatched because the result-cache probe MISSED
+	 * (or the cache is disabled — then the key is invalid and the insert is a
+	 * no-op). Memoize the freshly-computed result under the key built before
+	 * dispatch so the NEXT consumer of the identical (module, object content,
+	 * input) request is served without re-running the module off-reactor.
+	 *
+	 * Only the bytes that actually landed in the host buffer are stored
+	 * (min(out_len, buf_len)); the TRUE length (out_len) is recorded so a later
+	 * hit reports identical truncation. SUCCESS/BUFFER_TOO_SMALL only — the
+	 * insert helper drops transient failures.
+	 */
+	if (io->nkvx_result_key_valid) {
+		uint32_t bytes_len = io->host_out != NULL ?
+				     spdk_min(out_len, io->buf_len) : 0;
+
+		kvdev_rados_nkvx_result_insert(&io->nkvx_result_key, kvstatus, out_len,
+					       io->host_out, bytes_len);
+	}
+
 	io->cb_fn(io->cb_arg, kvstatus, out_len);
+	free(io->nkvx_input);
 	free(io->nkvx_obj);
 	free(io->nkvx_mod_buf);	/* TB3: the fetched module bytes (NULL on hit/legacy) */
 	free(io);
+}
+
+/*
+ * spdk-k3z: reactor-side RESULT-cache probe, run with the object CONTENT in hand
+ * and BEFORE the off-reactor dispatch (mirroring the spdk-fbm cache-probe
+ * short-circuit). Builds the canonical key from (module, module-sha256 for
+ * verified wasm, object content, per-request input) and probes the cache.
+ *
+ *   - HIT: copy the memoized result into the host buffer, fire the completion
+ *     with the memoized status/length, free io, and return true — NO off-reactor
+ *     work. The log marker makes the hit observable.
+ *   - MISS (or cache disabled / key build failed): stash the key on io (when
+ *     valid) so io_done memoizes the result after the module runs, and return
+ *     false so the caller proceeds to dispatch.
+ *
+ * \c object/\c object_len are the bytes the module will run on (the cold-filled
+ * buffer, or the pinned cached object). On the pin path the caller holds the pin
+ * across this call, so the bytes are stable.
+ */
+static bool
+kvdev_rados_nkvx_result_probe(struct kvdev_rados_io *io,
+			      const void *object, size_t object_len)
+{
+	const uint8_t *mod_sha256 = io->nkvx_has_mod ? io->nkvx_mod.sha256 : NULL;
+	uint32_t result_len = 0;
+	int kvstatus = 0;
+	int rc;
+
+	io->nkvx_result_key_valid = false;
+
+	if (!kvdev_rados_nkvx_result_cache_enabled()) {
+		SPDK_NOTICELOG("nkvx: result-cache DISABLED -> recompute module=%s oid=%s\n",
+			       io->nkvx_module, io->nkvx_oid);
+		return false;
+	}
+
+	rc = kvdev_rados_nkvx_result_key(io->nkvx_module, mod_sha256,
+					 object, object_len,
+					 io->nkvx_input, io->nkvx_input_len,
+					 &io->nkvx_result_key);
+	if (rc != 0) {
+		/* Could not build the key (digest error): just recompute. */
+		return false;
+	}
+
+	if (kvdev_rados_nkvx_result_lookup(&io->nkvx_result_key, io->host_out,
+					   io->buf_len, &result_len, &kvstatus)) {
+		SPDK_NOTICELOG("nkvx: result-cache HIT module=%s oid=%s obj_len=%zu "
+			       "input_len=%u -> served WITHOUT off-reactor run "
+			       "(status=%d len=%u)\n",
+			       io->nkvx_module, io->nkvx_oid, object_len,
+			       io->nkvx_input_len, kvstatus, result_len);
+		io->cb_fn(io->cb_arg, kvstatus, result_len);
+		free(io->nkvx_input);
+		free(io->nkvx_obj);
+		free(io->nkvx_mod_buf);
+		free(io);
+		return true;
+	}
+
+	SPDK_NOTICELOG("nkvx: result-cache MISS module=%s oid=%s obj_len=%zu "
+		       "input_len=%u -> dispatch off-reactor run\n",
+		       io->nkvx_module, io->nkvx_oid, object_len, io->nkvx_input_len);
+	io->nkvx_result_key_valid = true;
+	return false;
 }
 
 /*
@@ -636,6 +734,15 @@ kvdev_rados_nkvx_dispatch_or_fail(struct kvdev_rados_io *io, int ret)
 			goto done_free;
 		}
 
+		/*
+		 * spdk-k3z: result-cache probe with the cold-filled object CONTENT in
+		 * hand, BEFORE the off-reactor dispatch. A hit completes the io here
+		 * (no worker run); a miss stashes the key so io_done memoizes the result.
+		 */
+		if (kvdev_rados_nkvx_result_probe(io, io->nkvx_obj, io->stat_size)) {
+			return;	/* served from result cache; io already freed */
+		}
+
 		/* Dispatch the module off the reactor against the true object length.
 		 * TB3: pass the verified-module arg (sha256 + fetched bytes, or NULL on
 		 * the legacy/built-in path). The buffer + io live until io_done frees
@@ -659,6 +766,7 @@ kvdev_rados_nkvx_dispatch_or_fail(struct kvdev_rados_io *io, int ret)
 	io->cb_fn(io->cb_arg, status, 0);
 
 done_free:
+	free(io->nkvx_input);
 	free(io->nkvx_obj);
 	free(io->nkvx_mod_buf);
 	free(io);
@@ -770,6 +878,7 @@ kvdev_rados_nkvx_module_fetched(struct kvdev_rados_io *io, int ret)
 	return;
 
 fail_free:
+	free(io->nkvx_input);
 	free(io->nkvx_mod_buf);
 	free(io->nkvx_obj);
 	free(io);
@@ -823,6 +932,7 @@ kvdev_rados_nkvx_module_compiled(void *done_arg, int kvstatus)
 			    kvstatus == SPDK_KVDEV_IO_STATUS_NOT_SUPPORTED ? "runtime unavailable" :
 			    "compile/cache failure");
 		io->cb_fn(io->cb_arg, kvstatus, 0);
+		free(io->nkvx_input);
 		free(io->nkvx_mod_buf);
 		free(io->nkvx_obj);
 		free(io);
@@ -844,6 +954,7 @@ kvdev_rados_nkvx_module_compiled(void *done_arg, int kvstatus)
 	if (rados_aio_create_completion((void *)io, kvdev_rados_aio_cb, NULL, &io->comp) < 0) {
 		SPDK_ERRLOG("nkvx: cannot create completion for data phase\n");
 		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		free(io->nkvx_input);
 		free(io);
 		spdk_put_io_channel(compile_ch);
 		return;
@@ -1304,12 +1415,28 @@ kvdev_rados_nkvx_start_data_phase(struct kvdev_rados_io *io)
 		void *pin = kvdev_rados_nkvx_wasm_cache_pin(io->nkvx_oid);
 
 		if (pin != NULL) {
+			const void *pobj = NULL;
+			size_t pobj_len = 0;
+
 			SPDK_NOTICELOG("nkvx: oid %s served from executor cache "
 				       "(pinned, no librados read)\n", io->nkvx_oid);
 			rados_aio_release(io->comp);
 			io->comp = NULL;
 			io->nkvx_obj = NULL;
 			io->nkvx_obj_cap = 0;
+
+			/*
+			 * spdk-k3z: result-cache probe on the pinned object's CONTENT
+			 * (read under the pin, so the bytes are stable) BEFORE the
+			 * off-reactor dispatch. A hit completes here; we still own the pin,
+			 * so release it before returning.
+			 */
+			kvdev_rados_nkvx_wasm_pin_object(pin, &pobj, &pobj_len);
+			if (kvdev_rados_nkvx_result_probe(io, pobj, pobj_len)) {
+				kvdev_rados_nkvx_wasm_cache_unpin(pin);
+				return 0;	/* served from result cache; io already freed */
+			}
+
 			rc = kvdev_rados_nkvx_dispatch(io->nkvx_module,
 						       kvdev_rados_nkvx_mod_arg(io),
 						       io->nkvx_oid, pin,
@@ -1320,6 +1447,7 @@ kvdev_rados_nkvx_start_data_phase(struct kvdev_rados_io *io)
 					    spdk_strerror(-rc));
 				kvdev_rados_nkvx_wasm_cache_unpin(pin);
 				io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+				free(io->nkvx_input);
 				free(io->nkvx_mod_buf);
 				free(io);
 				return 0;
@@ -1335,6 +1463,7 @@ kvdev_rados_nkvx_start_data_phase(struct kvdev_rados_io *io)
 	if (io->nkvx_obj == NULL) {
 		rados_aio_release(io->comp);
 		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		free(io->nkvx_input);
 		free(io->nkvx_mod_buf);
 		free(io);
 		return 0;
@@ -1345,6 +1474,7 @@ kvdev_rados_nkvx_start_data_phase(struct kvdev_rados_io *io)
 		free(io->nkvx_obj);
 		rados_aio_release(io->comp);
 		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		free(io->nkvx_input);
 		free(io->nkvx_mod_buf);
 		free(io);
 		return 0;
@@ -1360,6 +1490,7 @@ kvdev_rados_nkvx_start_data_phase(struct kvdev_rados_io *io)
 		free(io->nkvx_obj);
 		rados_aio_release(io->comp);
 		io->cb_fn(io->cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, rc), 0);
+		free(io->nkvx_input);
 		free(io->nkvx_mod_buf);
 		free(io);
 		return 0;
@@ -1434,6 +1565,7 @@ kvdev_rados_nkvx_start_module_fetch(struct kvdev_rados_io *io)
 	if (rc < 0) {
 		rados_aio_release(io->comp);
 		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+		free(io->nkvx_input);
 		free(io);
 		return 0;
 	}
@@ -1445,6 +1577,7 @@ kvdev_rados_nkvx_start_module_fetch(struct kvdev_rados_io *io)
 		io->nkvx_mod_ioctx = NULL;
 		rados_aio_release(io->comp);
 		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		free(io->nkvx_input);
 		free(io);
 		return 0;
 	}
@@ -1457,6 +1590,7 @@ kvdev_rados_nkvx_start_module_fetch(struct kvdev_rados_io *io)
 		io->nkvx_mod_ioctx = NULL;
 		rados_aio_release(io->comp);
 		io->cb_fn(io->cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		free(io->nkvx_input);
 		free(io);
 		return 0;
 	}
@@ -1480,6 +1614,7 @@ kvdev_rados_nkvx_start_module_fetch(struct kvdev_rados_io *io)
 		io->nkvx_mod_ioctx = NULL;
 		rados_aio_release(io->comp);
 		io->cb_fn(io->cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, rc), 0);
+		free(io->nkvx_input);
 		free(io);
 		return 0;
 	}
@@ -1491,6 +1626,7 @@ kvdev_rados_nkvx_start_module_fetch(struct kvdev_rados_io *io)
 static int
 kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_t key_len,
 		      const char *module, const struct spdk_kv_exec_binding *binding,
+		      const void *input, uint32_t input_len,
 		      void *output_buf, uint32_t output_buf_len,
 		      spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
 {
@@ -1512,6 +1648,19 @@ kvdev_rados_nkvx_exec(struct kvdev_rados_io_channel *ch, const void *key, uint8_
 	}
 	io->buf_len = output_buf_len;
 	io->host_out = output_buf;
+	/*
+	 * spdk-k3z: snapshot the per-request input for the result-cache key. The
+	 * caller's input buffer need not outlive the async cold-fill, so copy it now.
+	 * A failed copy is non-fatal — we simply skip result caching for this Exec
+	 * (it recomputes), never a wrong answer.
+	 */
+	if (input != NULL && input_len > 0) {
+		io->nkvx_input = malloc(input_len);
+		if (io->nkvx_input != NULL) {
+			memcpy(io->nkvx_input, input, input_len);
+			io->nkvx_input_len = input_len;
+		}
+	}
 	snprintf(io->nkvx_module, sizeof(io->nkvx_module), "%s", module);
 	/* The oid (hex of the key) is the stable content/identity key for the
 	 * executor's TB4 content-addressed object + warm-instance cache. */
@@ -1595,8 +1744,6 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 	int rc;
 
 	(void)op_id;
-	(void)input;
-	(void)input_len;
 
 	if (binding == NULL) {
 		SPDK_ERRLOG("KV Exec: missing structured binding\n");
@@ -1643,6 +1790,7 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 		 * it is permitted on a read-only namespace. (A future write-capable
 		 * module class must consult read_only at its own mutation point.) */
 		return kvdev_rados_nkvx_exec(ch, key, key_len, module, binding,
+					     input, input_len,
 					     output_buf, output_buf_len, cb_fn, cb_arg);
 	}
 
@@ -1680,6 +1828,7 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 		/* Built-in: no verified binding (mod arg stays NULL in the executor). The
 		 * executor is read-only by contract, so it is permitted on a read-only ns. */
 		return kvdev_rados_nkvx_exec(ch, key, key_len, module, NULL,
+					     input, input_len,
 					     output_buf, output_buf_len, cb_fn, cb_arg);
 	}
 

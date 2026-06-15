@@ -2317,6 +2317,40 @@ kvdev_rados_nkvx_wasm_cache_unpin(void *handle)
 }
 
 /*
+ * spdk-k3z: expose the OBJECT CONTENT bytes behind a pin (the handle from
+ * kvdev_rados_nkvx_wasm_cache_pin) so the reactor-side result-cache probe can key
+ * on the SAME content the worker would run on, without a librados refetch. The
+ * caller holds the pin (so the buffer is alive), reads the bytes synchronously,
+ * and must not retain the returned pointer past the unpin. Returns the object
+ * bytes pointer + true length; *bytes may be NULL for a zero-length object.
+ */
+void
+kvdev_rados_nkvx_wasm_pin_object(void *handle, const void **bytes, size_t *len)
+{
+	struct nkvx_obj_entry *obj = handle;
+
+	if (bytes != NULL) {
+		*bytes = NULL;
+	}
+	if (len != NULL) {
+		*len = 0;
+	}
+	if (obj == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&g_cache.mutex);
+	if (obj->mem != NULL && obj->filled) {
+		if (bytes != NULL) {
+			*bytes = obj->mem + WASM_OBJ_OFF;
+		}
+		if (len != NULL) {
+			*len = obj->obj_len;
+		}
+	}
+	pthread_mutex_unlock(&g_cache.mutex);
+}
+
+/*
  * Invalidate every cache entry (object + warm instances) for obj_key. Called from
  * EVERY value-mutating datapath op (Store, Delete) so a subsequent Exec cannot
  * serve stale cached bytes. Identity(oid)-addressed with invalidation-on-write —
