@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Intel Corporation. All rights reserved.
+#
+# Standalone build for the Slice C3 Exec RPC contract round-trip unit test.
+# Not part of the SPDK build graph: it compiles the contract (.c) + the UT
+# directly against Mercury and the in-tree spdk/kvdev.h (status enum only),
+# proving the executor (non-SPDK) can include the contract with minimal deps.
+#
+# Usage:
+#   make -f Makefile.ut MERCURY_PREFIX=<mercury-install> run
+# MERCURY_PREFIX defaults to the worktree's vendored install.
+
+SPDK_ROOT       ?= $(realpath $(CURDIR)/../../..)
+MERCURY_PREFIX  ?= $(SPDK_ROOT)/vendor/mercury-install
+
+MERCURY_CFLAGS  := $(shell PKG_CONFIG_PATH=$(MERCURY_PREFIX)/lib/pkgconfig pkg-config --cflags mercury)
+MERCURY_LIBS    := $(shell PKG_CONFIG_PATH=$(MERCURY_PREFIX)/lib/pkgconfig pkg-config --libs mercury)
+
+# -std=gnu11 matches SPDK's own build (mk/spdk.common.mk). It is LOAD-BEARING for
+# the wire-status guard: SPDK_STATIC_ASSERT (spdk/assert.h) expands to a real
+# static_assert only when <assert.h> defines `static_assert` as a macro, which
+# is true under C11/gnu11 but NOT under the compiler default C23 (where
+# static_assert is a keyword and the macro is absent, so the gate is a no-op).
+# The executor (Slice C2) must likewise compile this contract under gnu11.
+CFLAGS  := -g -O0 -std=gnu11 -Wall -Wextra -Werror -I$(SPDK_ROOT)/include $(MERCURY_CFLAGS)
+LDFLAGS := $(MERCURY_LIBS) -Wl,-rpath,$(MERCURY_PREFIX)/lib
+
+BIN := nkvx_exec_rpc_ut
+
+$(BIN): nkvx_exec_rpc_ut.c nkvx_exec_rpc.c nkvx_exec_rpc.h
+	$(CC) $(CFLAGS) -o $@ nkvx_exec_rpc_ut.c nkvx_exec_rpc.c $(LDFLAGS)
+
+run: $(BIN)
+	LD_LIBRARY_PATH=$(MERCURY_PREFIX)/lib ./$(BIN)
+
+clean:
+	rm -f $(BIN)
+
+.PHONY: run clean
