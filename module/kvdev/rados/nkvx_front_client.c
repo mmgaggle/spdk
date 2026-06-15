@@ -86,17 +86,37 @@ struct nkvx_call {
 	 * while Mercury still references it.
 	 */
 	bool			tenant_done;
+
+	/*
+	 * Slice C6b two-phase cancel join (bead spdk-5ia, design §C6b). A cancel is a
+	 * handshake: forward nkvx_cancel and wait for the executor's ACK — positive proof
+	 * the executor's remote view of result_sink/input_bulk is gone — then HG_Cancel
+	 * the Exec forward so the origin stops waiting. The DPTR/MR is released ONLY
+	 * when BOTH the forward has resolved (forward_done) AND the ack has arrived
+	 * (cancel_acked). Until then the call stays in-flight (n_inflight nonzero), which
+	 * is what makes the channel-destroy drain wait for executor quiescence.
+	 */
+	bool			cancelling;	/* a cancel handshake is in progress */
+	bool			forward_done;	/* the Exec forward has resolved (cb ran) */
+	bool			cancel_acked;	/* the executor acked nkvx_cancel (or it is moot) */
+	bool			detached;	/* removed from front->inflight (detach-once guard) */
+	hg_handle_t		cancel_handle;	/* the nkvx_cancel forward handle (HG_HANDLE_NULL if none) */
+	uint32_t		op_id;		/* cached for telemetry (== in->op_id) */
+	uint64_t		call_id;	/* front-unique handshake token (keys the cancel) */
+	enum spdk_kvdev_io_status join_status;	/* status to fire the tenant cb with on join */
 };
 
 struct nkvx_front {
 	hg_class_t	*cls;
 	hg_context_t	*ctx;
 	hg_id_t		rpc_id;
+	hg_id_t		cancel_rpc_id;	/* nkvx_cancel RPC id (Slice C6b) */
 	hg_addr_t	addr;	/* resolved executor target */
 
 	/* In-flight Exec forwards (Slice C6a): channel-destroy cancel + drain. */
 	TAILQ_HEAD(, nkvx_call)	inflight;
 	unsigned		n_inflight;
+	uint64_t		next_call_id;	/* monotonic per-front handshake-token source (C6b) */
 
 	/* MR/hg_bulk handle cache (C7.2). */
 	struct nkvx_bulk_entry	bulk_cache[NKVX_BULK_CACHE_SLOTS];
@@ -198,6 +218,165 @@ nkvx_bulk_release(struct nkvx_front *front, hg_bulk_t h)
 }
 
 /*
+ * ====================================================================
+ * Slice C6b two-phase cancel join (bead spdk-5ia, design §C6b).
+ *
+ * A cancel splits a call's terminal completion across TWO callbacks — the Exec
+ * forward (HG_Cancel'd) and the nkvx_cancel ack. The DPTR/MR is released only when
+ * BOTH have resolved, so the executor cannot PUSH into the sink after the front
+ * frees it. This is the SOLE difference from the normal path, which still tears
+ * down inline in nkvx_front_forward_cb (byte-for-byte as before).
+ * ====================================================================
+ */
+
+/*
+ * The cancel-path join point: reap the call once BOTH the Exec forward has
+ * resolved (forward_done) AND the executor has acked nkvx_cancel (cancel_acked).
+ * Fires the tenant cb exactly once (join_status), releases the bulk handles (THE
+ * sole DPTR/MR release on the cancel path — now provably after executor quiesce),
+ * detaches from the in-flight list, and frees the call. Idempotent guards make it
+ * safe to call from either resolving callback and after a forced fail-all detach.
+ */
+static void
+nkvx_call_try_complete(struct nkvx_call *call)
+{
+	struct nkvx_front *front = call->front;
+
+	if (!(call->cancelling && call->forward_done && call->cancel_acked)) {
+		return;		/* still waiting on the other half of the join */
+	}
+
+	/* Tenant cb exactly once (fail_all_pending may already have fired it). */
+	if (!call->tenant_done) {
+		call->cb(call->arg, call->join_status, 0, NULL, 0);
+		call->tenant_done = true;
+	}
+
+	/*
+	 * Release the bulk handles ONLY here, after executor quiescence is proven by
+	 * the ack — the UAF-safe release point. fail_all_pending nulls the handles
+	 * after releasing them, so this is a no-op (HG_BULK_NULL) on that path.
+	 */
+	nkvx_bulk_release(front, call->input_bulk);
+	nkvx_bulk_release(front, call->result_sink);
+	call->input_bulk = HG_BULK_NULL;
+	call->result_sink = HG_BULK_NULL;
+
+	/* Detach from the in-flight list (fail_all_pending may already have done so). */
+	if (!call->detached) {
+		TAILQ_REMOVE(&front->inflight, call, link);
+		call->detached = true;
+		front->n_inflight--;
+	}
+
+	/* The exec handle was destroyed+nulled when the forward resolved; the cancel
+	 * handle when the ack resolved. Nothing left to destroy. */
+	free(call);
+}
+
+/* Forward declaration: begin_cancel forwards nkvx_cancel with this completion. */
+static hg_return_t nkvx_cancel_ack_cb(const struct hg_cb_info *info);
+
+/*
+ * Begin (idempotently) the two-phase cancel of an in-flight call (design §C6b):
+ *   phase 2: forward nkvx_cancel and await the executor's ack (the safety proof);
+ *   phase 1: HG_Cancel the Exec forward so the origin stops waiting — but ONLY once
+ *            the cancel was submitted, so a failure to signal the executor degrades
+ *            to UAF-safe natural completion rather than a stranded bulk op.
+ * Optimization: with neither result_sink nor input_bulk there is no remote bulk view
+ * (inline-only payload), so the handshake is skipped (cancel_acked=true) — HG_Cancel
+ * alone is safe.
+ */
+static void
+nkvx_call_begin_cancel(struct nkvx_call *call)
+{
+	struct nkvx_front *front = call->front;
+	nkvx_cancel_in_t cin;
+	hg_handle_t ch = HG_HANDLE_NULL;
+	hg_return_t ret;
+
+	if (call->cancelling) {
+		return;		/* idempotent */
+	}
+	call->cancelling = true;
+	call->join_status = SPDK_KVDEV_IO_STATUS_ABORTED;
+
+	/*
+	 * No bulk handle registered over a tenant DPTR -> the executor has no remote
+	 * view to PUSH into OR PULL from, so the cross-process UAF cannot occur and the
+	 * handshake is unnecessary. Must check BOTH handles: a large-input / inline-or-
+	 * small-result Exec has result_sink == NULL but a live input_bulk the executor
+	 * may still be PULLing (spdk-5ia review). HG_Cancel alone is safe here.
+	 */
+	if (call->result_sink == HG_BULK_NULL && call->input_bulk == HG_BULK_NULL) {
+		(void)HG_Cancel(call->handle);
+		call->cancel_acked = true;
+		return;
+	}
+
+	/*
+	 * Phase 2 BEFORE phase 1 (spdk-5ia review). Forward nkvx_cancel FIRST, and only
+	 * HG_Cancel the Exec forward once the cancel is actually submitted. If we cannot
+	 * signal the executor, we must NOT cancel the Exec forward: letting it complete
+	 * naturally is UAF-safe because the executor PUSHes/PULLs and only THEN responds
+	 * (PUSH-before-Respond, design §1.3), so the natural forward completion is itself
+	 * proof the executor's bulk access finished and the DPTR is releasable. Cancelling
+	 * the forward early is precisely what would strand an in-flight bulk op against a
+	 * freed DPTR — so the failure fallback waits for natural completion, not origin-
+	 * only cancel. (The tenant still observes ABORTED via join_status; only the DPTR
+	 * release is deferred to the safe point.)
+	 */
+	ret = HG_Create(front->ctx, front->addr, front->cancel_rpc_id, &ch);
+	if (ret != HG_SUCCESS) {
+		fprintf(stderr, "nkvx_front: cancel HG_Create failed: %s (degrading to "
+			"natural completion — UAF-safe via PUSH-before-Respond)\n",
+			HG_Error_to_string(ret));
+		call->cancel_acked = true;	/* join now waits only on the natural forward cb */
+		return;
+	}
+	cin.call_id = call->call_id;
+	ret = HG_Forward(ch, nkvx_cancel_ack_cb, call, &cin);
+	if (ret != HG_SUCCESS) {
+		fprintf(stderr, "nkvx_front: cancel HG_Forward failed: %s (degrading to "
+			"natural completion — UAF-safe via PUSH-before-Respond)\n",
+			HG_Error_to_string(ret));
+		HG_Destroy(ch);
+		call->cancel_acked = true;	/* join waits only on the natural forward cb */
+		return;
+	}
+	call->cancel_handle = ch;
+
+	/* Cancel submitted -> safe to abort the Exec forward fast (origin stops waiting).
+	 * The forward cb resolves later (HG_CANCELED if it won, or the real status if the
+	 * Exec finished first) and sets forward_done; the ack resolves in
+	 * nkvx_cancel_ack_cb. The DPTR is released only when BOTH have fired. */
+	(void)HG_Cancel(call->handle);
+}
+
+/*
+ * nkvx_cancel ack completion. ANY resolution is the proof we need: a delivered ack
+ * (HG_SUCCESS) is positive confirmation the executor's bulk view is gone; an error
+ * (e.g. the executor finalized at channel-destroy) is safe in that teardown
+ * context. Either way: destroy the cancel handle, mark acked, try to join.
+ */
+static hg_return_t
+nkvx_cancel_ack_cb(const struct hg_cb_info *info)
+{
+	struct nkvx_call *call = info->arg;
+	hg_handle_t ch = info->info.forward.handle;
+
+	if (info->ret != HG_SUCCESS) {
+		fprintf(stderr, "nkvx_front: cancel ack resolved %s (safe at "
+			"channel-destroy)\n", HG_Error_to_string(info->ret));
+	}
+	HG_Destroy(ch);
+	call->cancel_handle = HG_HANDLE_NULL;
+	call->cancel_acked = true;
+	nkvx_call_try_complete(call);
+	return HG_SUCCESS;
+}
+
+/*
  * HG_Forward completion, fired from HG_Trigger inside nkvx_front_progress() — so
  * it runs on the progressing thread (the SPDK reactor in the integrated case).
  * Decodes the response, maps the wire status, hands the result to the caller's
@@ -208,6 +387,23 @@ nkvx_front_forward_cb(const struct hg_cb_info *info)
 {
 	struct nkvx_call *call = info->arg;
 	hg_handle_t handle = info->info.forward.handle;
+
+	/*
+	 * Slice C6b cancel path: this is phase 1 of the two-phase join resolving. Do
+	 * NOT release bulks / fire the tenant cb / detach / free here — the DPTR must
+	 * survive until the nkvx_cancel ack proves the executor will not PUSH. Just
+	 * record that the forward resolved, drop our exec-handle ref, and try to join
+	 * (which completes only once the ack has also arrived). Keeping the call on the
+	 * in-flight list (n_inflight nonzero) is what makes the channel-destroy drain
+	 * wait for executor quiescence.
+	 */
+	if (call->cancelling) {
+		call->forward_done = true;
+		HG_Destroy(handle);
+		call->handle = HG_HANDLE_NULL;
+		nkvx_call_try_complete(call);
+		return HG_SUCCESS;
+	}
 
 	/*
 	 * Teardown reap (Slice C6a, nkvx_front_fail_all_pending): the tenant cb was
@@ -275,6 +471,7 @@ out:
 	 * still load-bearing.)
 	 */
 	TAILQ_REMOVE(&call->front->inflight, call, link);
+	call->detached = true;
 	call->front->n_inflight--;
 	nkvx_bulk_release(call->front, call->input_bulk);
 	nkvx_bulk_release(call->front, call->result_sink);
@@ -322,6 +519,16 @@ nkvx_front_init(const char *na_init, const char *target_addr,
 					 hg_proc_nkvx_exec_out_t,
 					 NULL);
 	if (front->rpc_id == 0) {
+		goto err;
+	}
+
+	/* Slice C6b: the origin half of the cancel RPC — same name/procs to obtain the
+	 * matching id, NULL handler (the origin only forwards it, design §C6b). */
+	front->cancel_rpc_id = HG_Register_name(front->cls, "nkvx_cancel",
+						hg_proc_nkvx_cancel_in_t,
+						hg_proc_nkvx_cancel_out_t,
+						NULL);
+	if (front->cancel_rpc_id == 0) {
 		goto err;
 	}
 
@@ -404,6 +611,9 @@ nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 	call->arg = arg;
 	call->input_bulk = HG_BULK_NULL;
 	call->result_sink = HG_BULK_NULL;
+	call->op_id = in->op_id;		/* telemetry only */
+	call->call_id = ++front->next_call_id;	/* front-unique handshake token (C6b); 0 reserved as none */
+	call->cancel_handle = HG_HANDLE_NULL;	/* (calloc already zeroes the join fields) */
 
 	/*
 	 * Originate the front-side bulk handles (Slice C7, design §1.3): the front is
@@ -412,6 +622,7 @@ nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 	 * onto the wire; the executor PULLs/PUSHes against them mid-RPC.
 	 */
 	local = *in;
+	local.client_call_id = call->call_id;	/* front-assigned; the executor keys its cancel registry on it */
 	local.input_bulk = HG_BULK_NULL;
 	local.result_sink = HG_BULK_NULL;
 
@@ -488,15 +699,17 @@ nkvx_front_cancel_all(struct nkvx_front *front)
 		return;
 	}
 	/*
-	 * HG_Cancel cancels the ORIGIN side of each handle; the completion removes the
-	 * call from the list later (it does not mutate the list here), so a straight
-	 * forward-walk is safe. BEST-EFFORT only: the executor may still PUSH after the
-	 * origin cancels (bead spdk-5ia); this is the channel-destroy teardown drain,
-	 * not a per-command UAF guarantee (see the header). A skipped fail-detached
-	 * call (tenant_done) needs no re-cancel — its origin is already withdrawn.
+	 * Slice C6b: begin the two-phase cancel handshake for each in-flight call —
+	 * HG_Cancel the Exec forward (phase 1) AND forward nkvx_cancel (phase 2). The
+	 * call stays in-flight until BOTH the forward resolves and the executor acks,
+	 * so the DPTR/MR is not released until the executor's remote view is provably
+	 * gone (no late PUSH). begin_cancel is idempotent and does NOT mutate the
+	 * in-flight list here (resolution detaches later), so a straight forward-walk is
+	 * safe. The caller progresses until nkvx_front_outstanding() reaches 0 — now
+	 * bounded by the ack, not just the origin cancel.
 	 */
 	TAILQ_FOREACH(call, &front->inflight, link) {
-		(void)HG_Cancel(call->handle);
+		nkvx_call_begin_cancel(call);
 	}
 }
 
@@ -522,8 +735,19 @@ nkvx_front_fail_all_pending(struct nkvx_front *front,
 	 * tears the handle down (Mercury holds its own forward-side ref — HG_Destroy on
 	 * a non-terminal handle would only drop OUR ref, so deferring it is safe).
 	 *
-	 * The cross-process late-PUSH residual (executor PUSHing into a released MR) is
-	 * out of scope here and tracked by bead spdk-5ia.
+	 * Slice C6b: a call may be mid-cancel-JOIN — it can have TWO pending Mercury
+	 * completions (the Exec forward AND the nkvx_cancel ack), each carrying this
+	 * call as arg. So for a cancelling call we must NOT let the first-resolving
+	 * forward cb free it; nkvx_call_try_complete already gates freeing on
+	 * (forward_done && cancel_acked), so leaving tenant_done set and detaching here
+	 * routes BOTH callbacks through try_complete and the last one reaps. A
+	 * non-cancelling call has only the forward cb pending, reaped via its
+	 * tenant_done branch. Detach via the shared `detached` guard so try_complete
+	 * does not double-remove.
+	 *
+	 * The cross-process late-PUSH residual is now closed by the handshake itself;
+	 * this teardown last-resort remains best-effort only when the executor is
+	 * already dead (no ack will ever come — safe, the peer cannot PUSH either).
 	 */
 	/* glibc <sys/queue.h> has no TAILQ_FOREACH_SAFE; hand-roll the safe walk so the
 	 * standalone build (which includes only <sys/queue.h>) compiles. */
@@ -538,6 +762,7 @@ nkvx_front_fail_all_pending(struct nkvx_front *front,
 		call->input_bulk = HG_BULK_NULL;	/* released; the reap cb must not re-release */
 		call->result_sink = HG_BULK_NULL;
 		TAILQ_REMOVE(&front->inflight, call, link);
+		call->detached = true;
 		front->n_inflight--;
 		call = next;
 	}

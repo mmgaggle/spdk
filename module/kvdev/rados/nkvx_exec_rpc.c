@@ -51,6 +51,16 @@ SPDK_STATIC_ASSERT(SPDK_KVDEV_IO_STATUS_READ_ONLY        == -9, "wire status dri
 /* The wire status is exactly a 32-bit signed integer on the wire. */
 SPDK_STATIC_ASSERT(sizeof(int32_t) == 4, "wire status must be a fixed int32");
 
+/*
+ * Cancel-ack enum (Slice C6b). The value is telemetry-only (the DELIVERED ack is
+ * the safety proof), but pin it anyway for cross-build hygiene — mirroring the
+ * wire-status block so a future reorder breaks the BUILD instead of silently
+ * shuffling the executor's logged cancel-case. Fires only under gnu11 (see above).
+ */
+SPDK_STATIC_ASSERT(NKVX_CANCEL_ALREADY_DONE  == 0, "cancel-ack drift");
+SPDK_STATIC_ASSERT(NKVX_CANCEL_ABORTED       == 1, "cancel-ack drift");
+SPDK_STATIC_ASSERT(NKVX_CANCEL_PUSH_CANCELED == 2, "cancel-ack drift");
+
 int32_t
 nkvx_status_to_wire(enum spdk_kvdev_io_status status)
 {
@@ -183,6 +193,8 @@ hg_proc_nkvx_exec_in_t(hg_proc_t proc, void *data)
 
 	ret = hg_proc_uint32_t(proc, &in->op_id);
 	if (ret != HG_SUCCESS) { return ret; }
+	ret = hg_proc_uint64_t(proc, &in->client_call_id);
+	if (ret != HG_SUCCESS) { return ret; }
 	ret = hg_proc_uint8_t(proc, &in->read_only);
 	if (ret != HG_SUCCESS) { return ret; }
 	ret = hg_proc_uint8_t(proc, &in->runtime);
@@ -271,6 +283,25 @@ hg_proc_nkvx_exec_out_t(hg_proc_t proc, void *data)
 	}
 
 	return HG_SUCCESS;
+}
+
+hg_return_t
+hg_proc_nkvx_cancel_in_t(hg_proc_t proc, void *data)
+{
+	nkvx_cancel_in_t *in = data;
+
+	/* Only the call_id is on the wire; the origin address rides implicitly via
+	 * HG_Get_info(handle)->addr on the executor side (design §C6b). */
+	return hg_proc_uint64_t(proc, &in->call_id);
+}
+
+hg_return_t
+hg_proc_nkvx_cancel_out_t(hg_proc_t proc, void *data)
+{
+	nkvx_cancel_out_t *out = data;
+
+	/* The ack is a fixed int32 (one of enum nkvx_cancel_ack), endian-safe. */
+	return hg_proc_int32_t(proc, &out->ack);
 }
 
 void

@@ -567,6 +567,56 @@ eviction path (§4.3, OQ-7). Validate: abort an in-flight 64 MiB Exec mid-PUSH a
 no PUSH lands after teardown, no use-after-free (ASan/valgrind clean), the front's DPTR
 is safely reusable, and the executor stays up.
 
+**C6b — executor-side do-not-PUSH cancellation protocol (bead spdk-5ia).** C6a shipped the
+ORIGIN-only half (`HG_Cancel` on the front handle): it stops the front waiting and fires
+the tenant CQE, but the executor (a separate process) had NO cancel awareness and could
+still be mid-`HG_Bulk_transfer(PUSH)` into the front's `result_sink` after the front frees
+the DPTR — a cross-process use-after-free (invisible on sm/tcp's tiny window; bites on
+ofi+verbs, C8). C6b closes it with a SECOND Mercury RPC + an ACK HANDSHAKE so the front
+defers releasing the DPTR/MR until the executor confirms its remote bulk view is gone.
+
+- **Wire (freeze EXTENSION):** a new `nkvx_cancel` RPC registered BY NAME (request
+  `{ uint64 call_id }`, response `{ int32 ack }`; the name-hashed id does not perturb
+  `nkvx_exec`), PLUS one new field `uint64 client_call_id` appended to `nkvx_exec_in_t`. The
+  ack enum (`ALREADY_DONE/ABORTED/PUSH_CANCELED`) is TELEMETRY only — the DELIVERED ack is the
+  safety proof, the front never branches on its value.
+- **`(origin_addr, client_call_id)` registry:** `op_id` (tenant CDW13) is NOT unique even
+  among a SINGLE front's concurrent in-flight Execs — keying on it lets a cancel alias the
+  wrong Exec and ack the other early (a UAF; caught in C6b review). So the front stamps each
+  forward with a monotonic per-front `client_call_id` and the executor keys its registry on
+  `(HG_Get_info(handle)->addr, client_call_id)`, comparing origin with `HG_Addr_cmp` (origin
+  also scopes the id across fronts). `op_id` remains on the wire for telemetry only.
+- **Executor ack-chokepoint ordering (load-bearing):** `nkvx_req_finish` becomes the single
+  exit, ordered (1) `reg_remove` FIRST (any later cancel is then Case-a), (2) `HG_Respond`
+  the Exec, (3) free the local bulk handles — THE QUIESCENCE POINT: the executor's view of
+  `result_sink` is now gone, no PUSH can land, (4) ONLY THEN `HG_Respond` the stashed cancel
+  handle (ack), (5) free input/handle/req. Three cancel cases: (a) not found → ack
+  ALREADY_DONE now; (b) found, no PUSH in flight → `do_not_push=true` (the do-not-PUSH gate
+  finishes it ABORTED, the chokepoint acks); (c) found, PUSH in flight → `HG_Bulk_cancel` the
+  captured bulk op id (the PUSH submission now passes `&req->push_op`, not
+  `HG_OP_ID_IGNORE`), its cb resolves and the chokepoint acks post-quiesce.
+- **Front two-phase join:** `begin_cancel` (idempotent) sets `cancelling`, forwards
+  `nkvx_cancel` (phase 2) and ONLY THEN `HG_Cancel`s the Exec forward (phase 1). The order is
+  load-bearing (C6b review): if the cancel cannot be submitted, the front must NOT `HG_Cancel`
+  — letting the Exec finish naturally is UAF-safe because PUSH-before-Respond makes the natural
+  forward completion itself proof the bulk op drained. Cancelling the forward early in that
+  case is exactly what strands an in-flight PUSH against a freed DPTR. The call stays in-flight
+  until BOTH the forward resolves AND the ack arrives; the DPTR/MR is released ONLY at that
+  join (the sole release point on the cancel path). A call with NEITHER `result_sink` NOR
+  `input_bulk` (fully-inline payload) skips phase 2 — must check both handles, since a
+  large-input/inline-result Exec has no `result_sink` but a live input MR the executor is still
+  PULLing. `nkvx_front_cancel_all` is now this handshake; the channel-destroy drain it backs is
+  thereby UAF-safe.
+- **Scope:** the protocol + the channel-destroy teardown drain. Wiring the LIVE NVMe
+  ABORT-opcode to a per-command `begin_cancel` (needs per-io handle retention keyed by NVMe
+  cmd-id) is a deferred follow-on bead — independent of the protocol, which makes it safe.
+- **Validate (nkvx_c6b_test.sh, both na+sm and ofi+tcp):** cancel an in-flight Exec mid-PUSH
+  via an executor TICK-DEFERRAL stall hook (`NKVX_TEST_PUSH_STALL_TICKS`, NOT usleep —
+  usleep freezes the single-threaded loop and blocks cancel processing); assert the sink
+  poison is intact post-ack (NO late PUSH), the DPTR is reusable (byte-correct sha on a
+  following Exec), exactly-once ABORTED, outstanding→0, executor up, valgrind 0/0. (On-verbs
+  acceptance is C8, now unblocked.)
+
 **C7 — large-object/result bulk RMA.**
 Scope: the front-sink/executor-push large-result path (§1.3): front registers the
 tenant DPTR as a WRITE `hg_bulk_t`, ships `result_sink`; executor PUSHes (awaiting PUSH

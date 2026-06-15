@@ -119,10 +119,12 @@ main(int argc, char **argv)
 	int distinct = 1;			/* C7.2: round-robin N distinct sink buffers */
 	int cancel = 0;				/* C6a: cancel each forward after submitting */
 	int cancel_after = 0;			/* C6a: progress ticks before the cancel */
+	int poison_after_cancel = 0;		/* C6b: after an ABORTED cancel, poison the sink and
+						 * progress extra ticks; assert NO late PUSH overwrites it */
 
 	enum { OPT_KEY = 256, OPT_RUNTIME, OPT_MODULE, OPT_MODULE_NS, OPT_OSIZE,
 	       OPT_EXPECT_RESULT, OPT_SHA256, OPT_EXPECT_SHA, OPT_ITERS, OPT_DISTINCT,
-	       OPT_CANCEL, OPT_CANCEL_AFTER };
+	       OPT_CANCEL, OPT_CANCEL_AFTER, OPT_POISON_AFTER_CANCEL };
 	static const struct option opts[] = {
 		{ "listen",        required_argument, NULL, 'l' },
 		{ "target",        required_argument, NULL, 't' },
@@ -140,6 +142,7 @@ main(int argc, char **argv)
 		{ "distinct",      required_argument, NULL, OPT_DISTINCT },
 		{ "cancel",        no_argument,       NULL, OPT_CANCEL },
 		{ "cancel-after",  required_argument, NULL, OPT_CANCEL_AFTER },
+		{ "poison-after-cancel", required_argument, NULL, OPT_POISON_AFTER_CANCEL },
 		{ NULL,            0,                 NULL, 0 },
 	};
 	int c;
@@ -161,11 +164,12 @@ main(int argc, char **argv)
 		case OPT_DISTINCT: distinct = atoi(optarg); break;
 		case OPT_CANCEL: cancel = 1; break;
 		case OPT_CANCEL_AFTER: cancel = 1; cancel_after = atoi(optarg); break;
+		case OPT_POISON_AFTER_CANCEL: poison_after_cancel = atoi(optarg); break;
 		default:
 			fprintf(stderr, "usage: %s --listen NA (--target ADDR | --addr-file PATH) "
 				"[--key K] [--runtime N] [--module M] [--module-ns NS] [--osize N] "
 				"[--sha256 HEX] [--expect N] [--expect-result N] [--expect-sha256 HEX] "
-				"[--iters N] [--cancel] [--cancel-after N]\n",
+				"[--iters N] [--cancel] [--cancel-after N] [--poison-after-cancel N]\n",
 				argv[0]);
 			return 2;
 		}
@@ -359,6 +363,36 @@ main(int argc, char **argv)
 			printf("test: cancel iter %d -> status=%d (%s)\n", it, (int)st.status,
 			       (int)st.status == SPDK_KVDEV_IO_STATUS_ABORTED ?
 			       "ABORTED — cancel won" : "completed — cancel lost race");
+
+			/*
+			 * Slice C6b LOAD-BEARING "no PUSH after ack" assertion. The done-cb
+			 * fired only after the two-phase cancel JOINED — i.e. after the executor
+			 * ACKED the cancel (do-not-PUSH set / in-flight PUSH HG_Bulk_cancel'd,
+			 * remote bulk view gone). So the DPTR is now ours again and NOTHING may
+			 * land in it. Poison it with a fresh sentinel, progress extra bounded
+			 * ticks (any stray late PUSH would fire here), and assert the sentinel is
+			 * untouched. With the C6a origin-only cancel this could be violated by a
+			 * late cross-process PUSH; with the handshake it must hold. (Only mean-
+			 * ingful when the cancel actually WON — a lost race delivered real bytes.) */
+			if (poison_after_cancel > 0 &&
+			    (int)st.status == SPDK_KVDEV_IO_STATUS_ABORTED) {
+				const unsigned char POISON = 0x5C;
+				memset(sink, POISON, (size_t)osize);
+				for (int i = 0; i < poison_after_cancel; i++) {
+					(void)nkvx_front_progress(front, 1);
+				}
+				for (int o = 0; o < osize; o++) {
+					if (sink[o] != POISON) {
+						fprintf(stderr, "test: FAIL iter %d (LATE PUSH after cancel "
+							"ack — byte %d = 0x%02x != poison 0x%02x; the "
+							"do-not-PUSH handshake did not hold)\n",
+							it, o, sink[o], POISON);
+						goto done;
+					}
+				}
+				printf("test: iter %d no-late-PUSH verified (sink poison intact "
+				       "%d ticks post-ack)\n", it, poison_after_cancel);
+			}
 			continue;	/* skip result_len / sha checks on the abort path */
 		}
 		if ((int)st.status != expect) {
@@ -383,6 +417,55 @@ main(int argc, char **argv)
 				goto done;
 			}
 		}
+	}
+
+	/*
+	 * Slice C6b DPTR-REUSE-AFTER-CANCEL: after cancelling Execs on a sink, run ONE
+	 * NON-cancel Exec on that SAME sink and sha-check the delivered bytes. Proves
+	 * the just-cancelled DPTR is fully reusable and the executor PUSHes correct
+	 * bytes into it (no residual MR confusion from the cancel handshake). Only when
+	 * a content hash is known (--expect-sha256) and a real result is expected.
+	 */
+	if (cancel && have_expect_sha && expect == SPDK_KVDEV_IO_STATUS_SUCCESS) {
+		unsigned char *sink = sinks[0];
+		struct done_state st;
+		memset(&st, 0, sizeof(st));
+		st.sink = sink;
+		st.sink_cap = (uint32_t)osize;
+		memset(sink, 0xA5, (size_t)osize);
+
+		rc = nkvx_front_forward(front, &in, sink, (uint32_t)osize, on_done, &st);
+		if (rc != 0) {
+			fprintf(stderr, "test: reuse-after-cancel forward failed: %d\n", rc);
+			goto done;
+		}
+		for (int i = 0; i < 200000 && !st.called; i++) {
+			if (nkvx_front_progress(front, 100) < 0) {
+				fprintf(stderr, "test: reuse-after-cancel progress failed\n");
+				goto done;
+			}
+		}
+		if (!st.called || st.calls != 1 || nkvx_front_outstanding(front) != 0 ||
+		    (int)st.status != SPDK_KVDEV_IO_STATUS_SUCCESS) {
+			fprintf(stderr, "test: FAIL reuse-after-cancel (called=%d calls=%d "
+				"outstanding=%u status=%d)\n", st.called, st.calls,
+				nkvx_front_outstanding(front), (int)st.status);
+			goto done;
+		}
+		{
+			uint32_t n = st.result_len < (uint32_t)osize ?
+				st.result_len : (uint32_t)osize;
+			unsigned char got[SHA256_DIGEST_LENGTH];
+
+			SHA256(sink, n, got);
+			if (memcmp(got, expect_sha, sizeof(got)) != 0) {
+				fprintf(stderr, "test: FAIL reuse-after-cancel (delivered %u bytes "
+					"sha256 mismatch — DPTR not cleanly reusable?)\n", n);
+				goto done;
+			}
+		}
+		printf("test: DPTR reuse-after-cancel verified (correct bytes into the "
+		       "just-cancelled sink)\n");
 	}
 
 	/*

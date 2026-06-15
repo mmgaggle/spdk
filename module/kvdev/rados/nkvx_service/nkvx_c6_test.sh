@@ -22,13 +22,15 @@
 #       (valgrind) the cancel test under valgrind --leak-check=full: 0 lost, 0
 #                  errors (origin-side teardown is leak/UAF clean).
 #
-#   SCOPE / HONESTY: these assertions cover what the slice WIRES (origin-side
-#   cancel + bounded teardown drain). They do NOT prove the design's "no PUSH lands
-#   after teardown" invariant: HG_Cancel is ORIGIN-side only, and a late executor
-#   PUSH into the result_sink is invisible to valgrind on sm/tcp (cross-process). A
-#   green run is NOT proof of that cross-process UAF invariant. The executor-side
-#   do-not-PUSH protocol that makes per-command abort and on-verbs teardown SAFE is
-#   DEFERRED to bead spdk-5ia (verifiable on verbs / with an executor-side abort).
+#   SCOPE: these C6/C6a assertions cover the origin-side cancel + bounded teardown
+#   drain. The design's "no PUSH lands after teardown" cross-process UAF invariant
+#   that this test historically DISCLAIMED (HG_Cancel being origin-only) is NOW
+#   IMPLEMENTED and ASSERTED by Slice C6b (bead spdk-5ia): the executor-side
+#   do-not-PUSH protocol + ack handshake. See nkvx_c6b_test.sh, which drives a
+#   cancel mid-PUSH with the executor TICK-DEFERRAL stall hook and asserts the sink
+#   poison is intact post-ack (no late PUSH) + a reusable DPTR + valgrind-clean, on
+#   both na+sm and ofi+tcp. (On-verbs acceptance is the downstream C8 bead, now
+#   unblocked.) This C6 harness remains the origin-side / fault-injection coverage.
 #
 # The (caps)/(sha)/(cancel) cases need a rados-backed executor; (kill) is
 # pure-transport (no --rados-pool needed, but we run it on the same rados-backed

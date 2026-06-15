@@ -72,6 +72,15 @@ typedef struct {
 	uint32_t	op_id;
 
 	/**
+	 * Front-assigned, per-front-UNIQUE handshake token (Slice C6b). op_id is the
+	 * tenant CDW13 and is NOT unique among a front's concurrent in-flight Execs, so
+	 * it cannot key the executor's cancel registry (two same-op_id Execs would alias
+	 * and a cancel could abort the wrong one / ack the other early — a UAF). This
+	 * monotonic per-front id names exactly one in-flight Exec. 0 = unset/none.
+	 */
+	uint64_t	client_call_id;
+
+	/**
 	 * Read-only invariant (design OQ-5): the front passes the per-op
 	 * read_only bit; the executor enforces it at its mutation point.
 	 */
@@ -176,6 +185,45 @@ typedef struct {
 	void		*result_inline;
 } nkvx_exec_out_t;
 
+/**
+ * Exec CANCEL RPC (Slice C6b, bead spdk-5ia; design §C6b). A SECOND, additive
+ * Mercury RPC the front forwards to the executor to make the cross-process abort
+ * use-after-free-safe: the executor sets do-not-PUSH / HG_Bulk_cancels any
+ * in-flight result PUSH and acks ONLY once its remote bulk view is quiescent; the
+ * front defers releasing the result_sink MR / tenant DPTR until that ack. The new
+ * RPC is registered by name ("nkvx_cancel"), so its name-hashed id does NOT
+ * perturb the frozen nkvx_exec contract — this is a freeze-respecting EXTENSION,
+ * not a change to nkvx_exec_in_t (HITL nod).
+ *
+ * Registry key on the executor is (origin_addr, op_id), NOT op_id alone: op_id is
+ * the tenant CDW13 and is not unique across fronts; a single executor serves
+ * several. The origin address rides implicitly via HG_Get_info(handle)->addr, so
+ * ONLY op_id is on the wire — deliberately avoiding a new field on the frozen
+ * request envelope.
+ */
+typedef struct {
+	/** The front-unique client_call_id of the in-flight nkvx_exec to cancel
+	 *  (matches nkvx_exec_in_t.client_call_id — NOT op_id, which is not unique). */
+	uint64_t	call_id;
+} nkvx_cancel_in_t;
+
+/**
+ * Cancel ack code (TELEMETRY only). All three values mean the same thing for
+ * SAFETY — "the executor's remote view of result_sink is gone" — so the front
+ * never branches on the value; the DELIVERED ack is itself the proof. The value
+ * only lets the executor log / tests assert which cancel case (a/b/c) was taken.
+ */
+enum nkvx_cancel_ack {
+	NKVX_CANCEL_ALREADY_DONE = 0,	/* (a) op not found: already finished / unknown / dup */
+	NKVX_CANCEL_ABORTED      = 1,	/* (b) found, no PUSH in flight: do-not-PUSH honored */
+	NKVX_CANCEL_PUSH_CANCELED = 2,	/* (c) found, PUSH in flight: HG_Bulk_cancel'd */
+};
+
+/** Cancel RPC RESPONSE: a fixed int32 ack (one of enum nkvx_cancel_ack), endian-safe. */
+typedef struct {
+	int32_t		ack;
+} nkvx_cancel_out_t;
+
 /*
  * hg_proc serializers (design §1.2 / C3). One routine per envelope; each
  * encodes/decodes every field explicitly. Usable as the proc callback in
@@ -187,6 +235,14 @@ typedef struct {
  */
 hg_return_t hg_proc_nkvx_exec_in_t(hg_proc_t proc, void *data);
 hg_return_t hg_proc_nkvx_exec_out_t(hg_proc_t proc, void *data);
+
+/*
+ * Cancel RPC serializers (Slice C6b). Each is a single fixed-width scalar
+ * (uint32 op_id / int32 ack), so there is nothing to allocate on decode and
+ * therefore no matching _free() helper.
+ */
+hg_return_t hg_proc_nkvx_cancel_in_t(hg_proc_t proc, void *data);
+hg_return_t hg_proc_nkvx_cancel_out_t(hg_proc_t proc, void *data);
 
 /** Release heap allocations a decoded request holds (strings + inline input). */
 void nkvx_exec_in_free(nkvx_exec_in_t *in);

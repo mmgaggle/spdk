@@ -130,20 +130,25 @@ int nkvx_front_forward(struct nkvx_front *front, const nkvx_exec_in_t *in,
 /**
  * Cancel EVERY in-flight Exec on \p front (channel-destroy teardown drain).
  *
- * BEST-EFFORT, ORIGIN-SIDE ONLY (NOT a full UAF guarantee): HG_Cancel() cancels
- * the ORIGIN-side send/recv on each handle so the forward resolves to a terminal
- * completion (HG_CANCELED -> ABORTED) from a later progress tick, where the bulk
- * handles are released and the call ctx freed. It does NOT reach into the
- * executor: the executor has no do-not-PUSH awareness and may still PUSH into the
- * registered result_sink AFTER the origin cancels (tracked by bead spdk-5ia).
- * This is therefore safe ONLY at channel-destroy teardown, where the front AND
- * the executor are being torn down and the DPTR is not reused per-command. SAFE
- * per-command abort and on-the-verbs teardown require the executor-side cancel
- * protocol (bead spdk-5ia) and are NOT provided here.
+ * UAF-SAFE via the Slice C6b two-phase cancel handshake (bead spdk-5ia): for each
+ * in-flight call this (1) HG_Cancel()s the ORIGIN-side Exec forward so it resolves
+ * to a terminal completion, AND (2) forwards an nkvx_cancel RPC to the executor.
+ * The call stays in-flight (counted by nkvx_front_outstanding) until BOTH the
+ * forward has resolved AND the executor has ACKED the cancel — the ack is positive
+ * proof the executor has set do-not-PUSH / HG_Bulk_cancel'd any in-flight PUSH and
+ * its remote view of the result_sink is gone. ONLY THEN are the bulk handles (the
+ * tenant DPTR / MR) released. So no PUSH can land in the DPTR after release — the
+ * cross-process use-after-free C6a left open is closed here. (An inline-only call
+ * with no result_sink skips phase 2: there is no DPTR for the executor to PUSH.)
  *
  * Idempotent. The caller progresses until nkvx_front_outstanding() reaches 0
- * (bounded — HG_Cancel forces each forward to a terminal NA completion), then, if
- * the bound is exceeded, uses nkvx_front_fail_all_pending() before fini.
+ * (bounded by the ack), then, if the bound is exceeded (a wedged/dead executor),
+ * uses nkvx_front_fail_all_pending() before fini.
+ *
+ * NOTE: this is the channel-destroy teardown primitive. Wiring the live NVMe
+ * ABORT-opcode to a PER-COMMAND abort is a deferred follow-on (it needs per-io
+ * handle retention keyed by NVMe cmd-id); the protocol here is what makes that
+ * follow-on UAF-safe.
  */
 void nkvx_front_cancel_all(struct nkvx_front *front);
 
