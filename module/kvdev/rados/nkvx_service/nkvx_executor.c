@@ -175,12 +175,58 @@ nkvx_result_set(struct nkvx_exec_result *res, enum spdk_kvdev_io_status status,
  * The object is the value stored at oid=hex(key); osize is the tenant output cap.
  */
 static int
-nkvx_run_builtin(struct nkvx_executor *ex, const char *oid, const char *module,
-		 uint32_t osize, struct nkvx_exec_result *res)
+nkvx_run_builtin(struct nkvx_executor *ex, const char *oid,
+		 const nkvx_exec_in_t *in, struct nkvx_exec_result *res)
 {
+	const char *module = in->module_key;
+	uint32_t osize = in->osize;
 	uint64_t size = 0;
 	time_t mtime = 0;
 	int rc;
+
+	/*
+	 * Input-observing built-ins (spdk-aep): operate on the per-request input
+	 * (in->input_inline / in->input_len -- the C7 PULL path repoints input_inline
+	 * at the pulled buffer for large inputs, so this is uniform for inline and
+	 * bulk). They do NOT read the stored object, so they run before rados_stat.
+	 *   - inputlen:  result is the input length as a little-endian uint64 (8 B).
+	 *   - inputecho: result is the input bytes (truncated to the host cap, true
+	 *                length reported, matching identity/Retrieve truncation).
+	 */
+	if (strcmp(module, "inputlen") == 0) {
+		uint64_t len = in->input_len;
+		uint32_t result_len = (uint32_t)sizeof(len);
+		uint32_t deliver = spdk_min(osize, result_len);
+		enum spdk_kvdev_io_status st = (result_len > osize) ?
+			SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL : SPDK_KVDEV_IO_STATUS_SUCCESS;
+
+		return nkvx_result_set(res, st, result_len, &len, deliver);
+	}
+
+	if (strcmp(module, "inputecho") == 0) {
+		uint32_t result_len = in->input_len;
+		uint32_t deliver = spdk_min(osize, result_len);
+		enum spdk_kvdev_io_status st = (result_len > osize) ?
+			SPDK_KVDEV_IO_STATUS_BUFFER_TOO_SMALL : SPDK_KVDEV_IO_STATUS_SUCCESS;
+		char *buf;
+
+		if (deliver == 0) {
+			return nkvx_result_set(res, st, result_len, NULL, 0);
+		}
+		if (in->input_inline == NULL) {
+			return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_INVALID, 0, NULL, 0);
+		}
+		buf = malloc(deliver);
+		if (buf == NULL) {
+			return nkvx_result_set(res, SPDK_KVDEV_IO_STATUS_NOMEM, 0, NULL, 0);
+		}
+		memcpy(buf, in->input_inline, deliver);
+		res->status = st;
+		res->result_len = result_len;
+		res->buf = buf;
+		res->buf_len = deliver;
+		return 0;
+	}
 
 	rc = rados_stat(ex->ioctx, oid, &size, &mtime);
 	if (rc == -ENOENT) {
@@ -514,7 +560,7 @@ nkvx_executor_run(struct nkvx_executor *ex, const nkvx_exec_in_t *in,
 	if (in->runtime == (uint8_t)SPDK_KV_EXEC_RUNTIME_CLS &&
 	    in->module_ns != NULL && strcmp(in->module_ns, "nkvx") == 0 &&
 	    in->module_key != NULL) {
-		return nkvx_run_builtin(ex, oid, in->module_key, in->osize, res);
+		return nkvx_run_builtin(ex, oid, in, res);
 	}
 
 	if (in->runtime == (uint8_t)SPDK_KV_EXEC_RUNTIME_WASM) {
