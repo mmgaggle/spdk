@@ -417,56 +417,6 @@ nvfu_kv_exec(struct nvfu_dev *d, const char *key, uint32_t op_id,
 }
 
 /*
- * Build PRP1/PRP2 for a page-contiguous DMA buffer of `size` bytes (iova==vaddr,
- * page-aligned). <=1 page: PRP2 unused. 2 pages: PRP2 = page 1. >2 pages: fill
- * prp_list (a >=1-page DMA buffer) with pages 1..n-1 and point PRP2 at it.
- * Supports up to one PRP-list page (<=512 list entries => ~2 MiB). 0 / -errno.
- */
-static inline int
-nvfu_build_prp(uint64_t buf_iova, uint32_t size, uint64_t *prp_list,
-	       uint64_t prp_list_iova, uint64_t *prp1, uint64_t *prp2)
-{
-	uint32_t pages = (size + 4095) / 4096;
-	uint32_t i;
-
-	*prp1 = buf_iova;
-	*prp2 = 0;
-	if (pages <= 1) {
-		return 0;
-	}
-	if (pages == 2) {
-		*prp2 = buf_iova + 4096;
-		return 0;
-	}
-	if (pages - 1 > 512) {
-		return -E2BIG;	/* would need chained PRP lists */
-	}
-	for (i = 1; i < pages; i++) {
-		prp_list[i - 1] = buf_iova + (uint64_t)i * 4096;
-	}
-	*prp2 = prp_list_iova;
-	return 0;
-}
-
-/* KV op (store/retrieve) with caller-built PRPs and an explicit value size. */
-static inline int
-nvfu_kv_xfer_prp(struct nvfu_dev *d, uint8_t opc, const char *key,
-		 uint32_t size, uint64_t prp1, uint64_t prp2,
-		 struct spdk_nvme_cpl *out_cpl)
-{
-	struct spdk_nvme_cmd cmd;
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.opc = opc;
-	cmd.nsid = KV_NSID;
-	cmd.dptr.prp.prp1 = prp1;
-	cmd.dptr.prp.prp2 = prp2;
-	cmd.cdw10_bits.kv.vsize = size;
-	nvfu_kv_set_key(&cmd, key, (uint8_t)strlen(key));
-	return nvfu_submit_poll(d, &d->io, &cmd, out_cpl);
-}
-
-/*
  * KV op with a single CONTIGUOUS SGL data-block descriptor. One descriptor
  * describes the whole buffer regardless of size (up to the controller's
  * max_io_size = 64 MiB) -- no PRP list, no 512-entry-page boundary. This is the
