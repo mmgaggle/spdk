@@ -321,6 +321,17 @@ struct spdk_kvdev_fn_table {
 		     spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
 
 	/**
+	 * Iovec-native Store (optional; may be NULL). Gathers exactly \c value_len
+	 * bytes from \c iov[0..iovcnt) directly, with no contiguous bounce buffer.
+	 * Same options/semantics as \c store. When NULL the caller must fall back to
+	 * \c store with a contiguous buffer.
+	 */
+	int (*storev)(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+		      struct iovec *iov, int iovcnt, uint32_t value_len,
+		      const struct spdk_kvdev_store_opts *opts,
+		      spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
+
+	/**
 	 * Retrieve the value stored under a key into value_buf.
 	 *
 	 * On completion, value_len reports the true stored length. If the
@@ -330,6 +341,16 @@ struct spdk_kvdev_fn_table {
 	int (*retrieve)(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
 			void *value_buf, uint32_t buf_len,
 			spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
+
+	/**
+	 * Iovec-native Retrieve (optional; may be NULL). Scatters the stored value
+	 * across \c iov[0..iovcnt) (up to \c buf_len bytes total) directly, with no
+	 * contiguous bounce buffer. Same completion semantics as \c retrieve. When
+	 * NULL the caller must fall back to \c retrieve with a contiguous buffer.
+	 */
+	int (*retrievev)(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+			 struct iovec *iov, int iovcnt, uint32_t buf_len,
+			 spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
 
 	/**
 	 * Delete the key (and its value) from the kvdev.
@@ -623,6 +644,34 @@ int spdk_kvdev_retrieve(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch
 			const void *key, uint8_t key_len,
 			void *value_buf, uint32_t buf_len,
 			spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
+
+/**
+ * True if the descriptor's kvdev implements the iovec-native Store/Retrieve ops
+ * (spdk_kvdev_storev / spdk_kvdev_retrievev). A caller with a multi-iov payload
+ * can then avoid gathering/scattering through a contiguous bounce buffer.
+ */
+bool spdk_kvdev_io_supports_iov(struct spdk_kvdev_desc *desc);
+
+/**
+ * Iovec-native Store: gather exactly \c value_len bytes from \c iov[0..iovcnt)
+ * with no contiguous bounce buffer. Returns -ENOTSUP if the backend has no
+ * storev op (check spdk_kvdev_io_supports_iov first).
+ */
+int spdk_kvdev_storev(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
+		      const void *key, uint8_t key_len,
+		      struct iovec *iov, int iovcnt, uint32_t value_len,
+		      const struct spdk_kvdev_store_opts *opts,
+		      spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
+
+/**
+ * Iovec-native Retrieve: scatter the stored value across \c iov[0..iovcnt) (up
+ * to \c buf_len bytes total) with no contiguous bounce buffer. Returns -ENOTSUP
+ * if the backend has no retrievev op (check spdk_kvdev_io_supports_iov first).
+ */
+int spdk_kvdev_retrievev(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
+			 const void *key, uint8_t key_len,
+			 struct iovec *iov, int iovcnt, uint32_t buf_len,
+			 spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
 
 /**
  * Submit a Delete on the descriptor's kvdev. Thin wrapper over the fn_table.

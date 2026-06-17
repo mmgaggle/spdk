@@ -1201,10 +1201,10 @@ kvdev_rados_io_alloc(struct kvdev_rados_io_channel *ch, enum kvdev_rados_op op,
 }
 
 static int
-kvdev_rados_store(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
-		  const void *value, uint32_t value_len,
-		  const struct spdk_kvdev_store_opts *opts,
-		  spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+kvdev_rados_storev(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
+		   struct iovec *iov, int iovcnt, uint32_t value_len,
+		   const struct spdk_kvdev_store_opts *opts,
+		   spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
 {
 	struct kvdev_rados_io_channel *ch = spdk_io_channel_get_ctx(_ch);
 	struct kvdev_rados *rdev = ch->rdev;
@@ -1272,7 +1272,32 @@ kvdev_rados_store(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 		rados_write_op_assert_exists(io->write_op);
 	}
 
-	rados_write_op_write_full(io->write_op, value, value_len);
+	/*
+	 * Write exactly value_len bytes gathered from the iovs, with no contiguous
+	 * bounce buffer (spdk-6gs). write_full on the first chunk truncates the
+	 * object to that chunk, then each subsequent chunk is written at its
+	 * cumulative offset, so the object ends up exactly value_len bytes — the
+	 * write_full semantics object-per-KV relies on. value_len <= sum(iov_len).
+	 */
+	if (value_len == 0) {
+		rados_write_op_write_full(io->write_op, "", 0);
+	} else {
+		uint64_t off = 0;
+		uint32_t remaining = value_len;
+		int i;
+
+		for (i = 0; i < iovcnt && remaining > 0; i++) {
+			uint32_t n = (uint32_t)spdk_min((uint64_t)remaining, (uint64_t)iov[i].iov_len);
+
+			if (off == 0) {
+				rados_write_op_write_full(io->write_op, iov[i].iov_base, n);
+			} else {
+				rados_write_op_write(io->write_op, iov[i].iov_base, n, off);
+			}
+			off += n;
+			remaining -= n;
+		}
+	}
 
 	if (ttl_valid) {
 		/* Store-only TTL persisted as an xattr (ADR-0003 spirit). Never
@@ -1296,16 +1321,30 @@ kvdev_rados_store(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 	return 0;
 }
 
+/* Contiguous Store: a single-iovec gather over the iovec-native core. */
 static int
-kvdev_rados_retrieve(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
-		     void *value_buf, uint32_t buf_len,
-		     spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+kvdev_rados_store(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
+		  const void *value, uint32_t value_len,
+		  const struct spdk_kvdev_store_opts *opts,
+		  spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct iovec iov = { .iov_base = (void *)value, .iov_len = value_len };
+
+	return kvdev_rados_storev(_ch, key, key_len, &iov, 1, value_len, opts, cb_fn, cb_arg);
+}
+
+static int
+kvdev_rados_retrievev(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
+		      struct iovec *iov, int iovcnt, uint32_t buf_len,
+		      spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
 {
 	struct kvdev_rados_io_channel *ch = spdk_io_channel_get_ctx(_ch);
 	struct kvdev_rados *rdev = ch->rdev;
 	struct kvdev_rados_io *io;
 	char oid[KVDEV_RADOS_OID_MAX];
-	int rc;
+	uint64_t off;
+	uint32_t remaining;
+	int rc, i;
 
 	kvdev_rados_key_to_oid(key, key_len, oid);
 
@@ -1316,13 +1355,6 @@ kvdev_rados_retrieve(struct spdk_io_channel *_ch, const void *key, uint8_t key_l
 	}
 	io->buf_len = buf_len;
 
-	/*
-	 * Bundle read + stat in a single aio read_op so we learn the TRUE object
-	 * size in the same round-trip: read copies min(size, buf_len) bytes, stat
-	 * yields the full size. This lets Retrieve report the true value length
-	 * (and BUFFER_TOO_SMALL when truncated), matching the in-memory module,
-	 * without a second network round-trip.
-	 */
 	io->read_op = rados_create_read_op();
 	if (io->read_op == NULL) {
 		rados_aio_release(io->comp);
@@ -1331,8 +1363,23 @@ kvdev_rados_retrieve(struct spdk_io_channel *_ch, const void *key, uint8_t key_l
 		return 0;
 	}
 
-	rados_read_op_read(io->read_op, 0, buf_len, value_buf, &io->bytes_read,
-			   &io->read_rval);
+	/*
+	 * Scatter the object's first buf_len bytes directly across the iovs in ONE
+	 * read_op round-trip (spdk-6gs) -- no contiguous bounce buffer. Only the
+	 * first sub-read records read_rval; reads within range never fail on their
+	 * own (a past-EOF range just yields fewer bytes), and a genuine error fails
+	 * operate() as a whole. stat yields the TRUE length for truncation reporting.
+	 */
+	off = 0;
+	remaining = buf_len;
+	for (i = 0; i < iovcnt && remaining > 0; i++) {
+		uint32_t n = (uint32_t)spdk_min((uint64_t)remaining, (uint64_t)iov[i].iov_len);
+
+		rados_read_op_read(io->read_op, off, n, iov[i].iov_base, NULL,
+				   (off == 0) ? &io->read_rval : NULL);
+		off += n;
+		remaining -= n;
+	}
 	rados_read_op_stat(io->read_op, &io->stat_size, &io->stat_mtime, NULL);
 
 	rc = rados_aio_read_op_operate(io->read_op, rdev->io_ctx, io->comp, oid, 0);
@@ -1346,6 +1393,17 @@ kvdev_rados_retrieve(struct spdk_io_channel *_ch, const void *key, uint8_t key_l
 
 	TAILQ_INSERT_TAIL(&ch->inflight, io, link);
 	return 0;
+}
+
+/* Contiguous Retrieve: a single-iovec scatter over the iovec-native core. */
+static int
+kvdev_rados_retrieve(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
+		     void *value_buf, uint32_t buf_len,
+		     spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct iovec iov = { .iov_base = value_buf, .iov_len = buf_len };
+
+	return kvdev_rados_retrievev(_ch, key, key_len, &iov, 1, buf_len, cb_fn, cb_arg);
 }
 
 static int
@@ -2464,7 +2522,9 @@ static const struct spdk_kvdev_fn_table kvdev_rados_fn_table = {
 	.destruct	= kvdev_rados_destruct,
 	.get_io_channel	= kvdev_rados_get_io_channel,
 	.store		= kvdev_rados_store,
+	.storev		= kvdev_rados_storev,
 	.retrieve	= kvdev_rados_retrieve,
+	.retrievev	= kvdev_rados_retrievev,
 	.del		= kvdev_rados_op_delete,
 	.exist		= kvdev_rados_exist,
 	.list		= kvdev_rados_list,

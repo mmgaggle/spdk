@@ -172,10 +172,10 @@ kvdev_mem_entry_set_ttl(struct kvdev_mem_entry *entry,
 }
 
 static int
-kvdev_mem_store(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
-		const void *value, uint32_t value_len,
-		const struct spdk_kvdev_store_opts *opts,
-		spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+kvdev_mem_storev(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+		 struct iovec *iov, int iovcnt, uint32_t value_len,
+		 const struct spdk_kvdev_store_opts *opts,
+		 spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
 {
 	struct kvdev_mem_io_channel *mch = spdk_io_channel_get_ctx(ch);
 	struct kvdev_mem *mdev = mch->mdev;
@@ -201,7 +201,7 @@ kvdev_mem_store(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
 			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
 			return 0;
 		}
-		memcpy(buf, value, value_len);
+		spdk_copy_iovs_to_buf(buf, value_len, iov, iovcnt);
 		free(entry->value);
 		entry->value = buf;
 		entry->value_len = value_len;
@@ -238,7 +238,7 @@ kvdev_mem_store(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
 
 	memcpy(entry->key, key, key_len);
 	entry->key_len = key_len;
-	memcpy(buf, value, value_len);
+	spdk_copy_iovs_to_buf(buf, value_len, iov, iovcnt);
 	entry->value = buf;
 	entry->value_len = value_len;
 	kvdev_mem_entry_set_ttl(entry, opts);
@@ -250,10 +250,22 @@ kvdev_mem_store(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
 	return 0;
 }
 
+/* Contiguous Store: a single-iovec gather over the iovec-native core. */
 static int
-kvdev_mem_retrieve(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
-		   void *value_buf, uint32_t buf_len,
-		   spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+kvdev_mem_store(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+		const void *value, uint32_t value_len,
+		const struct spdk_kvdev_store_opts *opts,
+		spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct iovec iov = { .iov_base = (void *)value, .iov_len = value_len };
+
+	return kvdev_mem_storev(ch, key, key_len, &iov, 1, value_len, opts, cb_fn, cb_arg);
+}
+
+static int
+kvdev_mem_retrievev(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+		    struct iovec *iov, int iovcnt, uint32_t buf_len,
+		    spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
 {
 	struct kvdev_mem_io_channel *mch = spdk_io_channel_get_ctx(ch);
 	struct kvdev_mem *mdev = mch->mdev;
@@ -268,7 +280,7 @@ kvdev_mem_retrieve(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
 
 	copy_len = spdk_min(entry->value_len, buf_len);
 	if (copy_len > 0) {
-		memcpy(value_buf, entry->value, copy_len);
+		spdk_copy_buf_to_iovs(iov, iovcnt, entry->value, copy_len);
 	}
 
 	if (entry->value_len > buf_len) {
@@ -279,6 +291,17 @@ kvdev_mem_retrieve(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
 
 	cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_SUCCESS, entry->value_len);
 	return 0;
+}
+
+/* Contiguous Retrieve: a single-iovec scatter over the iovec-native core. */
+static int
+kvdev_mem_retrieve(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+		   void *value_buf, uint32_t buf_len,
+		   spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct iovec iov = { .iov_base = value_buf, .iov_len = buf_len };
+
+	return kvdev_mem_retrievev(ch, key, key_len, &iov, 1, buf_len, cb_fn, cb_arg);
 }
 
 static int
@@ -577,6 +600,35 @@ kvdev_mem_retrieve_locked(struct spdk_io_channel *ch, const void *key, uint8_t k
 }
 
 static int
+kvdev_mem_storev_locked(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+			struct iovec *iov, int iovcnt, uint32_t value_len,
+			const struct spdk_kvdev_store_opts *opts,
+			spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_mem *mdev = KVDEV_MEM_MDEV(ch);
+	int rc;
+
+	pthread_mutex_lock(&mdev->lock);
+	rc = kvdev_mem_storev(ch, key, key_len, iov, iovcnt, value_len, opts, cb_fn, cb_arg);
+	pthread_mutex_unlock(&mdev->lock);
+	return rc;
+}
+
+static int
+kvdev_mem_retrievev_locked(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+			   struct iovec *iov, int iovcnt, uint32_t buf_len,
+			   spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_mem *mdev = KVDEV_MEM_MDEV(ch);
+	int rc;
+
+	pthread_mutex_lock(&mdev->lock);
+	rc = kvdev_mem_retrievev(ch, key, key_len, iov, iovcnt, buf_len, cb_fn, cb_arg);
+	pthread_mutex_unlock(&mdev->lock);
+	return rc;
+}
+
+static int
 kvdev_mem_delete_locked(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
 			spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
 {
@@ -638,7 +690,9 @@ static const struct spdk_kvdev_fn_table kvdev_mem_fn_table = {
 	.destruct	= kvdev_mem_destruct,
 	.get_io_channel	= kvdev_mem_get_io_channel,
 	.store		= kvdev_mem_store_locked,
+	.storev		= kvdev_mem_storev_locked,
 	.retrieve	= kvdev_mem_retrieve_locked,
+	.retrievev	= kvdev_mem_retrievev_locked,
 	.del		= kvdev_mem_delete_locked,
 	.exist		= kvdev_mem_exist_locked,
 	.list		= kvdev_mem_list_locked,

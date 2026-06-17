@@ -257,6 +257,51 @@ spdk_kvdev_retrieve(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 	return kvdev->fn_table->retrieve(ch, key, key_len, value_buf, buf_len, cb_fn, cb_arg);
 }
 
+bool
+spdk_kvdev_io_supports_iov(struct spdk_kvdev_desc *desc)
+{
+	const struct spdk_kvdev_fn_table *t = desc->kvdev->fn_table;
+
+	return t->storev != NULL && t->retrievev != NULL;
+}
+
+int
+spdk_kvdev_storev(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
+		  const void *key, uint8_t key_len,
+		  struct iovec *iov, int iovcnt, uint32_t value_len,
+		  const struct spdk_kvdev_store_opts *opts,
+		  spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct spdk_kvdev *kvdev = desc->kvdev;
+
+	if (key == NULL || key_len < SPDK_KVDEV_KEY_MIN_LEN || key_len > kvdev->caps.max_key_len) {
+		return -EINVAL;
+	}
+	if (kvdev->fn_table->storev == NULL) {
+		return -ENOTSUP;
+	}
+
+	return kvdev->fn_table->storev(ch, key, key_len, iov, iovcnt, value_len, opts, cb_fn, cb_arg);
+}
+
+int
+spdk_kvdev_retrievev(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
+		     const void *key, uint8_t key_len,
+		     struct iovec *iov, int iovcnt, uint32_t buf_len,
+		     spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct spdk_kvdev *kvdev = desc->kvdev;
+
+	if (key == NULL || key_len < SPDK_KVDEV_KEY_MIN_LEN || key_len > kvdev->caps.max_key_len) {
+		return -EINVAL;
+	}
+	if (kvdev->fn_table->retrievev == NULL) {
+		return -ENOTSUP;
+	}
+
+	return kvdev->fn_table->retrievev(ch, key, key_len, iov, iovcnt, buf_len, cb_fn, cb_arg);
+}
+
 int
 spdk_kvdev_delete(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 		  const void *key, uint8_t key_len,

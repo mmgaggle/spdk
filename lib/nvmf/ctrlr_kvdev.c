@@ -497,21 +497,41 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 			opts.ttl = cmd->cdw12_bits.kv_store.ttl;
 		}
 
-		data = nvmf_kvdev_get_contig_buf(req, true, kv_req);
-		if (data == NULL) {
-			goto err_nomem;
+		/*
+		 * Multi-iov payload: gather directly from the request iovs via the
+		 * iovec-native op (no contiguous bounce buffer; spdk-6gs). A single iov
+		 * (or a backend without storev) uses the contiguous path, which returns
+		 * iov[0] for iovcnt==1 and only bounces for iovcnt>1.
+		 */
+		if (req->iovcnt > 1 && spdk_kvdev_io_supports_iov(ns->kvdev_desc)) {
+			rc = spdk_kvdev_storev(ns->kvdev_desc, ch, key, key_len,
+					       req->iov, req->iovcnt, xfer_len, &opts,
+					       nvmf_kvdev_store_done, kv_req);
+		} else {
+			data = nvmf_kvdev_get_contig_buf(req, true, kv_req);
+			if (data == NULL) {
+				goto err_nomem;
+			}
+			rc = spdk_kvdev_store(ns->kvdev_desc, ch, key, key_len, data, xfer_len,
+					      &opts, nvmf_kvdev_store_done, kv_req);
 		}
-		rc = spdk_kvdev_store(ns->kvdev_desc, ch, key, key_len, data, xfer_len,
-				      &opts, nvmf_kvdev_store_done, kv_req);
 		break;
 	}
 	case SPDK_NVME_OPC_KV_RETRIEVE:
-		data = nvmf_kvdev_get_contig_buf(req, false, kv_req);
-		if (data == NULL) {
-			goto err_nomem;
+		/* Scatter directly into the request iovs when possible; otherwise use
+		 * the contiguous path (bounce only for iovcnt>1). */
+		if (req->iovcnt > 1 && spdk_kvdev_io_supports_iov(ns->kvdev_desc)) {
+			rc = spdk_kvdev_retrievev(ns->kvdev_desc, ch, key, key_len,
+						  req->iov, req->iovcnt, xfer_len,
+						  nvmf_kvdev_retrieve_done, kv_req);
+		} else {
+			data = nvmf_kvdev_get_contig_buf(req, false, kv_req);
+			if (data == NULL) {
+				goto err_nomem;
+			}
+			rc = spdk_kvdev_retrieve(ns->kvdev_desc, ch, key, key_len, data, xfer_len,
+						 nvmf_kvdev_retrieve_done, kv_req);
 		}
-		rc = spdk_kvdev_retrieve(ns->kvdev_desc, ch, key, key_len, data, xfer_len,
-					 nvmf_kvdev_retrieve_done, kv_req);
 		break;
 	case SPDK_NVME_OPC_KV_DELETE:
 		/* No-data command: no host payload, so bypass the bounce/value path. */

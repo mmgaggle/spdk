@@ -28,6 +28,18 @@ DEFINE_STUB(spdk_kvdev_retrieve, int,
 	    (struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch, const void *key,
 	     uint8_t key_len, void *value_buf, uint32_t buf_len,
 	     spdk_kvdev_io_completion_cb cb_fn, void *cb_arg), 0);
+/* Default false: the existing tests exercise the contiguous (single-iov/bounce)
+ * path; the iovec-native path (storev/retrievev) is covered by the backend UTs. */
+DEFINE_STUB(spdk_kvdev_io_supports_iov, bool, (struct spdk_kvdev_desc *desc), false);
+DEFINE_STUB(spdk_kvdev_storev, int,
+	    (struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch, const void *key,
+	     uint8_t key_len, struct iovec *iov, int iovcnt, uint32_t value_len,
+	     const struct spdk_kvdev_store_opts *opts, spdk_kvdev_io_completion_cb cb_fn,
+	     void *cb_arg), 0);
+DEFINE_STUB(spdk_kvdev_retrievev, int,
+	    (struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch, const void *key,
+	     uint8_t key_len, struct iovec *iov, int iovcnt, uint32_t buf_len,
+	     spdk_kvdev_io_completion_cb cb_fn, void *cb_arg), 0);
 DEFINE_STUB(spdk_kvdev_delete, int,
 	    (struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch, const void *key,
 	     uint8_t key_len, spdk_kvdev_io_completion_cb cb_fn, void *cb_arg), 0);
