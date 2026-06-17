@@ -329,6 +329,128 @@ done:
 	return rc;
 }
 
+/* GPU produces the bulk value: each lane writes its bytes of a verifiable
+ * pattern, then a system fence makes the whole buffer visible to the controller. */
+__global__ void
+fill_pattern(uint8_t *buf, uint32_t size)
+{
+	uint32_t stride = blockDim.x * gridDim.x;
+	uint32_t i;
+
+	for (i = blockIdx.x * blockDim.x + threadIdx.x; i < size; i += stride) {
+		buf[i] = (uint8_t)((i * 131u + 7u) & 0xffu);
+	}
+	__threadfence_system();
+}
+
+/*
+ * Size-ladder / spdk-5co coherence test: the GPU PRODUCES a large value (kernel
+ * fills the pattern), then GPU-initiated Store; CPU retrieves and verifies
+ * byte-exact. This is the faithful spdk-5co scenario (GPU bulk production + the
+ * doorbell) on bare metal -- the hypothesis is the QEMU memfd race is gone.
+ * Multi-page via PRP list, up to ~2 MiB (one list page).
+ */
+static int
+gpu_store_big(struct nvfu_dev *d, const char *key, uint32_t size)
+{
+	uint8_t *vbuf = NULL, *rbuf = NULL, *vbuf_dev = NULL;
+	uint64_t *plist = NULL;
+	uint64_t vbuf_iova = 0, rbuf_iova = 0, plist_iova = 0, prp1 = 0, prp2 = 0;
+	struct spdk_nvme_cpl cpl;
+	uint32_t got = 0, i, bad = 0, threads = 256, blocks;
+	hipError_t e;
+	int rc = -EIO;
+
+	/* Cap at 511 pages: verified byte-exact through 511 pages; exactly 512 pages
+	 * (511 list entries filling the list page) returns zeros -- a PRP-list chain
+	 * boundary that needs proper list chaining (or matches the target's
+	 * coalesced-PRP edge, cf. spdk-7o1). Follow-up: chained PRP lists for >2 MiB. */
+	if (size == 0 || size > 511u * 4096u) {
+		fprintf(stderr, "store-big size must be 1..%u bytes (single PRP list; "
+			"512-page boundary needs chaining)\n", 511u * 4096u);
+		return -EINVAL;
+	}
+	vbuf = (uint8_t *)nvfu_dma_alloc(size, &vbuf_iova);
+	rbuf = (uint8_t *)nvfu_dma_alloc(size, &rbuf_iova);
+	plist = (uint64_t *)nvfu_dma_alloc(4096, &plist_iova);
+	if (!vbuf || !rbuf || !plist) {
+		fprintf(stderr, "store-big alloc failed\n");
+		goto done;
+	}
+
+	e = hipHostRegister(vbuf, size, hipHostRegisterMapped);
+	if (e != hipSuccess) {
+		fprintf(stderr, "hipHostRegister(vbuf): %s\n", hipGetErrorString(e));
+		goto done;
+	}
+	(void)hipHostGetDevicePointer((void **)&vbuf_dev, vbuf, 0);
+	blocks = (size + threads - 1) / threads;
+	if (blocks > 65535) {
+		blocks = 65535;
+	}
+	fill_pattern<<<blocks, threads>>>(vbuf_dev, size);
+	e = hipDeviceSynchronize();
+	if (e != hipSuccess) {
+		fprintf(stderr, "fill kernel: %s\n", hipGetErrorString(e));
+		hipHostUnregister(vbuf);
+		goto done;
+	}
+
+	/* GPU-initiated Store of the GPU-produced bulk. */
+	if (nvfu_build_prp(vbuf_iova, size, plist, plist_iova, &prp1, &prp2) != 0) {
+		hipHostUnregister(vbuf);
+		goto done;
+	}
+	g_use_gpu = 1;
+	rc = nvfu_kv_xfer_prp(d, SPDK_NVME_OPC_KV_STORE, key, size, prp1, prp2, NULL);
+	hipHostUnregister(vbuf);
+	if (rc != 0) {
+		goto done;
+	}
+
+	/* CPU retrieve + byte-exact verify of the GPU-produced pattern. */
+	g_use_gpu = 0;
+	memset(&cpl, 0, sizeof(cpl));
+	if (nvfu_build_prp(rbuf_iova, size, plist, plist_iova, &prp1, &prp2) != 0 ||
+	    nvfu_kv_xfer_prp(d, SPDK_NVME_OPC_KV_RETRIEVE, key, size, prp1, prp2, &cpl) != 0) {
+		rc = -EIO;
+		goto done;
+	}
+	got = cpl.cdw0;
+	for (i = 0; i < size; i++) {
+		if (rbuf[i] != (uint8_t)((i * 131u + 7u) & 0xffu)) {
+			if (bad < 3) {
+				fprintf(stderr, "  mismatch @%u: got 0x%02x want 0x%02x\n",
+					i, rbuf[i], (uint8_t)((i * 131u + 7u) & 0xffu));
+			}
+			bad++;
+		}
+	}
+	printf("STORE-BIG %s: GPU produced+stored %u bytes (%u pages), retrieved %u -> %s "
+	       "(%u mismatches)\n", key, size, (size + 4095) / 4096, got,
+	       (got == size && bad == 0) ? "BYTE-EXACT" : "MISMATCH", bad);
+	rc = (got == size && bad == 0) ? 0 : -EIO;
+done:
+	spdk_dma_free(vbuf);
+	spdk_dma_free(rbuf);
+	spdk_dma_free(plist);
+	return rc;
+}
+
+static uint64_t
+parse_size(const char *s)
+{
+	char *end = NULL;
+	uint64_t v = strtoull(s, &end, 0);
+
+	if (end && (*end == 'k' || *end == 'K')) {
+		v *= 1024;
+	} else if (end && (*end == 'm' || *end == 'M')) {
+		v *= 1024u * 1024u;
+	}
+	return v;
+}
+
 static void
 usage(const char *prog)
 {
@@ -339,10 +461,11 @@ usage(const char *prog)
 		"  %s <traddr> exec       <key> <op_id>   GPU-initiated KV Exec (10=bytecount, 11=identity)\n"
 		"  %s <traddr> store-batch <prefix> <N>   N GPU Stores in ONE wavefront + ONE doorbell\n"
 		"  %s <traddr> exec-batch <prefix> <op_id> <N>  N GPU Execs in ONE wavefront (two-tier)\n"
+		"  %s <traddr> store-big  <key> <size>    GPU produces+stores a big value (e.g. 256K, 2M), verify\n"
 		"  %s <traddr> [demo]                     store+retrieve self-test\n"
 		"  %s <traddr> demo-exec                  store+retrieve+exec self-test\n"
 		"<traddr> is the VFIOUSER listener dir containing 'cntrl'.\n",
-		prog, prog, prog, prog, prog, prog, prog);
+		prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int
@@ -369,6 +492,7 @@ main(int argc, char **argv)
 	    (!strcmp(mode, "retrieve") && argc != 4) ||
 	    (!strcmp(mode, "exec") && argc != 5) ||
 	    (!strcmp(mode, "store-batch") && argc != 5) ||
+	    (!strcmp(mode, "store-big") && argc != 5) ||
 	    (!strcmp(mode, "exec-batch") && argc != 6)) {
 		usage(argv[0]);
 		return 1;
@@ -417,6 +541,13 @@ main(int argc, char **argv)
 		uint32_t op_id = (uint32_t)strtoul(argv[4], NULL, 0);
 		uint32_t nbatch = (uint32_t)strtoul(argv[5], NULL, 0);
 		if (gpu_exec_batch(&d, prefix, op_id, nbatch) != 0) {
+			goto out;
+		}
+		rc = 0;
+	} else if (!strcmp(mode, "store-big")) {
+		key = argv[3];
+		uint32_t size = (uint32_t)parse_size(argv[4]);
+		if (gpu_store_big(&d, key, size) != 0) {
 			goto out;
 		}
 		rc = 0;
