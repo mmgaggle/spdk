@@ -466,6 +466,31 @@ nvfu_kv_xfer_prp(struct nvfu_dev *d, uint8_t opc, const char *key,
 	return nvfu_submit_poll(d, &d->io, &cmd, out_cpl);
 }
 
+/*
+ * KV op with a single CONTIGUOUS SGL data-block descriptor. One descriptor
+ * describes the whole buffer regardless of size (up to the controller's
+ * max_io_size = 64 MiB) -- no PRP list, no 512-entry-page boundary. This is the
+ * transport the target's KV datapath uses for large values. iova==vaddr and our
+ * DMA buffers are physically contiguous, so a single data block suffices.
+ */
+static inline int
+nvfu_kv_xfer_sgl(struct nvfu_dev *d, uint8_t opc, const char *key,
+		 uint32_t size, uint64_t buf_iova, struct spdk_nvme_cpl *out_cpl)
+{
+	struct spdk_nvme_cmd cmd;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.opc = opc;
+	cmd.nsid = KV_NSID;
+	cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
+	cmd.dptr.sgl1.address = buf_iova;
+	cmd.dptr.sgl1.unkeyed.length = size;
+	cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
+	cmd.cdw10_bits.kv.vsize = size;
+	nvfu_kv_set_key(&cmd, key, (uint8_t)strlen(key));
+	return nvfu_submit_poll(d, &d->io, &cmd, out_cpl);
+}
+
 /* Shared attach + bring-to-ready + IO queue. Returns 0 on success. */
 static inline int
 nvfu_open(struct nvfu_dev *d, const char *traddr_dir)

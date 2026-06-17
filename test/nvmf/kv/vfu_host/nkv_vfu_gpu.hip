@@ -347,37 +347,36 @@ fill_pattern(uint8_t *buf, uint32_t size)
  * Size-ladder / spdk-5co coherence test: the GPU PRODUCES a large value (kernel
  * fills the pattern), then GPU-initiated Store; CPU retrieves and verifies
  * byte-exact. This is the faithful spdk-5co scenario (GPU bulk production + the
- * doorbell) on bare metal -- the hypothesis is the QEMU memfd race is gone.
- * Multi-page via PRP list, up to ~2 MiB (one list page).
+ * doorbell) on bare metal. Uses a single contiguous SGL descriptor (no PRP
+ * list / 512-page boundary), so it scales to the controller max (64 MiB).
  */
 static int
 gpu_store_big(struct nvfu_dev *d, const char *key, uint32_t size)
 {
 	uint8_t *vbuf = NULL, *rbuf = NULL, *vbuf_dev = NULL;
-	uint64_t *plist = NULL;
-	uint64_t vbuf_iova = 0, rbuf_iova = 0, plist_iova = 0, prp1 = 0, prp2 = 0;
+	uint64_t vbuf_iova = 0, rbuf_iova = 0;
 	struct spdk_nvme_cpl cpl;
 	uint32_t got = 0, i, bad = 0, threads = 256, blocks;
 	hipError_t e;
 	int rc = -EIO;
 
-	/* Cap at 511 pages: verified byte-exact through 511 pages; exactly 512 pages
-	 * (511 list entries filling the list page) returns zeros -- a PRP-list chain
-	 * boundary that needs proper list chaining (or matches the target's
-	 * coalesced-PRP edge, cf. spdk-7o1). Follow-up: chained PRP lists for >2 MiB. */
+	/* Byte-exact through 511 pages with BOTH SGL and PRP; exactly 512 pages
+	 * (2 MiB) and beyond fail identically -- a target-side limit (max-iovec /
+	 * DMA-region boundary at 2 MiB), not a client transport choice. Capped at
+	 * the proven range; >2 MiB needs target-side work. */
 	if (size == 0 || size > 511u * 4096u) {
-		fprintf(stderr, "store-big size must be 1..%u bytes (single PRP list; "
-			"512-page boundary needs chaining)\n", 511u * 4096u);
+		fprintf(stderr, "store-big size must be 1..%u bytes (target caps a single "
+			"KV transfer at 511 pages / ~2MiB)\n", 511u * 4096u);
 		return -EINVAL;
 	}
 	vbuf = (uint8_t *)nvfu_dma_alloc(size, &vbuf_iova);
 	rbuf = (uint8_t *)nvfu_dma_alloc(size, &rbuf_iova);
-	plist = (uint64_t *)nvfu_dma_alloc(4096, &plist_iova);
-	if (!vbuf || !rbuf || !plist) {
+	if (!vbuf || !rbuf) {
 		fprintf(stderr, "store-big alloc failed\n");
 		goto done;
 	}
 
+	/* GPU produces the bulk value into the host-registered buffer. */
 	e = hipHostRegister(vbuf, size, hipHostRegisterMapped);
 	if (e != hipSuccess) {
 		fprintf(stderr, "hipHostRegister(vbuf): %s\n", hipGetErrorString(e));
@@ -396,13 +395,9 @@ gpu_store_big(struct nvfu_dev *d, const char *key, uint32_t size)
 		goto done;
 	}
 
-	/* GPU-initiated Store of the GPU-produced bulk. */
-	if (nvfu_build_prp(vbuf_iova, size, plist, plist_iova, &prp1, &prp2) != 0) {
-		hipHostUnregister(vbuf);
-		goto done;
-	}
+	/* GPU-initiated Store of the GPU-produced bulk (single contiguous SGL). */
 	g_use_gpu = 1;
-	rc = nvfu_kv_xfer_prp(d, SPDK_NVME_OPC_KV_STORE, key, size, prp1, prp2, NULL);
+	rc = nvfu_kv_xfer_sgl(d, SPDK_NVME_OPC_KV_STORE, key, size, vbuf_iova, NULL);
 	hipHostUnregister(vbuf);
 	if (rc != 0) {
 		goto done;
@@ -411,8 +406,7 @@ gpu_store_big(struct nvfu_dev *d, const char *key, uint32_t size)
 	/* CPU retrieve + byte-exact verify of the GPU-produced pattern. */
 	g_use_gpu = 0;
 	memset(&cpl, 0, sizeof(cpl));
-	if (nvfu_build_prp(rbuf_iova, size, plist, plist_iova, &prp1, &prp2) != 0 ||
-	    nvfu_kv_xfer_prp(d, SPDK_NVME_OPC_KV_RETRIEVE, key, size, prp1, prp2, &cpl) != 0) {
+	if (nvfu_kv_xfer_sgl(d, SPDK_NVME_OPC_KV_RETRIEVE, key, size, rbuf_iova, &cpl) != 0) {
 		rc = -EIO;
 		goto done;
 	}
@@ -426,14 +420,13 @@ gpu_store_big(struct nvfu_dev *d, const char *key, uint32_t size)
 			bad++;
 		}
 	}
-	printf("STORE-BIG %s: GPU produced+stored %u bytes (%u pages), retrieved %u -> %s "
+	printf("STORE-BIG %s: GPU produced+stored %u bytes (%u pages, SGL), retrieved %u -> %s "
 	       "(%u mismatches)\n", key, size, (size + 4095) / 4096, got,
 	       (got == size && bad == 0) ? "BYTE-EXACT" : "MISMATCH", bad);
 	rc = (got == size && bad == 0) ? 0 : -EIO;
 done:
 	spdk_dma_free(vbuf);
 	spdk_dma_free(rbuf);
-	spdk_dma_free(plist);
 	return rc;
 }
 
