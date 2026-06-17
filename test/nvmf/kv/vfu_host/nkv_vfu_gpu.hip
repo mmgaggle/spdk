@@ -217,8 +217,11 @@ gpu_store_batch(struct nvfu_dev *d, const char *prefix, uint32_t n)
 	uint32_t i;
 	int ok, rc = -EIO;
 
-	if (n == 0 || n > q->depth || n > 1024) {
-		fprintf(stderr, "batch n must be 1..%u\n", (q->depth < 1024) ? q->depth : 1024);
+	/* An NVMe SQ holds depth-1 entries (tail==head means empty), and the kernel
+	 * launches n threads (<=1024 per block), so cap at min(depth-1, 1024). */
+	if (n == 0 || n >= q->depth || n > 1024) {
+		fprintf(stderr, "batch n must be 1..%u\n",
+			(q->depth - 1u < 1024u) ? q->depth - 1u : 1024u);
 		return -EINVAL;
 	}
 	cmds = (struct spdk_nvme_cmd *)nvfu_dma_alloc(n * sizeof(*cmds), NULL);
@@ -274,8 +277,11 @@ gpu_exec_batch(struct nvfu_dev *d, const char *prefix, uint32_t op_id, uint32_t 
 	uint32_t i;
 	int ok, rc = -EIO;
 
-	if (n == 0 || n > q->depth || n > 1024) {
-		fprintf(stderr, "batch n must be 1..%u\n", (q->depth < 1024) ? q->depth : 1024);
+	/* An NVMe SQ holds depth-1 entries (tail==head means empty), and the kernel
+	 * launches n threads (<=1024 per block), so cap at min(depth-1, 1024). */
+	if (n == 0 || n >= q->depth || n > 1024) {
+		fprintf(stderr, "batch n must be 1..%u\n",
+			(q->depth - 1u < 1024u) ? q->depth - 1u : 1024u);
 		return -EINVAL;
 	}
 	cmds = (struct spdk_nvme_cmd *)nvfu_dma_alloc(n * sizeof(*cmds), NULL);
