@@ -114,18 +114,143 @@ gpu_map(struct nvfu_dev *d)
 	return 0;
 }
 
+/*
+ * Wavefront batch: each lane stages one 64-byte SQE into its SQ slot; after a
+ * block-wide barrier + system fence (all SQEs globally visible), lane 0 rings
+ * the SQ doorbell ONCE for the whole batch. With n<=32 this is exactly one
+ * gfx1151 wavefront (warpSize=32); n up to the IO queue depth uses ceil(n/32)
+ * wavefronts in one block, still one doorbell ring (rocm-xio batchSize > 1).
+ */
+__global__ void
+ring_wavefront(struct spdk_nvme_cmd *sq, uint16_t base, uint16_t depth,
+	       const struct spdk_nvme_cmd *cmds, uint32_t n,
+	       volatile uint32_t *db, uint32_t db_idx, uint16_t new_tail)
+{
+	uint32_t i = threadIdx.x;
+
+	if (i < n) {
+		sq[(base + i) % depth] = cmds[i];
+	}
+	__threadfence_system();		/* this lane's SQE visible system-wide */
+	__syncthreads();		/* all lanes have staged + fenced */
+	if (i == 0) {
+		db[db_idx] = new_tail;	/* one doorbell for the whole batch */
+		__threadfence_system();
+	}
+}
+
+/*
+ * Fire n GPU-initiated KV Stores in a single wavefront + single doorbell, then
+ * reap n completions. Keys are <prefix>0..<prefix>(n-1); each value is distinct.
+ */
+static int
+gpu_store_batch(struct nvfu_dev *d, const char *prefix, uint32_t n)
+{
+	struct nvfu_queue *q = &d->io;
+	const uint32_t SLOT = 4096;	/* one page per value -> single PRP */
+	struct spdk_nvme_cmd *cmds = NULL, *cmds_dev = NULL;
+	char *vbuf = NULL;
+	uint64_t vbuf_iova = 0;
+	uint16_t base, new_tail;
+	uint32_t i, reaped, ok = 0;
+	hipError_t e;
+	int rc = -EIO;
+
+	if (n == 0 || n > q->depth || n > 1024) {
+		fprintf(stderr, "batch n must be 1..%u\n", (q->depth < 1024) ? q->depth : 1024);
+		return -EINVAL;
+	}
+
+	cmds = (struct spdk_nvme_cmd *)nvfu_dma_alloc(n * sizeof(*cmds), NULL);
+	vbuf = (char *)nvfu_dma_alloc((size_t)n * SLOT, &vbuf_iova);
+	if (!cmds || !vbuf) {
+		fprintf(stderr, "batch alloc failed\n");
+		goto done;
+	}
+
+	base = q->sq_tail;
+	for (i = 0; i < n; i++) {
+		char key[32], val[64];
+		int klen = snprintf(key, sizeof(key), "%s%u", prefix, i);
+		int vlen = snprintf(val, sizeof(val), "wavefront-value-%u", i);
+		struct spdk_nvme_cmd *c = &cmds[i];
+
+		memcpy(vbuf + (size_t)i * SLOT, val, vlen);
+		memset(c, 0, sizeof(*c));
+		c->opc = SPDK_NVME_OPC_KV_STORE;
+		c->nsid = KV_NSID;
+		c->dptr.prp.prp1 = vbuf_iova + (uint64_t)i * SLOT;
+		c->cdw10_bits.kv.vsize = vlen;
+		nvfu_kv_set_key(c, key, (uint8_t)klen);
+		c->cid = q->cid++;
+	}
+	spdk_wmb();
+
+	e = hipHostRegister(cmds, n * sizeof(*cmds), hipHostRegisterMapped);
+	if (e != hipSuccess) {
+		fprintf(stderr, "hipHostRegister(cmds): %s\n", hipGetErrorString(e));
+		goto done;
+	}
+	(void)hipHostGetDevicePointer((void **)&cmds_dev, cmds, 0);
+
+	new_tail = (uint16_t)((base + n) % q->depth);
+	ring_wavefront<<<1, n>>>(g_sq_dev, base, q->depth, cmds_dev, n,
+				 g_db_dev, q->sq_db, new_tail);
+	e = hipDeviceSynchronize();
+	hipHostUnregister(cmds);
+	if (e != hipSuccess) {
+		fprintf(stderr, "wavefront kernel failed: %s\n", hipGetErrorString(e));
+		goto done;
+	}
+	q->sq_tail = new_tail;
+
+	/* reap n completions (any order; all should be SUCCESS) */
+	for (reaped = 0; reaped < n; reaped++) {
+		volatile struct spdk_nvme_cpl *cqe = &q->cq[q->cq_head];
+		uint64_t deadline = spdk_get_ticks() + 5 * spdk_get_ticks_hz();
+
+		while (cqe->status.p != q->cq_phase) {
+			if (spdk_get_ticks() > deadline) {
+				fprintf(stderr, "batch reap timeout %u/%u\n", reaped, n);
+				goto done;
+			}
+			spdk_pause();
+		}
+		spdk_rmb();
+		if (cqe->status.sc == 0 && cqe->status.sct == 0) {
+			ok++;
+		}
+		q->cq_head = (q->cq_head + 1) % q->depth;
+		if (q->cq_head == 0) {
+			q->cq_phase ^= 1;
+		}
+		d->doorbells[q->cq_db] = q->cq_head;
+	}
+
+	printf("WAVEFRONT STORE-BATCH ok: %u/%u GPU-initiated stores in ONE doorbell "
+	       "(%u-lane launch = %u wavefront%s), keys %s0..%s%u\n",
+	       ok, n, n, (n + 31) / 32, ((n + 31) / 32 > 1) ? "s" : "",
+	       prefix, prefix, n - 1);
+	rc = (ok == n) ? 0 : -EIO;
+done:
+	spdk_dma_free(cmds);
+	spdk_dma_free(vbuf);
+	return rc;
+}
+
 static void
 usage(const char *prog)
 {
 	fprintf(stderr,
 		"usage:\n"
-		"  %s <traddr> store    <key> <value>   GPU-initiated KV Store\n"
-		"  %s <traddr> retrieve <key>           GPU-initiated KV Retrieve\n"
-		"  %s <traddr> exec     <key> <op_id>   GPU-initiated KV Exec (10=bytecount, 11=identity)\n"
-		"  %s <traddr> [demo]                   store+retrieve self-test\n"
-		"  %s <traddr> demo-exec                store+retrieve+exec self-test\n"
+		"  %s <traddr> store      <key> <value>   GPU-initiated KV Store\n"
+		"  %s <traddr> retrieve   <key>           GPU-initiated KV Retrieve\n"
+		"  %s <traddr> exec       <key> <op_id>   GPU-initiated KV Exec (10=bytecount, 11=identity)\n"
+		"  %s <traddr> store-batch <prefix> <N>   N GPU Stores in ONE wavefront + ONE doorbell\n"
+		"  %s <traddr> [demo]                     store+retrieve self-test\n"
+		"  %s <traddr> demo-exec                  store+retrieve+exec self-test\n"
 		"<traddr> is the VFIOUSER listener dir containing 'cntrl'.\n",
-		prog, prog, prog, prog, prog);
+		prog, prog, prog, prog, prog, prog);
 }
 
 int
@@ -150,7 +275,8 @@ main(int argc, char **argv)
 	/* Validate args per mode up front. */
 	if ((!strcmp(mode, "store") && argc != 5) ||
 	    (!strcmp(mode, "retrieve") && argc != 4) ||
-	    (!strcmp(mode, "exec") && argc != 5)) {
+	    (!strcmp(mode, "exec") && argc != 5) ||
+	    (!strcmp(mode, "store-batch") && argc != 5)) {
 		usage(argv[0]);
 		return 1;
 	}
@@ -185,6 +311,13 @@ main(int argc, char **argv)
 			goto out;
 		}
 		printf("STORE ok: GPU stored key='%s' (%zu bytes)\n", key, strlen(value));
+		rc = 0;
+	} else if (!strcmp(mode, "store-batch")) {
+		const char *prefix = argv[3];
+		uint32_t nbatch = (uint32_t)strtoul(argv[4], NULL, 0);
+		if (gpu_store_batch(&d, prefix, nbatch) != 0) {
+			goto out;
+		}
 		rc = 0;
 	} else if (!strcmp(mode, "retrieve")) {
 		char buf[4096];
