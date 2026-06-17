@@ -59,6 +59,13 @@ for sz in 4K 64K 256K 1M 2M 8M 32M 64M; do
   check "store-big $sz byte-exact" "BYTE-EXACT" "$(g store-big "big_$sz" "$sz")"
 done
 
+echo "== 5. Large-result Exec scatter (op11 identity, byte-exact) =="
+# Verifies the two-tier executor's large result scatters back bit-faithfully
+# through the region-bounded SGL DPTR (spdk-w2y).
+for sz in 4K 1M 2M 8M 64M; do
+  check "exec-big $sz identity byte-exact" "BYTE-EXACT" "$(g exec-big "eb_$sz" 11 "$sz")"
+done
+
 echo
 echo "===================================================="
 echo "RESULT: $pass passed, $fail failed"

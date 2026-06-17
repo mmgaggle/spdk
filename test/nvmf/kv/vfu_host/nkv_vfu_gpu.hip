@@ -436,6 +436,68 @@ done:
 	return rc;
 }
 
+/*
+ * Large-result exec verification (spdk-w2y): store a >2 MiB pattern value, then
+ * KV Exec op11 (nkvx:identity) with a large output buffer, and verify the
+ * scattered-back result is byte-exact. Exercises the two-tier executor's
+ * large-result path and the region-bounded SGL DPTR scatter on the front.
+ */
+static int
+gpu_exec_big(struct nvfu_dev *d, const char *key, uint32_t op_id, uint32_t size)
+{
+	uint8_t *vbuf = NULL, *obuf = NULL;
+	uint64_t vbuf_iova = 0;
+	uint32_t got = 0, i, bad = 0;
+	int rc = -EIO;
+
+	if (size == 0 || size > 64u * 1024u * 1024u) {
+		fprintf(stderr, "exec-big size must be 1..%u bytes\n", 64u * 1024u * 1024u);
+		return -EINVAL;
+	}
+	vbuf = (uint8_t *)nvfu_dma_alloc(size, &vbuf_iova);
+	obuf = (uint8_t *)malloc(size);
+	if (!vbuf || !obuf) {
+		fprintf(stderr, "exec-big alloc failed\n");
+		goto done;
+	}
+
+	for (i = 0; i < size; i++) {
+		vbuf[i] = (uint8_t)((i * 131u + 7u) & 0xffu);
+	}
+	spdk_wmb();
+
+	/* Store the value via a region-bounded SGL. */
+	if (nvfu_kv_xfer_sgl(d, SPDK_NVME_OPC_KV_STORE, key, size, vbuf_iova, NULL) != 0) {
+		fprintf(stderr, "exec-big: store failed\n");
+		goto done;
+	}
+
+	/* Exec identity: the executor returns the stored value, scattered back into
+	 * the (multi-region) DPTR buffer. */
+	if (nvfu_kv_exec(d, key, op_id, NULL, 0, obuf, size, &got) != 0) {
+		goto done;
+	}
+	for (i = 0; i < got; i++) {
+		if (obuf[i] != (uint8_t)((i * 131u + 7u) & 0xffu)) {
+			if (bad < 3) {
+				fprintf(stderr, "  mismatch @%u: got 0x%02x want 0x%02x\n",
+					i, obuf[i], (uint8_t)((i * 131u + 7u) & 0xffu));
+			}
+			bad++;
+		}
+	}
+	printf("EXEC-BIG %s: op %u over %u bytes -> result %u bytes -> %s (%u mismatches)\n",
+	       key, op_id, size, got,
+	       (got == size && bad == 0) ? "BYTE-EXACT" : "MISMATCH", bad);
+	rc = (got == size && bad == 0) ? 0 : -EIO;
+done:
+	if (vbuf) {
+		spdk_dma_free(vbuf);
+	}
+	free(obuf);
+	return rc;
+}
+
 static uint64_t
 parse_size(const char *s)
 {
@@ -461,10 +523,11 @@ usage(const char *prog)
 		"  %s <traddr> store-batch <prefix> <N>   N GPU Stores in ONE wavefront + ONE doorbell\n"
 		"  %s <traddr> exec-batch <prefix> <op_id> <N>  N GPU Execs in ONE wavefront (two-tier)\n"
 		"  %s <traddr> store-big  <key> <size>    GPU produces+stores a big value (e.g. 256K, 2M), verify\n"
+		"  %s <traddr> exec-big   <key> <op_id> <size>  store big value + Exec, verify scattered result\n"
 		"  %s <traddr> [demo]                     store+retrieve self-test\n"
 		"  %s <traddr> demo-exec                  store+retrieve+exec self-test\n"
 		"<traddr> is the VFIOUSER listener dir containing 'cntrl'.\n",
-		prog, prog, prog, prog, prog, prog, prog, prog);
+		prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 int
@@ -492,6 +555,7 @@ main(int argc, char **argv)
 	    (!strcmp(mode, "exec") && argc != 5) ||
 	    (!strcmp(mode, "store-batch") && argc != 5) ||
 	    (!strcmp(mode, "store-big") && argc != 5) ||
+	    (!strcmp(mode, "exec-big") && argc != 6) ||
 	    (!strcmp(mode, "exec-batch") && argc != 6)) {
 		usage(argv[0]);
 		return 1;
@@ -547,6 +611,14 @@ main(int argc, char **argv)
 		key = argv[3];
 		uint32_t size = (uint32_t)parse_size(argv[4]);
 		if (gpu_store_big(&d, key, size) != 0) {
+			goto out;
+		}
+		rc = 0;
+	} else if (!strcmp(mode, "exec-big")) {
+		key = argv[3];
+		uint32_t op_id = (uint32_t)strtoul(argv[4], NULL, 0);
+		uint32_t size = (uint32_t)parse_size(argv[5]);
+		if (gpu_exec_big(&d, key, op_id, size) != 0) {
 			goto out;
 		}
 		rc = 0;
