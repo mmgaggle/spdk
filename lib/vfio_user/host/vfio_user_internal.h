@@ -11,8 +11,12 @@
 #define VFIO_USER_MAJOR_VER			0
 #define VFIO_USER_MINOR_VER			1
 
-/* Maximum memory regions supported */
-#define VFIO_MAXIMUM_MEMORY_REGIONS		16
+/* Maximum memory regions supported. Each DPDK hugepage maps to one vfio-user DMA
+ * region (see vfio_mr_map_notify), so large multi-hugepage DMA buffers need many
+ * regions: a 64 MiB transfer over 2 MiB hugepages is 32 regions, and a buffer
+ * pair (e.g. store source + retrieve sink) doubles that. Sized to match the
+ * libvfio-user server cap (MAX_DMA_REGIONS). */
+#define VFIO_MAXIMUM_MEMORY_REGIONS		256
 /* Maximum sparse memory regions in one BAR region */
 #define VFIO_MAXIMUM_SPARSE_MMAP_REGIONS	8
 

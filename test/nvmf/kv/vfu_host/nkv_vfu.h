@@ -416,29 +416,76 @@ nvfu_kv_exec(struct nvfu_dev *d, const char *key, uint32_t op_id,
 	return 0;
 }
 
+/* One vfio-user DMA region == one DPDK hugepage (2 MiB). The target maps each
+ * region independently (max_nr_sgs=1 per descriptor), so a single SGL data-block
+ * descriptor must not cross a region boundary. */
+#define NVFU_DMA_REGION	(2ULL * 1024 * 1024)
+
 /*
- * KV op with a single CONTIGUOUS SGL data-block descriptor. One descriptor
- * describes the whole buffer regardless of size (up to the controller's
- * max_io_size = 64 MiB) -- no PRP list, no 512-entry-page boundary. This is the
- * transport the target's KV datapath uses for large values. iova==vaddr and our
- * DMA buffers are physically contiguous, so a single data block suffices.
+ * KV op transferred via SGL. A buffer that fits within a single 2 MiB DMA region
+ * uses one contiguous data-block descriptor. A larger buffer is described by a
+ * segment list with one region-bounded data block per chunk, so each descriptor
+ * maps to exactly one region on the target (which then gathers/scatters across
+ * the resulting iovecs). Bounded by NVMF_REQ_MAX_BUFFERS (33) descriptors ->
+ * 64 MiB, matching the controller's max_io_size.
  */
 static inline int
 nvfu_kv_xfer_sgl(struct nvfu_dev *d, uint8_t opc, const char *key,
 		 uint32_t size, uint64_t buf_iova, struct spdk_nvme_cpl *out_cpl)
 {
 	struct spdk_nvme_cmd cmd;
+	struct spdk_nvme_sgl_descriptor *segs;
+	uint64_t segs_iova = 0, first_chunk, off;
+	uint32_t nseg, i;
+	int rc;
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.opc = opc;
 	cmd.nsid = KV_NSID;
-	cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
-	cmd.dptr.sgl1.address = buf_iova;
-	cmd.dptr.sgl1.unkeyed.length = size;
-	cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
 	cmd.cdw10_bits.kv.vsize = size;
 	nvfu_kv_set_key(&cmd, key, (uint8_t)strlen(key));
-	return nvfu_submit_poll(d, &d->io, &cmd, out_cpl);
+
+	/* Bytes from buf_iova to the next region boundary. */
+	first_chunk = NVFU_DMA_REGION - (buf_iova & (NVFU_DMA_REGION - 1));
+
+	if (size <= first_chunk) {
+		/* Single region: one contiguous data block. */
+		cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_CONTIG;
+		cmd.dptr.sgl1.address = buf_iova;
+		cmd.dptr.sgl1.unkeyed.length = size;
+		cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
+		return nvfu_submit_poll(d, &d->io, &cmd, out_cpl);
+	}
+
+	/* Multi-region: build a region-bounded data-block list. */
+	nseg = 1 + (uint32_t)((size - first_chunk + NVFU_DMA_REGION - 1) / NVFU_DMA_REGION);
+	segs = (struct spdk_nvme_sgl_descriptor *)nvfu_dma_alloc(nseg * sizeof(*segs), &segs_iova);
+	if (segs == NULL) {
+		return -ENOMEM;
+	}
+
+	off = 0;
+	for (i = 0; i < nseg; i++) {
+		uint64_t chunk = (i == 0) ? first_chunk : NVFU_DMA_REGION;
+
+		if (off + chunk > size) {
+			chunk = size - off;
+		}
+		memset(&segs[i], 0, sizeof(segs[i]));
+		segs[i].address = buf_iova + off;
+		segs[i].unkeyed.length = (uint32_t)chunk;
+		segs[i].unkeyed.type = SPDK_NVME_SGL_TYPE_DATA_BLOCK;
+		off += chunk;
+	}
+
+	cmd.psdt = SPDK_NVME_PSDT_SGL_MPTR_SGL;
+	cmd.dptr.sgl1.address = segs_iova;
+	cmd.dptr.sgl1.unkeyed.length = nseg * sizeof(*segs);
+	cmd.dptr.sgl1.unkeyed.type = SPDK_NVME_SGL_TYPE_LAST_SEGMENT;
+
+	rc = nvfu_submit_poll(d, &d->io, &cmd, out_cpl);
+	spdk_dma_free(segs);
+	return rc;
 }
 
 /* Shared attach + bring-to-ready + IO queue. Returns 0 on success. */

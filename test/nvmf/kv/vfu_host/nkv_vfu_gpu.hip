@@ -366,13 +366,13 @@ gpu_store_big(struct nvfu_dev *d, const char *key, uint32_t size)
 	hipError_t e;
 	int rc = -EIO;
 
-	/* Byte-exact through 511 pages with BOTH SGL and PRP; exactly 512 pages
-	 * (2 MiB) and beyond fail identically -- a target-side limit (max-iovec /
-	 * DMA-region boundary at 2 MiB), not a client transport choice. Capped at
-	 * the proven range; >2 MiB needs target-side work. */
-	if (size == 0 || size > 511u * 4096u) {
-		fprintf(stderr, "store-big size must be 1..%u bytes (target caps a single "
-			"KV transfer at 511 pages / ~2MiB)\n", 511u * 4096u);
+	/* Up to the controller's max_io_size (64 MiB). Transfers spanning more than
+	 * one 2 MiB vfio-user DMA region use a region-bounded SGL segment list
+	 * (nvfu_kv_xfer_sgl), since a single data-block descriptor cannot cross a
+	 * region boundary (spdk-rcz / spdk-cvi). */
+	if (size == 0 || size > 64u * 1024u * 1024u) {
+		fprintf(stderr, "store-big size must be 1..%u bytes (controller max_io_size)\n",
+			64u * 1024u * 1024u);
 		return -EINVAL;
 	}
 	vbuf = (uint8_t *)nvfu_dma_alloc(size, &vbuf_iova);

@@ -53,7 +53,9 @@ check "wavefront exec-batch op10 x32" "EXEC-BATCH ok: 32/32" "$(g exec-batch wfb
 check "wavefront exec-batch op11 x32" "EXEC-BATCH ok: 32/32" "$(g exec-batch wfb 11 32)"
 
 echo "== 4. GPU-produced size ladder (byte-exact, spdk-5co coherence) =="
-for sz in 4K 64K 256K 1M 2044K; do
+# Spans single-region (<=2 MiB) and multi-region segment-list transfers, up to
+# the controller's 64 MiB max_io_size (spdk-rcz DMA-map fix + spdk-cvi SGL list).
+for sz in 4K 64K 256K 1M 2M 8M 32M 64M; do
   check "store-big $sz byte-exact" "BYTE-EXACT" "$(g store-big "big_$sz" "$sz")"
 done
 
