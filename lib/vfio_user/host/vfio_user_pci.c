@@ -13,6 +13,7 @@
 #include "spdk/queue.h"
 #include "spdk/util.h"
 #include "spdk/vfio_user_pci.h"
+#include "spdk/memory.h"
 
 #include "vfio_user_internal.h"
 
@@ -111,50 +112,114 @@ vfio_mr_map_notify(void *cb_ctx, struct spdk_mem_map *map,
 {
 	int ret;
 	struct vfio_device *dev = cb_ctx;
-	struct vfio_memory_region *mr;
-	uint64_t offset;
+	struct vfio_memory_region *mr, *tmp_mr;
+	uint64_t base = (uint64_t)(uintptr_t)vaddr;
+	uint64_t end = base + size;
+	uint64_t cur;
 
-	mr = vfio_get_mr(dev, (uint64_t)vaddr, size);
 	if (action == SPDK_MEM_MAP_NOTIFY_UNREGISTER) {
-		if (!mr) {
-			SPDK_ERRLOG("Memory region VADDR %p doesn't exist\n", vaddr);
-			return -EEXIST;
+		/*
+		 * A single registration may have been split into several DMA regions
+		 * (see the REGISTER path), so tear down every region that falls inside
+		 * [vaddr, vaddr + size).
+		 */
+		ret = 0;
+		TAILQ_FOREACH_SAFE(mr, &dev->mrs_head, link, tmp_mr) {
+			if (mr->vaddr < base || mr->vaddr >= end) {
+				continue;
+			}
+			ret = vfio_user_dev_dma_map_unmap(dev, mr, false);
+			vfio_remove_mr(dev, mr->vaddr, mr->size);
 		}
-
-		ret = vfio_user_dev_dma_map_unmap(dev, mr, false);
-		/* remove the memory region */
-		vfio_remove_mr(dev, (uint64_t)vaddr, size);
 		return ret;
 	}
 
-	/* SPDK_MEM_MAP_NOTIFY_REGISTER */
-	if (mr != NULL) {
-		SPDK_ERRLOG("Memory region VADDR 0x%lx already exist\n", mr->vaddr);
+	/*
+	 * SPDK_MEM_MAP_NOTIFY_REGISTER
+	 *
+	 * A VA-contiguous registration can span several hugepages that DPDK backs
+	 * with DISTINCT file descriptors (the default non --single-file-segments
+	 * mode). The vfio-user peer mmap()s each DMA region from a single fd, so a
+	 * region that crosses an fd boundary would leave everything past the first
+	 * fd's file unbacked -- the peer silently reads zeros for those bytes
+	 * (observed as a 2 MiB cliff: a buffer landing on the 2nd hugepage of a
+	 * coalesced region stores/loads all zeros). Split the range into maximal
+	 * extents that map to one fd at contiguous offsets and register a separate
+	 * DMA region for each. (Assumes memseg granularity == VALUE_2MB, i.e. 2 MiB
+	 * hugepages; registrations are memseg-aligned.)
+	 */
+	if (vfio_get_mr(dev, base, size) != NULL) {
+		SPDK_ERRLOG("Memory region VADDR 0x%lx already exist\n", base);
 		return -EEXIST;
 	}
 
-	mr = calloc(1, sizeof(*mr));
-	if (mr == NULL) {
-		return -ENOMEM;
-	}
-	mr->vaddr = (uint64_t)(uintptr_t)vaddr;
-	mr->iova = mr->vaddr;
-	mr->size = size;
-	mr->fd = spdk_mem_get_fd_and_offset(vaddr, &offset);
-	if (mr->fd < 0) {
-		SPDK_ERRLOG("Error to get the memory map offset\n");
-		free(mr);
-		return -EFAULT;
-	}
-	mr->offset = offset;
+	cur = base;
+	while (cur < end) {
+		uint64_t ext_start = cur;
+		uint64_t ext_off, probe_off, next;
+		int ext_fd, probe_fd;
 
-	ret = vfio_add_mr(dev, mr);
-	if (ret) {
-		free(mr);
-		return ret;
+		ext_fd = spdk_mem_get_fd_and_offset((void *)(uintptr_t)cur, &ext_off);
+		if (ext_fd < 0) {
+			SPDK_ERRLOG("Error to get the memory map offset\n");
+			ret = -EFAULT;
+			goto unwind;
+		}
+
+		/* Extend while the next memseg stays on the same fd at a contiguous offset. */
+		for (next = cur + VALUE_2MB; next < end; next += VALUE_2MB) {
+			probe_fd = spdk_mem_get_fd_and_offset((void *)(uintptr_t)next, &probe_off);
+			if (probe_fd < 0) {
+				SPDK_ERRLOG("Error to get the memory map offset\n");
+				ret = -EFAULT;
+				goto unwind;
+			}
+			if (probe_fd != ext_fd || probe_off != ext_off + (next - ext_start)) {
+				break;
+			}
+		}
+		if (next > end) {
+			next = end;
+		}
+
+		mr = calloc(1, sizeof(*mr));
+		if (mr == NULL) {
+			ret = -ENOMEM;
+			goto unwind;
+		}
+		mr->vaddr = ext_start;
+		mr->iova = ext_start;
+		mr->size = next - ext_start;
+		mr->fd = ext_fd;
+		mr->offset = ext_off;
+
+		ret = vfio_add_mr(dev, mr);
+		if (ret) {
+			free(mr);
+			goto unwind;
+		}
+
+		ret = vfio_user_dev_dma_map_unmap(dev, mr, true);
+		if (ret) {
+			vfio_remove_mr(dev, mr->vaddr, mr->size);
+			goto unwind;
+		}
+
+		cur = next;
 	}
 
-	return vfio_user_dev_dma_map_unmap(dev, mr, true);
+	return 0;
+
+unwind:
+	/* Roll back any extents already mapped for this registration. */
+	TAILQ_FOREACH_SAFE(mr, &dev->mrs_head, link, tmp_mr) {
+		if (mr->vaddr < base || mr->vaddr >= end) {
+			continue;
+		}
+		vfio_user_dev_dma_map_unmap(dev, mr, false);
+		vfio_remove_mr(dev, mr->vaddr, mr->size);
+	}
+	return ret;
 }
 
 static int
