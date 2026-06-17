@@ -218,6 +218,65 @@ nkvx_bulk_release(struct nkvx_front *front, hg_bulk_t h)
 }
 
 /*
+ * Register [result_sink, result_sink+len) as a WRITE-mode bulk backed by a
+ * DMA-BUF fd (rados-nkvx S2 dma-buf bulk path, bead spdk-a27). The handle is
+ * created via HG_Bulk_create_attr carrying {mem_type=HG_MEM_TYPE_HOST,
+ * dmabuf_fd, dmabuf_offset}; na_ofi then registers the MR from the fd
+ * (fi_mr_regattr(FI_MR_DMABUF)) so the executor RDMA-WRITEs straight into the
+ * dma-buf-backed memory.
+ *
+ * UNCACHED on purpose (C7.2 caveat): a dma-buf handle's MR identity is the
+ * (fd,offset) pair, NOT the VA — the cache keys on VA and would alias a stale fd.
+ * So this never enters front->bulk_cache; nkvx_bulk_release HG_Bulk_free()s it
+ * (handle-not-found path) when the RPC completes, exactly like an overflow handle.
+ *
+ * BASE (result_sink) is LOAD-BEARING, not a placeholder, on two counts:
+ *   1. HG_Bulk_create_attr -> hg_bulk_create_na_mem_descs SKIPS any segment whose
+ *      base == NULL ("Skip null segments"), so a NULL base would silently produce
+ *      an UNREGISTERED bulk and the executor would have nothing to RDMA into.
+ *   2. On the verbs/irdma provider (FI_MR_VIRT_ADDR), na_ofi sets the dma-buf MR's
+ *      IOVA base_addr to this VA; Mercury RMA addresses the remote MR by that VA,
+ *      so it MUST equal the IOVA the result_sink SGL segment advertised, or the
+ *      executor's WRITE lands outside the MR window (irdma local access violation).
+ * For the B-i mixed-SGL path the caller threads the dma-buf segment's guest IOVA
+ * down as result_sink, which satisfies both. The IOVA is NEVER dereferenced (the
+ * MR is registered from the fd, not from the VA), so a non-host-addressable IOVA
+ * is safe here. We reject a NULL base with a dma-buf fd to fail loudly rather than
+ * register a silently-skipped (unusable) bulk.
+ */
+static int
+nkvx_bulk_acquire_dmabuf(struct nkvx_front *front, void *result_sink,
+			 hg_size_t len, int dmabuf_fd, uint64_t dmabuf_offset,
+			 hg_bulk_t *out)
+{
+	struct hg_bulk_attr attr = {
+		.mem_type = HG_MEM_TYPE_HOST,	/* a dma-buf BAR/udmabuf is host-iface */
+		.device = 0,
+		.dmabuf_fd = dmabuf_fd,
+		.dmabuf_offset = dmabuf_offset,
+	};
+	void *base = result_sink;
+	hg_bulk_t h;
+	hg_return_t ret;
+
+	if (base == NULL) {
+		/* Mercury would skip a NULL-base segment, leaving the sink unregistered;
+		 * and verbs needs the IOVA as the MR base. Refuse rather than silently
+		 * produce an unusable bulk. */
+		return -EINVAL;
+	}
+
+	front->bulk_misses++;	/* always a "miss": dma-buf sinks are never cached */
+	ret = HG_Bulk_create_attr(front->cls, 1, &base, &len, HG_BULK_WRITE_ONLY,
+				  &attr, &h);
+	if (ret != HG_SUCCESS) {
+		return -EIO;
+	}
+	*out = h;
+	return 0;
+}
+
+/*
  * ====================================================================
  * Slice C6b two-phase cancel join (bead spdk-5ia, design §C6b).
  *
@@ -580,10 +639,17 @@ nkvx_front_get_bulk_stats(const struct nkvx_front *front,
 	stats->evicts = front->bulk_evicts;
 }
 
-int
-nkvx_front_forward_tok(struct nkvx_front *front, const nkvx_exec_in_t *in,
-		       void *result_sink, uint32_t result_sink_len,
-		       nkvx_front_done_cb cb, void *arg, uint64_t *out_token)
+/*
+ * Full forward implementation: nkvx_front_forward_tok and
+ * nkvx_front_forward_dmabuf are thin wrappers. When result_sink_dmabuf_fd >= 0
+ * the result_sink is registered from that dma-buf fd (uncached, S2); otherwise
+ * the VA is registered cache-eligibly (the original C7 path, byte-for-byte).
+ */
+static int
+nkvx_front_forward_full(struct nkvx_front *front, const nkvx_exec_in_t *in,
+			void *result_sink, uint32_t result_sink_len,
+			int result_sink_dmabuf_fd, uint64_t result_sink_dmabuf_offset,
+			nkvx_front_done_cb cb, void *arg, uint64_t *out_token)
 {
 	struct nkvx_call *call;
 	nkvx_exec_in_t local;		/* mutable copy: carries the bulk handles */
@@ -603,6 +669,19 @@ nkvx_front_forward_tok(struct nkvx_front *front, const nkvx_exec_in_t *in,
 	 * a large input_len with no input_inline would ship a request advertising
 	 * input it cannot deliver (neither inline nor via PULL). Reject it. */
 	if (in->input_len > NKVX_INLINE_MAX && in->input_inline == NULL) {
+		return -EINVAL;
+	}
+
+	/*
+	 * Defense in depth (R2, bead spdk-avu): a dma-buf result_sink has NO
+	 * host_out fallback -- the result is delivered ONLY by a bulk WRITE into the
+	 * dma-buf MR. A sink at or below the inline cap registers no bulk (the gate
+	 * below requires > NKVX_INLINE_MAX), so the executor would return the result
+	 * inline and the front would DROP it while still completing SUCCESS: silent
+	 * data loss. The NVMf layer already rejects this upstream with a clean NVMe
+	 * status; this is a belt-and-suspenders reject for any other caller.
+	 */
+	if (result_sink_dmabuf_fd >= 0 && result_sink_len <= NKVX_INLINE_MAX) {
 		return -EINVAL;
 	}
 
@@ -642,11 +721,31 @@ nkvx_front_forward_tok(struct nkvx_front *front, const nkvx_exec_in_t *in,
 		local.input_bulk = call->input_bulk;
 	}
 
-	if (result_sink != NULL && result_sink_len > NKVX_INLINE_MAX) {
-		/* C7.2: reuse a cached MR/hg_bulk handle for this result-sink DPTR
-		 * (the recurring tenant output buffer), or register one. */
-		rc = nkvx_bulk_acquire(front, result_sink, result_sink_len,
-				       HG_BULK_WRITE_ONLY, &call->result_sink);
+	/*
+	 * B3 fix (bead spdk-avu): a pure-VRAM dma-buf sink has NO host VA
+	 * (result_sink == NULL) -- its MR identity is (fd, offset), not a VA. The old
+	 * gate `result_sink != NULL` would skip registration for it, leaving the
+	 * executor with no bulk to RDMA-WRITE into. Register whenever there is a
+	 * dma-buf fd OR a non-NULL VA, provided the sink is larger than the inline cap.
+	 */
+	if ((result_sink_dmabuf_fd >= 0 || result_sink != NULL) &&
+	    result_sink_len > NKVX_INLINE_MAX) {
+		if (result_sink_dmabuf_fd >= 0) {
+			/* S2 dma-buf bulk path: register the result_sink from the
+			 * dma-buf fd (uncached — keyed by fd, not VA). The executor
+			 * RDMA-WRITEs straight into the dma-buf-backed region. */
+			rc = nkvx_bulk_acquire_dmabuf(front, result_sink,
+						      result_sink_len,
+						      result_sink_dmabuf_fd,
+						      result_sink_dmabuf_offset,
+						      &call->result_sink);
+		} else {
+			/* C7.2: reuse a cached MR/hg_bulk handle for this result-sink
+			 * DPTR (the recurring tenant output buffer), or register one. */
+			rc = nkvx_bulk_acquire(front, result_sink, result_sink_len,
+					       HG_BULK_WRITE_ONLY,
+					       &call->result_sink);
+		}
 		if (rc != 0) {
 			nkvx_bulk_release(front, call->input_bulk);
 			free(call);
@@ -701,6 +800,30 @@ err_bulk:
 	nkvx_bulk_release(front, call->result_sink);
 	free(call);
 	return -EIO;
+}
+
+int
+nkvx_front_forward_tok(struct nkvx_front *front, const nkvx_exec_in_t *in,
+		       void *result_sink, uint32_t result_sink_len,
+		       nkvx_front_done_cb cb, void *arg, uint64_t *out_token)
+{
+	/* VA-registered result_sink (dmabuf_fd = -1): the original C7 path. */
+	return nkvx_front_forward_full(front, in, result_sink, result_sink_len,
+				       -1, 0, cb, arg, out_token);
+}
+
+int
+nkvx_front_forward_dmabuf(struct nkvx_front *front, const nkvx_exec_in_t *in,
+			  void *result_sink, uint32_t result_sink_len,
+			  int result_sink_dmabuf_fd,
+			  uint64_t result_sink_dmabuf_offset,
+			  nkvx_front_done_cb cb, void *arg, uint64_t *out_token)
+{
+	/* S2 dma-buf bulk path: register the result_sink from a dma-buf fd. */
+	return nkvx_front_forward_full(front, in, result_sink, result_sink_len,
+				       result_sink_dmabuf_fd,
+				       result_sink_dmabuf_offset, cb, arg,
+				       out_token);
 }
 
 int

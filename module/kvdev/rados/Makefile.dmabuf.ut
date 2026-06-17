@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Intel Corporation. All rights reserved.
+#
+# Standalone build for the Slice S2 dma-buf bulk-path proof (bead spdk-a27):
+# the NON-GPU end-to-end test of the dma-buf result_sink path. It compiles the
+# front client core (nkvx_front_client.c, with the S2 _dmabuf forward variant) +
+# the C3 contract directly against Mercury, exactly like Makefile.front.ut, but
+# the driver registers a HOST udmabuf as the result_sink and asserts the executor
+# RDMA-WROTE bit-exact into it over verbs.
+#
+# Usage:
+#   make -f Makefile.dmabuf.ut [MERCURY_PREFIX=<mercury-install>]
+#   make -f Makefile.dmabuf.ut run
+#   make -f Makefile.dmabuf.ut clean
+
+SPDK_ROOT       ?= $(realpath $(CURDIR)/../../..)
+MERCURY_PREFIX  ?= $(SPDK_ROOT)/vendor/mercury-install
+
+MERCURY_CFLAGS  := $(shell PKG_CONFIG_PATH=$(MERCURY_PREFIX)/lib/pkgconfig pkg-config --cflags mercury)
+MERCURY_LIBS    := $(shell PKG_CONFIG_PATH=$(MERCURY_PREFIX)/lib/pkgconfig pkg-config --libs mercury)
+
+CFLAGS  := -g -O0 -std=gnu11 -Wall -Wextra -Werror -I$(SPDK_ROOT)/include $(MERCURY_CFLAGS)
+LDFLAGS := $(MERCURY_LIBS) -lcrypto -Wl,-rpath,$(MERCURY_PREFIX)/lib
+
+ifeq ($(ASAN),1)
+CFLAGS  += -fsanitize=address -fno-omit-frame-pointer
+LDFLAGS += -fsanitize=address
+endif
+
+BIN  := nkvx_front_dmabuf_test
+SRCS := nkvx_front_dmabuf_test.c nkvx_front_client.c nkvx_exec_rpc.c
+HDRS := nkvx_front_client.h nkvx_exec_rpc.h
+
+$(BIN): $(SRCS) $(HDRS)
+	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
+
+run: $(BIN)
+	MERCURY_PREFIX=$(MERCURY_PREFIX) ./nkvx_dmabuf_test.sh
+
+clean:
+	rm -f $(BIN)
+
+.PHONY: run clean

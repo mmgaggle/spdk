@@ -52,6 +52,17 @@ SPDK_STATIC_ASSERT(SPDK_KVDEV_IO_STATUS_READ_ONLY        == -9, "wire status dri
 SPDK_STATIC_ASSERT(sizeof(int32_t) == 4, "wire status must be a fixed int32");
 
 /*
+ * The public KV Exec dma-buf sink minimum (bead spdk-avu, R2) MUST match this
+ * module-internal inline cap. lib/nvmf rejects a dma-buf sink with declared
+ * length <= SPDK_KVDEV_DMABUF_SINK_MIN_LEN, and the front drops a sub-inline
+ * result (registers no bulk for it). If the two ever diverge, a sink in the gap
+ * would pass the upstream check yet be silently dropped here -- pin them
+ * together at compile time.
+ */
+SPDK_STATIC_ASSERT(NKVX_INLINE_MAX == SPDK_KVDEV_DMABUF_SINK_MIN_LEN,
+		   "dma-buf sink inline cap must match the public minimum");
+
+/*
  * Cancel-ack enum (Slice C6b). The value is telemetry-only (the DELIVERED ack is
  * the safety proof), but pin it anyway for cross-build hygiene — mirroring the
  * wire-status block so a future reorder breaks the BUILD instead of silently

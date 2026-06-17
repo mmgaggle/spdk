@@ -502,6 +502,25 @@ struct spdk_nvmf_transport_ops {
 	void (*subsystem_dump_host)(struct spdk_nvmf_transport *transport,
 				    const struct spdk_nvmf_subsystem *subsystem,
 				    const char *hostnqn, struct spdk_json_write_ctx *w);
+
+	/*
+	 * B-i V3 (bead spdk-avu, MIXED-SGL): if this request's DPTR (a KV Exec SGL)
+	 * has a trailing dma-buf result_sink segment (exported GPU VRAM) rather than
+	 * being pure host RAM, return that segment's (fd, offset, len), its index
+	 * within req->iov[] (\p iovidx), AND the guest IOVA the segment advertised
+	 * (\p iova). The IOVA is load-bearing as the verbs/irdma dma-buf MR base
+	 * (FI_MR_VIRT_ADDR addresses the remote MR by VA); it is NEVER dereferenced by
+	 * the host. The KV layer (a) parses key+input from the leading RAM head iov(s)
+	 * and (b) forwards (fd, offset, len, iova) to a remote executor for direct P2P
+	 * RDMA. OPTIONAL: a transport with no dma-buf concept leaves this NULL (the KV
+	 * layer then takes the normal VA path). Returns 0 and fills the out-params on a
+	 * dma-buf sink; -ENOTSUP or -ENOENT when the request has no dma-buf sink. The
+	 * fd is owned by the transport; the caller must NOT close it. Any out-param may
+	 * be NULL.
+	 */
+	int (*req_get_dmabuf_sink)(struct spdk_nvmf_request *req, int *fd,
+				   uint64_t *offset, uint32_t *len, uint8_t *iovidx,
+				   uint64_t *iova);
 };
 
 /**

@@ -348,6 +348,36 @@ spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 }
 
 int
+spdk_kvdev_exec_dmabuf(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
+		       const void *key, uint8_t key_len, uint32_t op_id, bool read_only,
+		       const struct spdk_kv_exec_binding *binding,
+		       const void *input, uint32_t input_len,
+		       int sink_fd, uint64_t sink_offset, uint32_t sink_len,
+		       uint64_t sink_va,
+		       spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct spdk_kvdev *kvdev = desc->kvdev;
+
+	SPDK_STATIC_ASSERT(SPDK_KVDEV_EXEC_KEY_MAX_LEN == UINT8_MAX,
+			   "exec key bound must match uint8_t range");
+	if (key == NULL || key_len < SPDK_KVDEV_KEY_MIN_LEN || sink_fd < 0) {
+		return -EINVAL;
+	}
+
+	/* exec_dmabuf is OPTIONAL: a backend that cannot target a dma-buf sink (the
+	 * in-memory module, or librados without the two-tier front) leaves it NULL.
+	 * Report -ENOTSUP so the NVMf layer fails the command rather than writing the
+	 * result to the wrong place. */
+	if (kvdev->fn_table->exec_dmabuf == NULL) {
+		return -ENOTSUP;
+	}
+
+	return kvdev->fn_table->exec_dmabuf(ch, key, key_len, op_id, read_only, binding,
+					    input, input_len, sink_fd, sink_offset, sink_len,
+					    sink_va, cb_fn, cb_arg);
+}
+
+int
 spdk_kvdev_abort(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch, void *cb_arg)
 {
 	struct spdk_kvdev *kvdev = desc->kvdev;

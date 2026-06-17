@@ -184,6 +184,84 @@ kvdev_rados_nkvx_front_forward(struct nkvx_front *front,
 	return 0;
 }
 
+int
+kvdev_rados_nkvx_front_forward_dmabuf(struct nkvx_front *front,
+				      const void *key, uint8_t key_len,
+				      uint32_t op_id, bool read_only,
+				      uint8_t runtime,
+				      const char *module_key, const char *module_ns,
+				      const uint8_t *sha256, bool sha256_valid,
+				      uint64_t caps,
+				      const void *input, uint32_t input_len,
+				      void *sink_va, uint32_t sink_len,
+				      int sink_fd, uint64_t sink_offset,
+				      spdk_kvdev_io_completion_cb cb_fn, void *cb_arg,
+				      uint64_t *out_token)
+{
+	struct kvdev_rados_nkvx_fwd_ctx *ctx;
+	nkvx_exec_in_t in;
+	int rc;
+
+	if (out_token != NULL) {
+		*out_token = KVDEV_RADOS_NKVX_TOKEN_NONE;
+	}
+
+	/* A dma-buf forward must carry a valid fd; key_len bounds as for the VA path. */
+	if (front == NULL || cb_fn == NULL || key_len == 0 || sink_fd < 0) {
+		return -EINVAL;
+	}
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL) {
+		return -ENOMEM;
+	}
+	ctx->cb_fn = cb_fn;
+	ctx->cb_arg = cb_arg;
+	/*
+	 * host_out is the CPU buffer the done-cb copies an INLINE result into. For a
+	 * dma-buf (VRAM) sink there is no CPU VA, so leave it NULL: a large result is
+	 * PUSHed straight into the dma-buf and the inline-copy is a no-op (inline is
+	 * empty on the push path). sink_va is the dma-buf segment's guest IOVA: the
+	 * advertised VA used as the verbs dma-buf MR base (load-bearing, never derefed).
+	 */
+	ctx->host_out = NULL;
+	ctx->host_out_len = 0;
+
+	memset(&in, 0, sizeof(in));
+	in.op_id = op_id;
+	in.read_only = read_only ? 1 : 0;
+	in.runtime = runtime;
+	in.caps = caps;
+	in.key_len = key_len;
+	memcpy(in.key, key, key_len);
+	if (sha256 != NULL && sha256_valid) {
+		memcpy(in.sha256, sha256, SPDK_KV_EXEC_SHA256_LEN);
+	}
+	in.sha256_valid = sha256_valid ? 1 : 0;
+	in.module_key = (char *)module_key;	/* borrowed; encoded synchronously */
+	in.module_ns = (char *)module_ns;
+	in.osize = sink_len;
+	in.input_len = input_len;
+	in.input_inline = (void *)input;	/* borrowed; registered/encoded synchronously */
+	in.input_bulk = HG_BULK_NULL;		/* originated by the forward */
+	in.result_sink = HG_BULK_NULL;		/* originated by the forward */
+
+	/*
+	 * B-i V2: register the result sink from the dma-buf fd (HG_Bulk_create_attr
+	 * with {mem_type=HG_MEM_TYPE_HOST, dmabuf_fd, dmabuf_offset}); the executor
+	 * RDMA-WRITEs the result straight into the dma-buf-backed VRAM region. The
+	 * dma-buf handle bypasses the VA-keyed bulk cache (it is keyed by (fd,offset)).
+	 */
+	rc = nkvx_front_forward_dmabuf(front, &in, sink_va, sink_len,
+				       sink_fd, sink_offset,
+				       kvdev_rados_nkvx_front_done, ctx, out_token);
+	if (rc != 0) {
+		free(ctx);
+		return rc;
+	}
+	return 0;
+}
+
 bool
 kvdev_rados_nkvx_front_cancel(struct nkvx_front *front, uint64_t token)
 {

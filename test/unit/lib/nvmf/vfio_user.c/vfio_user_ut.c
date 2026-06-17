@@ -250,6 +250,68 @@ test_nvme_cmd_map_sgls(void)
 	spdk_free(sgls);
 }
 
+/*
+ * B-i V3 (bead spdk-avu, MIXED-SGL) R1: the dma-buf result_sink tolerance in
+ * _map_one() (which emits a non-dereferenceable sentinel) is gated by
+ * nvmf_vfio_user_req_is_kv_exec_ns(). Opcode 0x83 (KV Exec) is a VENDOR opcode
+ * that can also target a bdev (NVM CSI) namespace in the same subsystem; a
+ * sentinel emitted for such a command would be DMAed against by the bdev passthru
+ * path and crash. Prove the gate is true ONLY for a 0x83 command on a KV-CSI
+ * namespace, and false for: a 0x83 on a non-KV namespace, a non-0x83 opcode, an
+ * unknown nsid, and an invisible namespace -- so NO sentinel can ever reach a
+ * non-KV/non-Exec consumer.
+ */
+static void
+test_vfio_user_map_one_dmabuf_gate_kv_ns(void)
+{
+	struct spdk_nvmf_subsystem subsys = {};
+	struct spdk_nvmf_ctrlr ctrlr = {};
+	struct spdk_nvmf_qpair qpair = {};
+	struct spdk_nvmf_ns kv_ns = { .nsid = 1, .csi = SPDK_NVME_CSI_KV };
+	struct spdk_nvmf_ns bdev_ns = { .nsid = 2, .csi = SPDK_NVME_CSI_NVM };
+	struct spdk_nvmf_ns *ns_arr[2] = { &kv_ns, &bdev_ns };
+	union nvmf_h2c_msg cmd = {};
+	struct spdk_nvmf_request req = {};
+
+	subsys.ns = ns_arr;
+	subsys.max_nsid = 2;
+	ctrlr.subsys = &subsys;
+	ctrlr.visible_ns = spdk_bit_array_create(2);
+	SPDK_CU_ASSERT_FATAL(ctrlr.visible_ns != NULL);
+	spdk_bit_array_set(ctrlr.visible_ns, 0);	/* nsid 1 visible */
+	spdk_bit_array_set(ctrlr.visible_ns, 1);	/* nsid 2 visible */
+	qpair.ctrlr = &ctrlr;
+	req.cmd = &cmd;
+	req.qpair = &qpair;
+
+	/* (1) KV Exec on the KV (CSI==KV) namespace: gate TRUE -> sentinel allowed. */
+	cmd.nvme_cmd.opc = SPDK_NVME_OPC_KV_EXEC;
+	cmd.nvme_cmd.nsid = 1;
+	CU_ASSERT(nvmf_vfio_user_req_is_kv_exec_ns(&req) == true);
+
+	/* (2) KV Exec opcode (0x83) on a BDEV (NVM CSI) namespace: gate FALSE.
+	 * This is the R1 crash vector -- a sentinel here would DMA against 0x1. */
+	cmd.nvme_cmd.nsid = 2;
+	CU_ASSERT(nvmf_vfio_user_req_is_kv_exec_ns(&req) == false);
+
+	/* (3) A non-KV-Exec opcode on the KV namespace: gate FALSE (opcode gate). */
+	cmd.nvme_cmd.opc = SPDK_NVME_OPC_KV_STORE;
+	cmd.nvme_cmd.nsid = 1;
+	CU_ASSERT(nvmf_vfio_user_req_is_kv_exec_ns(&req) == false);
+
+	/* (4) KV Exec on an unknown nsid: gate FALSE (ns lookup returns NULL). */
+	cmd.nvme_cmd.opc = SPDK_NVME_OPC_KV_EXEC;
+	cmd.nvme_cmd.nsid = 9;
+	CU_ASSERT(nvmf_vfio_user_req_is_kv_exec_ns(&req) == false);
+
+	/* (5) KV Exec on the KV namespace but the ns is INVISIBLE: gate FALSE. */
+	cmd.nvme_cmd.nsid = 1;
+	spdk_bit_array_clear(ctrlr.visible_ns, 0);
+	CU_ASSERT(nvmf_vfio_user_req_is_kv_exec_ns(&req) == false);
+
+	spdk_bit_array_free(&ctrlr.visible_ns);
+}
+
 static void
 ut_transport_destroy_done_cb(void *cb_arg)
 {
@@ -297,6 +359,7 @@ main(int argc, char **argv)
 	CU_ADD_TEST(suite, test_nvme_cmd_map_prps);
 	CU_ADD_TEST(suite, test_nvme_cmd_map_sgls);
 	CU_ADD_TEST(suite, test_nvmf_vfio_user_create_destroy);
+	CU_ADD_TEST(suite, test_vfio_user_map_one_dmabuf_gate_kv_ns);
 
 	num_failures = spdk_ut_run_tests(argc, argv, NULL);
 	CU_cleanup_registry();

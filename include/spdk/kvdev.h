@@ -42,6 +42,24 @@ extern "C" {
  */
 #define SPDK_KVDEV_EXEC_KEY_MAX_LEN 255
 
+/*
+ * Minimum length (bytes) of a KV Exec dma-buf result_sink (B-i V3, bead
+ * spdk-avu). A two-tier backend returns a result that fits within the RPC inline
+ * cap WITHOUT registering a bulk MR; for an ordinary host-VA sink the front then
+ * copies the inline bytes into host_out. The dma-buf path has NO host_out
+ * fallback -- the result must be RDMA-WRITTEN into device memory via a
+ * registered bulk -- so a sink whose declared length is <= this threshold would
+ * ride inline, be DROPPED by the front, yet still complete SUCCESS: silent data
+ * loss with the guest believing VRAM was written. sink_len is guest-controlled,
+ * so the NVMf KV Exec dispatch MUST reject a dma-buf sink at or below this bound
+ * with a clean NVMe error rather than dispatch it. The value mirrors the
+ * module-internal inline cap (NKVX_INLINE_MAX == 4096); a dma-buf sink must be
+ * STRICTLY LARGER (i.e. length > SPDK_KVDEV_DMABUF_SINK_MIN_LEN) to force a bulk
+ * registration. Kept in the public header so lib/nvmf need not depend on a
+ * backend-private constant.
+ */
+#define SPDK_KVDEV_DMABUF_SINK_MIN_LEN 4096
+
 struct spdk_kvdev;
 struct spdk_kvdev_desc;
 struct spdk_kvdev_module;
@@ -405,6 +423,28 @@ struct spdk_kvdev_fn_table {
 		    spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
 
 	/**
+	 * KV Exec variant whose RESULT SINK is a dma-buf (B-i V3, bead spdk-avu,
+	 * MIXED-SGL): the output is not addressable as a host VA but as
+	 * (\c sink_fd, \c sink_offset, \c sink_len) referencing exported device memory
+	 * (e.g. GPU VRAM). A two-tier backend forwards the fd so the remote executor
+	 * RDMA-WRITEs the result straight into device memory
+	 * (nkvx_front_forward_dmabuf). \c sink_va is the guest IOVA the result_sink SGL
+	 * segment advertised: it is load-bearing as the verbs/irdma dma-buf MR base
+	 * (FI_MR_VIRT_ADDR addresses the remote MR by VA) and is NEVER dereferenced.
+	 * OPTIONAL: a backend that cannot target a dma-buf leaves this NULL, in which
+	 * case spdk_kvdev_exec_dmabuf() returns -ENOTSUP and the NVMf layer fails the
+	 * command rather than silently writing to the wrong place. The key+input come
+	 * from the SGL's RAM head; \c sink_len is the dma-buf segment capacity.
+	 */
+	int (*exec_dmabuf)(struct spdk_io_channel *ch, const void *key, uint8_t key_len,
+			   uint32_t op_id, bool read_only,
+			   const struct spdk_kv_exec_binding *binding,
+			   const void *input, uint32_t input_len,
+			   int sink_fd, uint64_t sink_offset, uint32_t sink_len,
+			   uint64_t sink_va,
+			   spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
+
+	/**
 	 * Abort an in-flight operation (KV Exec) on this channel that was submitted
 	 * with the opaque \c cb_arg (vendor extension, Slice C6c). OPTIONAL: a module
 	 * may leave this NULL, in which case spdk_kvdev_abort() returns -ENOTSUP and
@@ -655,6 +695,28 @@ int spdk_kvdev_exec(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
 		    const void *input, uint32_t input_len,
 		    void *output_buf, uint32_t output_buf_len,
 		    spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
+
+/**
+ * KV Exec whose RESULT SINK is a dma-buf-backed region (B-i V3, bead spdk-avu,
+ * MIXED-SGL) rather than a host VA buffer. Identical to spdk_kvdev_exec() except
+ * the output is identified by (\c sink_fd, \c sink_offset, \c sink_len) -- exported
+ * device memory (e.g. GPU VRAM that is not CPU-mmappable) -- so a two-tier backend
+ * can RDMA the result straight into it. \c sink_va is the guest IOVA the
+ * result_sink SGL segment advertised (load-bearing as the verbs dma-buf MR base;
+ * never dereferenced). The \c key / \c input come from the SGL's RAM head. Thin
+ * wrapper over the optional fn_table::exec_dmabuf op.
+ *
+ * \return 0 if the request was accepted (a completion will fire), -ENOTSUP if
+ *         the backend has no exec_dmabuf op (no completion fires), or another
+ *         negative errno if it could not be submitted.
+ */
+int spdk_kvdev_exec_dmabuf(struct spdk_kvdev_desc *desc, struct spdk_io_channel *ch,
+			   const void *key, uint8_t key_len, uint32_t op_id, bool read_only,
+			   const struct spdk_kv_exec_binding *binding,
+			   const void *input, uint32_t input_len,
+			   int sink_fd, uint64_t sink_offset, uint32_t sink_len,
+			   uint64_t sink_va,
+			   spdk_kvdev_io_completion_cb cb_fn, void *cb_arg);
 
 /**
  * Request cancellation of an in-flight op (KV Exec) on the descriptor's kvdev

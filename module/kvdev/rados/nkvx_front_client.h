@@ -150,6 +150,40 @@ int nkvx_front_forward_tok(struct nkvx_front *front, const nkvx_exec_in_t *in,
 			   void *result_sink, uint32_t result_sink_len,
 			   nkvx_front_done_cb cb, void *arg, uint64_t *out_token);
 
+/**
+ * Like nkvx_front_forward(), but register the large \p result_sink from a DMA-BUF
+ * fd instead of its virtual address (rados-nkvx S2 dma-buf bulk path, bead
+ * spdk-a27). When \p result_sink_dmabuf_fd >= 0 and \p result_sink_len >
+ * NKVX_INLINE_MAX, the result-sink bulk is created via HG_Bulk_create_attr with
+ * {mem_type=HG_MEM_TYPE_HOST, dmabuf_fd, dmabuf_offset}, so on the verbs provider
+ * the executor RDMA-WRITEs the Exec result straight into the dma-buf-backed region
+ * (e.g. a host udmabuf in the non-GPU test, or a GPU-VRAM vfio-user P2PDMA sink in
+ * S3). \p result_sink is still passed (it is the VA the segment advertises and the
+ * cache/identity key) but the actual MR is taken from the fd at
+ * \p result_sink_dmabuf_offset. NOTE: \p result_sink must be NON-NULL even on the
+ * dma-buf path -- Mercury skips a NULL-base segment (it would never register the
+ * MR), and on verbs/irdma (FI_MR_VIRT_ADDR) it is load-bearing as the dma-buf MR's
+ * IOVA base. For the B-i mixed-SGL case the caller threads the dma-buf segment's
+ * guest IOVA here; it is the advertised VA and is NEVER dereferenced.
+ *
+ * dma-buf result sinks BYPASS the C7.2 bulk-handle cache: a dma-buf handle is
+ * keyed by (fd, offset), not VA, so it must never be reused for a different fd
+ * sharing the same VA — it is created uncached and freed (HG_Bulk_free) when the
+ * RPC completes, exactly like a cache-overflow handle.
+ *
+ * Pass \p result_sink_dmabuf_fd < 0 to behave exactly like nkvx_front_forward()
+ * (VA registration, cache-eligible). The input bulk path is unchanged.
+ *
+ * \return 0 if submitted; negative errno-style otherwise. \p out_token (when
+ * non-NULL) carries the cancel token as in nkvx_front_forward_tok().
+ */
+int nkvx_front_forward_dmabuf(struct nkvx_front *front, const nkvx_exec_in_t *in,
+			      void *result_sink, uint32_t result_sink_len,
+			      int result_sink_dmabuf_fd,
+			      uint64_t result_sink_dmabuf_offset,
+			      nkvx_front_done_cb cb, void *arg,
+			      uint64_t *out_token);
+
 /** Sentinel "no call" cancel token (a valid token is always nonzero). */
 #define NKVX_CALL_TOKEN_NONE 0ull
 

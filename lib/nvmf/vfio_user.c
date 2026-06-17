@@ -143,6 +143,37 @@ struct nvmf_vfio_user_req  {
 	struct iovec				iov[NVMF_VFIO_USER_MAX_IOVECS];
 	uint8_t					iovcnt;
 
+	/*
+	 * B-i V3 (bead spdk-avu, MIXED-SGL): a KV Exec DPTR is an NVMe SGL with two
+	 * (or more) segments: leading RAM segment(s) carry the CPU-readable HEAD
+	 * ([u16 key_len][key][input...]) and resolve to normal host VAs, while a
+	 * trailing dma-buf segment is the VRAM RESULT_SINK (exported GPU VRAM, not
+	 * CPU-mmappable). _map_one() cannot produce a host VA for that trailing
+	 * segment, so it records the dma-buf here: dmabuf_sink_fd >= 0 marks the
+	 * request as having a dma-buf sink, and iov[dmabuf_sink_iovidx] is a sentinel
+	 * (iov_base == VFIO_USER_DMABUF_SINK_SENTINEL, iov_len == mapped length). The
+	 * KV layer parses key+input from the RAM head iov(s) and forwards the
+	 * (fd, offset, len) of the dma-buf segment to the remote executor
+	 * (nkvx_front_forward_dmabuf) so it RDMA-WRITEs the result straight into VRAM.
+	 * Gated to KV Exec ONLY (B1): a dma-buf region under any other opcode falls
+	 * back to the old behavior (map failure -> the command errors normally), so no
+	 * sentinel ever escapes to a non-Exec consumer. A normal (memfd/RAM) sink
+	 * leaves dmabuf_sink_fd == -1 and is mapped exactly as before.
+	 */
+	int					dmabuf_sink_fd;
+	uint64_t				dmabuf_sink_offset;
+	uint32_t				dmabuf_sink_len;
+	uint8_t					dmabuf_sink_iovidx;
+	/*
+	 * The guest IOVA the SGL segment advertised for the dma-buf result_sink. It
+	 * is LOAD-BEARING for the verbs/irdma RDMA path: under FI_MR_VIRT_ADDR the
+	 * remote MR is addressed by this VA, so na_ofi sets the dma-buf MR's IOVA base
+	 * to it (na_ofi_mem_register). The KV layer passes it down as the bulk's
+	 * "sink_va" so the executor's WRITE lands inside the MR's IOVA window. It is
+	 * an IOVA, NEVER dereferenced by the host.
+	 */
+	uint64_t				dmabuf_sink_iova;
+
 	/* NVMF_VFIO_USER_MAX_IOVECS worth of dma_sg_t. */
 	uint8_t					sg[];
 };
@@ -637,6 +668,17 @@ poll_group_kick(struct nvmf_vfio_user_poll_group *vu_group)
 }
 
 /*
+ * B-i V2 (bead spdk-avu): non-NULL, non-dereferenceable sentinel returned by
+ * _map_one() for a dma-buf-backed result_sink. It satisfies the "gpa_to_vva
+ * returned non-NULL" success checks in nvme_cmd_map_prps()/map_sgls() (so the
+ * request is not failed) while being an obviously-invalid VA: any code that
+ * actually dereferences it would fault loudly rather than corrupt VRAM. The KV
+ * layer never dereferences it -- it detects the dma-buf via the transport
+ * accessor (vu_req->dmabuf_sink_fd) and consumes the fd instead.
+ */
+#define VFIO_USER_DMABUF_SINK_SENTINEL ((void *)(uintptr_t)0x1)
+
+/*
  * Make the given DMA address and length available (locally mapped) via iov.
  */
 static void *
@@ -670,8 +712,17 @@ map_one(vfu_ctx_t *ctx, uint64_t addr, uint64_t len, dma_sg_t *sg,
 
 	ret = vfu_sgl_get(ctx, sg, iov, 1, 0);
 	if (ret != 0) {
-		SPDK_ERRLOG("failed to get iovec for IOVA [%#lx, %#lx): %m\n",
-			    addr, addr + len);
+		/*
+		 * B-i V3 (bead spdk-avu): a dma-buf-backed region is intentionally not
+		 * mmapped, so vfu_sgl_get() returns EFAULT for it -- this is the EXPECTED
+		 * path for a KV Exec VRAM result_sink, which _map_one() recovers via
+		 * vfu_sgl_get_dmabuf(). Suppress the spurious error log when the segment
+		 * resolved to a dma-buf; a genuine (non-dma-buf) failure still logs.
+		 */
+		if (vfu_sgl_get_dmabuf(ctx, sg, NULL, NULL) != 0) {
+			SPDK_ERRLOG("failed to get iovec for IOVA [%#lx, %#lx): %m\n",
+				    addr, addr + len);
+		}
 		return NULL;
 	}
 
@@ -1605,6 +1656,31 @@ acq_setup(struct nvmf_vfio_user_ctrlr *ctrlr)
 	return 0;
 }
 
+/*
+ * B-i V3 (bead spdk-avu, MIXED-SGL) R1 gate: is this request a KV Exec targeting
+ * a KEY-VALUE (CSI == KV) namespace? The dma-buf result_sink tolerance in
+ * _map_one() (which emits a non-dereferenceable sentinel iov) is gated on BOTH
+ * conditions. Opcode 0x83 is a VENDOR opcode that can also target a bdev (NVM CSI)
+ * namespace in the same subsystem; a sentinel emitted for such a command would be
+ * DMAed against by the bdev passthru path and crash. The namespace is resolved
+ * from the controller's subsystem ns list (honoring per-controller visibility);
+ * an unknown/invisible ns, a non-KV CSI, or a missing controller all return false
+ * so the dma-buf tolerance is NOT applied and the command takes the normal path.
+ */
+static bool
+nvmf_vfio_user_req_is_kv_exec_ns(struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_ns *ns;
+
+	if (req->cmd->nvme_cmd.opc != SPDK_NVME_OPC_KV_EXEC ||
+	    req->qpair == NULL || req->qpair->ctrlr == NULL) {
+		return false;
+	}
+
+	ns = nvmf_ctrlr_get_ns(req->qpair->ctrlr, req->cmd->nvme_cmd.nsid);
+	return ns != NULL && ns->csi == SPDK_NVME_CSI_KV;
+}
+
 static void *
 _map_one(void *prv, uint64_t addr, uint64_t len, uint32_t flags)
 {
@@ -1625,8 +1701,75 @@ _map_one(void *prv, uint64_t addr, uint64_t len, uint32_t flags)
 		      &vu_req->iov[vu_req->iovcnt], flags);
 	if (spdk_likely(ret != NULL)) {
 		vu_req->iovcnt++;
+		return ret;
 	}
-	return ret;
+
+	/*
+	 * B-i V3 (bead spdk-avu, MIXED-SGL): map_one failed to produce a host VA.
+	 * Before failing the request, check whether the IOVA resolved to a
+	 * dma-buf-backed DMA region (exported GPU VRAM). map_one's vfu_addr_to_sgl()
+	 * populated the sg even though vfu_sgl_get() returned EFAULT (a dma-buf is not
+	 * mmapped), so vfu_sgl_get_dmabuf() can recover the (fd, offset) here.
+	 *
+	 * B1 CONTAINMENT: this dma-buf tolerance is gated on BOTH (1) KV Exec opcode
+	 * (req->cmd->nvme_cmd.opc == SPDK_NVME_OPC_KV_EXEC) AND (2) the command's
+	 * namespace being a Key-Value (CSI == SPDK_NVME_CSI_KV) namespace. Opcode 0x83
+	 * is a VENDOR opcode: the SAME number can legitimately target a bdev (NVM CSI)
+	 * namespace in the same subsystem, where it dispatches to the bdev passthru
+	 * path that DMAs against iov_base -- a sentinel there would be dereferenced and
+	 * crash. The command is fully populated by handle_cmd_req() (req->cmd->nvme_cmd
+	 * = *cmd) BEFORE mapping, so both the opcode and cmd->nsid are available here;
+	 * the ns is resolved via the controller's subsystem ns list
+	 * (nvmf_ctrlr_get_ns(), which also honors per-controller ns visibility). For
+	 * ANY other opcode OR a non-KV namespace (Store/Retrieve/bdev/...) a dma-buf
+	 * region falls back to the OLD behavior -- return NULL so the command errors
+	 * normally -- and NO sentinel ever escapes to a non-KV/non-Exec consumer that
+	 * would dereference it.
+	 *
+	 * If it is a KV Exec dma-buf, record it on the request and emit a SENTINEL iov
+	 * (iov_base == VFIO_USER_DMABUF_SINK_SENTINEL, iov_len == len): the KV/Exec
+	 * output path consumes the fd instead of a VA. Only ONE dma-buf sink per
+	 * request is supported (the trailing result_sink segment of the mixed SGL); a
+	 * second dma-buf segment is treated as an error (dmabuf_sink_fd already set).
+	 * For any non-dma-buf failure this returns NULL exactly as before, so the
+	 * normal RAM mapping path (the SGL's leading RAM head segments) is
+	 * byte-for-byte unchanged.
+	 */
+	{
+		dma_sg_t *sg = index_to_sg_t(vu_req->sg, vu_req->iovcnt);
+		int dfd = -1;
+		uint64_t doff = 0;
+
+		if ((flags & MAP_RW) &&
+		    nvmf_vfio_user_req_is_kv_exec_ns(req) &&
+		    vu_req->dmabuf_sink_fd < 0 &&
+		    vfu_sgl_get_dmabuf(sq->ctrlr->endpoint->vfu_ctx, sg, &dfd, &doff) == 0 &&
+		    dfd >= 0) {
+			struct iovec *iov = &vu_req->iov[vu_req->iovcnt];
+
+			iov->iov_base = VFIO_USER_DMABUF_SINK_SENTINEL;
+			iov->iov_len = len;
+
+			vu_req->dmabuf_sink_fd = dfd;
+			vu_req->dmabuf_sink_offset = doff;
+			vu_req->dmabuf_sink_len = (uint32_t)len;
+			vu_req->dmabuf_sink_iovidx = vu_req->iovcnt;
+			/* Record the segment IOVA: load-bearing as the verbs MR base_addr. */
+			vu_req->dmabuf_sink_iova = addr;
+
+			SPDK_DEBUGLOG(nvmf_vfio,
+				      "dma-buf result_sink: iova=%#lx len=%#lx fd=%d offset=%#lx\n",
+				      addr, len, dfd, doff);
+
+			vu_req->iovcnt++;
+			/* Non-NULL sentinel return: signals map success to the PRP/SGL
+			 * walker, which stores it into req->iov[].iov_base. The buffer is
+			 * NOT a usable VA -- only the fd path (dmabuf_sink_fd) is. */
+			return VFIO_USER_DMABUF_SINK_SENTINEL;
+		}
+	}
+
+	return NULL;
 }
 
 static int
@@ -1940,6 +2083,8 @@ alloc_sq_reqs(struct nvmf_vfio_user_ctrlr *vu_ctrlr, struct nvmf_vfio_user_sq *s
 		req->rsp = (union nvmf_c2h_msg *)&vu_req->rsp;
 		req->cmd = (union nvmf_h2c_msg *)&vu_req->cmd;
 		req->stripped_data = NULL;
+		/* B-i V2: -1 == "no dma-buf result_sink" (calloc zero would look like fd 0). */
+		vu_req->dmabuf_sink_fd = -1;
 
 		TAILQ_INSERT_TAIL(&sq->free_reqs, vu_req, link);
 	}
@@ -2610,6 +2755,22 @@ memory_region_add_cb(vfu_ctx_t *vfu_ctx, vfu_dma_info_t *info)
 	struct nvmf_vfio_user_cq *cq;
 	void *map_start, *map_end;
 	int ret;
+
+	/*
+	 * B-i V2 (bead spdk-avu): a dma-buf region (exported vfio-pci BAR / GPU
+	 * VRAM) is intentionally NOT mmapped, so info->vaddr is NULL but info->dmabuf
+	 * is set and the region is valid. We must NOT spdk_mem_register it (there is
+	 * no host CPU VA) and must NOT treat it as a broken region: libvfio-user
+	 * already tracks it and its IOVA range resolves via vfu_addr_to_sgl(), which
+	 * is all the KV result_sink path needs (it consumes the dma-buf fd directly).
+	 * Just return without registering; the absence of a CPU mapping is expected.
+	 */
+	if (info->dmabuf) {
+		SPDK_DEBUGLOG(nvmf_vfio, "dma-buf DMA region IOVA %p-%p (no vaddr)\n",
+			      info->iova.iov_base,
+			      info->iova.iov_base + info->iova.iov_len);
+		return;
+	}
 
 	/*
 	 * We're not interested in any DMA regions that aren't mappable (we don't
@@ -4717,6 +4878,14 @@ _nvmf_vfio_user_req_free(struct nvmf_vfio_user_sq *sq, struct nvmf_vfio_user_req
 	memset(&vu_req->cmd, 0, sizeof(vu_req->cmd));
 	memset(&vu_req->rsp, 0, sizeof(vu_req->rsp));
 	vu_req->iovcnt = 0;
+	/* B-i V3: clear ALL dma-buf result_sink state recorded for the prior command
+	 * (fd, offset, len, iovidx) so a stale offset/iovidx cannot leak into a later
+	 * reuse of this request. */
+	vu_req->dmabuf_sink_fd = -1;
+	vu_req->dmabuf_sink_offset = 0;
+	vu_req->dmabuf_sink_len = 0;
+	vu_req->dmabuf_sink_iovidx = 0;
+	vu_req->dmabuf_sink_iova = 0;
 	vu_req->req.iovcnt = 0;
 	vu_req->req.length = 0;
 	vu_req->req.raw = 0; /* clear all flags */
@@ -5358,6 +5527,48 @@ nvmf_vfio_user_opts_init(struct spdk_nvmf_transport_opts *opts)
 	opts->transport_specific =      NULL;
 }
 
+/*
+ * B-i V3 (bead spdk-avu, MIXED-SGL): transport op to expose a request's dma-buf
+ * result_sink segment (recorded during mapping in _map_one) to the KV/Exec layer.
+ * Returns 0 and the (fd, offset, len, iovidx) when this request's KV Exec SGL has
+ * a trailing dma-buf result_sink segment (exported GPU VRAM); -ENOENT for a normal
+ * RAM buffer. \p iovidx is the index of the dma-buf segment within req->iov[]
+ * (the KV layer requires it to be the LAST segment, with >= 1 preceding RAM head
+ * segments). The fd is owned by libvfio-user (closed on DMA_UNMAP / disconnect);
+ * the caller must NOT close it. Any out-param may be NULL.
+ */
+static int
+nvmf_vfio_user_req_get_dmabuf_sink(struct spdk_nvmf_request *req, int *fd,
+				   uint64_t *offset, uint32_t *len, uint8_t *iovidx,
+				   uint64_t *iova)
+{
+	struct nvmf_vfio_user_req *vu_req;
+
+	assert(req != NULL);
+	vu_req = SPDK_CONTAINEROF(req, struct nvmf_vfio_user_req, req);
+
+	if (vu_req->dmabuf_sink_fd < 0) {
+		return -ENOENT;
+	}
+
+	if (fd != NULL) {
+		*fd = vu_req->dmabuf_sink_fd;
+	}
+	if (offset != NULL) {
+		*offset = vu_req->dmabuf_sink_offset;
+	}
+	if (len != NULL) {
+		*len = vu_req->dmabuf_sink_len;
+	}
+	if (iovidx != NULL) {
+		*iovidx = vu_req->dmabuf_sink_iovidx;
+	}
+	if (iova != NULL) {
+		*iova = vu_req->dmabuf_sink_iova;
+	}
+	return 0;
+}
+
 const struct spdk_nvmf_transport_ops spdk_nvmf_transport_vfio_user = {
 	.name = "VFIOUSER",
 	.type = SPDK_NVME_TRANSPORT_VFIOUSER,
@@ -5392,6 +5603,8 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_vfio_user = {
 	.qpair_abort_request = nvmf_vfio_user_qpair_abort_request,
 
 	.poll_group_dump_stat = nvmf_vfio_user_poll_group_dump_stat,
+
+	.req_get_dmabuf_sink = nvmf_vfio_user_req_get_dmabuf_sink,
 };
 
 SPDK_NVMF_TRANSPORT_REGISTER(muser, &spdk_nvmf_transport_vfio_user);

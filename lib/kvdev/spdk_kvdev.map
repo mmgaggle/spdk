@@ -20,6 +20,7 @@
 	spdk_kvdev_exist;
 	spdk_kvdev_list;
 	spdk_kvdev_exec;
+	spdk_kvdev_exec_dmabuf;
 	spdk_kvdev_abort;
 
 	local: *;

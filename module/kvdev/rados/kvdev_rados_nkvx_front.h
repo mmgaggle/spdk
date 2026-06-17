@@ -105,6 +105,28 @@ int kvdev_rados_nkvx_front_forward(struct nkvx_front *front,
 				   spdk_kvdev_io_completion_cb cb_fn, void *cb_arg,
 				   uint64_t *out_token);
 
+/**
+ * B-i V2 (bead spdk-avu): like kvdev_rados_nkvx_front_forward(), but the result
+ * sink is a dma-buf (exported GPU VRAM) identified by (\p sink_fd, \p
+ * sink_offset) rather than a host VA. Forwards via nkvx_front_forward_dmabuf()
+ * so the remote executor RDMA-WRITEs the Exec result straight into the
+ * dma-buf-backed region. \p sink_va is the VA the segment advertises (may be
+ * NULL for a pure-VRAM sink); the MR is taken from the fd at \p sink_offset.
+ * Same submission/cancel/token contract as kvdev_rados_nkvx_front_forward().
+ */
+int kvdev_rados_nkvx_front_forward_dmabuf(struct nkvx_front *front,
+					  const void *key, uint8_t key_len,
+					  uint32_t op_id, bool read_only,
+					  uint8_t runtime,
+					  const char *module_key, const char *module_ns,
+					  const uint8_t *sha256, bool sha256_valid,
+					  uint64_t caps,
+					  const void *input, uint32_t input_len,
+					  void *sink_va, uint32_t sink_len,
+					  int sink_fd, uint64_t sink_offset,
+					  spdk_kvdev_io_completion_cb cb_fn, void *cb_arg,
+					  uint64_t *out_token);
+
 /** Sentinel "no in-flight forward to cancel" token (a live token is nonzero). */
 #define KVDEV_RADOS_NKVX_TOKEN_NONE 0ull
 

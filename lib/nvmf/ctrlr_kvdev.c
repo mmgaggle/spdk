@@ -352,6 +352,44 @@ nvmf_kvdev_get_contig_buf(struct spdk_nvmf_request *req, bool gather,
 	return buf;
 }
 
+/*
+ * B-i V3 (bead spdk-avu, MIXED-SGL): gather the CPU-readable HEAD of a KV Exec
+ * whose DPTR is a mixed SGL -- leading RAM segment(s) followed by a trailing
+ * dma-buf result_sink segment. \p head_iovcnt is the number of leading RAM iovs
+ * (== the dma-buf segment's index, since it is the last segment); we coalesce
+ * ONLY those into a freshly-allocated CPU buffer and must NOT touch the dma-buf
+ * segment (req->iov[head_iovcnt]), whose iov_base is a non-dereferenceable
+ * sentinel. The result lands entirely in the dma-buf body, so the head is
+ * input-only (never scattered back). Returns the head buffer (owned via
+ * kv_req->bounce) and its byte length in \p head_len, or NULL on OOM.
+ */
+static void *
+nvmf_kvdev_gather_ram_head(struct spdk_nvmf_request *req, uint8_t head_iovcnt,
+			   struct nvmf_kvdev_request *kv_req, uint32_t *head_len)
+{
+	uint32_t len = 0;
+	uint8_t i;
+	void *buf;
+
+	for (i = 0; i < head_iovcnt; i++) {
+		len += req->iov[i].iov_len;
+	}
+
+	buf = malloc(len ? len : 1);
+	if (buf == NULL) {
+		return NULL;
+	}
+
+	/* Coalesce only the leading RAM head iovs; the dma-buf segment is excluded. */
+	spdk_copy_iovs_to_buf(buf, len, req->iov, head_iovcnt);
+
+	kv_req->bounce = buf;
+	if (head_len != NULL) {
+		*head_len = len;
+	}
+	return buf;
+}
+
 int
 nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel *ch,
 				struct spdk_nvmf_request *req)
@@ -506,6 +544,20 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		const uint8_t *input;
 		uint32_t input_len;
 		uint16_t klp;
+		/*
+		 * B-i V3 (bead spdk-avu, MIXED-SGL): dma-buf result_sink (fd>=0 marks
+		 * VRAM-direct). The KV Exec DPTR is an SGL with leading RAM head
+		 * segment(s) (the [u16 key_len][key][input] payload, CPU-readable) and a
+		 * trailing dma-buf segment (the VRAM result_sink). kv_dmabuf_iovidx is the
+		 * index of the dma-buf segment within req->iov[]; the RAM head is
+		 * req->iov[0 .. kv_dmabuf_iovidx-1].
+		 */
+		int kv_dmabuf_fd = -1;
+		uint64_t kv_dmabuf_off = 0;
+		uint32_t kv_dmabuf_len = 0;
+		uint8_t kv_dmabuf_iovidx = 0;
+		uint64_t kv_dmabuf_iova = 0;
+		uint32_t head_len = xfer_len;
 
 		/*
 		 * Per-namespace KV Exec allowlist enforcement (ADR-0005). The trust
@@ -536,19 +588,112 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		}
 		kv_req->xfer_len = output_len;
 
-		/* Gather the input into a contiguous buffer (bounce when multi-iov);
-		 * the device overwrites it with output, then we scatter it back. */
-		data = nvmf_kvdev_get_contig_buf(req, true, kv_req);
-		if (data == NULL) {
-			goto err_nomem;
+		/*
+		 * B-i V3 (bead spdk-avu, MIXED-SGL): detect a dma-buf result_sink
+		 * (exported GPU VRAM) BEFORE touching the data buffer. The KV Exec DPTR
+		 * is a mixed SGL: leading RAM segment(s) (the CPU-readable [u16
+		 * key_len][key][input] HEAD) followed by a trailing dma-buf segment (the
+		 * VRAM result_sink, whose iov_base is a non-dereferenceable sentinel and
+		 * must NOT be CPU-read). The transport accessor reports the dma-buf
+		 * segment's (fd, offset, len, iovidx). The dispatch below routes such a
+		 * request to spdk_kvdev_exec_dmabuf(). Non-dma-buf requests leave
+		 * kv_dmabuf_fd == -1 and follow the byte-for-byte unchanged VA path.
+		 */
+		{
+			struct spdk_nvmf_transport *tr =
+				(req->qpair != NULL) ? req->qpair->transport : NULL;
+
+			if (tr != NULL && tr->ops->req_get_dmabuf_sink != NULL) {
+				(void)tr->ops->req_get_dmabuf_sink(req, &kv_dmabuf_fd,
+								   &kv_dmabuf_off, &kv_dmabuf_len,
+								   &kv_dmabuf_iovidx, &kv_dmabuf_iova);
+			}
+		}
+
+		/*
+		 * B-i V3 MIXED-SGL shape guard. Require exactly the
+		 * [RAM head segment(s) ...][dma-buf body] layout:
+		 *   - at least one RAM head segment precedes the dma-buf segment
+		 *     (kv_dmabuf_iovidx >= 1), so there is a key+input to parse; and
+		 *   - the dma-buf segment is the LAST segment
+		 *     (kv_dmabuf_iovidx == req->iovcnt - 1).
+		 * _map_one() already records only a SINGLE dma-buf sink per request, so a
+		 * second dma-buf segment never reaches here. Reject any other shape --
+		 * all-VRAM (no RAM head -> no key), a non-trailing dma-buf segment -- with
+		 * a clean status, never a crash. The non-dma-buf (all-RAM) path is
+		 * untouched (kv_dmabuf_fd < 0).
+		 */
+		if (kv_dmabuf_fd >= 0 &&
+		    (kv_dmabuf_iovidx < 1 || kv_dmabuf_iovidx != req->iovcnt - 1)) {
+			SPDK_ERRLOG("KV Exec dma-buf sink: unsupported SGL shape "
+				    "(iovidx=%u iovcnt=%u); require [RAM head][dma-buf body]\n",
+				    kv_dmabuf_iovidx, req->iovcnt);
+			free(kv_req);
+			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+			rsp->status.sc = SPDK_NVME_SC_DATA_SGL_LENGTH_INVALID;
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+
+		/*
+		 * B-i V3 sub-inline dma-buf sink reject (R2, silent-data-loss guard). A
+		 * two-tier backend returns a result that fits the RPC inline cap WITHOUT
+		 * registering a bulk MR; the front then has only host_out to copy the
+		 * inline bytes into. The dma-buf path has NO host_out (the result must be
+		 * RDMA-WRITTEN into device memory via a registered bulk), so a sink whose
+		 * declared length is <= the inline cap (SPDK_KVDEV_DMABUF_SINK_MIN_LEN)
+		 * would ride inline, be DROPPED by the front, yet still complete SUCCESS --
+		 * the guest believes VRAM was written but nothing was. sink_len is
+		 * guest-controlled, so reject it here with a clean status BEFORE dispatch
+		 * rather than silently lose data. A sub-inline dma-buf sink is unsupported
+		 * by design; fail it loudly.
+		 */
+		if (kv_dmabuf_fd >= 0 && kv_dmabuf_len <= SPDK_KVDEV_DMABUF_SINK_MIN_LEN) {
+			SPDK_ERRLOG("KV Exec dma-buf sink length %u <= inline cap %u: "
+				    "result would ride inline and be dropped; rejecting\n",
+				    kv_dmabuf_len, (uint32_t)SPDK_KVDEV_DMABUF_SINK_MIN_LEN);
+			free(kv_req);
+			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+			rsp->status.sc = SPDK_NVME_SC_DATA_SGL_LENGTH_INVALID;
+			return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+		}
+
+		/*
+		 * Obtain a CPU-readable buffer for the key+input parse.
+		 *
+		 * Non-dma-buf: gather the input into a contiguous buffer (bounce when
+		 * multi-iov); the device overwrites it with output, then we scatter it
+		 * back -- unchanged behavior. Parsed over the full payload (head_len ==
+		 * xfer_len).
+		 *
+		 * dma-buf result_sink (V3 mixed SGL): coalesce ONLY the leading RAM head
+		 * iov(s) (req->iov[0 .. kv_dmabuf_iovidx-1]) into a CPU buffer -- these
+		 * are real host VAs carrying [u16 key_len][key][input]. The dma-buf
+		 * segment (req->iov[kv_dmabuf_iovidx]) is excluded; its sentinel VA is
+		 * never read. The result lands ENTIRELY in the dma-buf body, so the head
+		 * is input-only (never scattered back). head_len is the RAM head byte
+		 * length, which bounds the key+input parse instead of xfer_len.
+		 */
+		if (kv_dmabuf_fd >= 0) {
+			data = nvmf_kvdev_gather_ram_head(req, kv_dmabuf_iovidx, kv_req,
+							  &head_len);
+			if (data == NULL) {
+				goto err_nomem;
+			}
+		} else {
+			data = nvmf_kvdev_get_contig_buf(req, true, kv_req);
+			if (data == NULL) {
+				goto err_nomem;
+			}
 		}
 
 		/*
 		 * Parse the payload-head key: [u16 key_len][key][input]. The header
-		 * (2 bytes) and the declared key must fit within the request payload
-		 * (xfer_len). Anything malformed is INVALID_KEY_SIZE before dispatch.
+		 * (2 bytes) and the declared key must fit within the parse bound
+		 * (head_len, == xfer_len for the all-RAM path; the RAM head byte length
+		 * for the mixed-SGL dma-buf path). Anything malformed is INVALID_KEY_SIZE
+		 * before dispatch.
 		 */
-		if (xfer_len < sizeof(uint16_t)) {
+		if (head_len < sizeof(uint16_t)) {
 			free(kv_req->bounce);
 			free(kv_req);
 			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
@@ -557,7 +702,7 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		}
 		memcpy(&klp, data, sizeof(klp));
 		if (klp < SPDK_KVDEV_KEY_MIN_LEN || klp > SPDK_KVDEV_EXEC_KEY_MAX_LEN ||
-		    (uint32_t)sizeof(uint16_t) + klp > xfer_len) {
+		    (uint32_t)sizeof(uint16_t) + klp > head_len) {
 			free(kv_req->bounce);
 			free(kv_req);
 			rsp->status.sct = SPDK_NVME_SCT_GENERIC;
@@ -567,7 +712,7 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		exec_key_len = (uint8_t)klp;
 		exec_key = (const uint8_t *)data + sizeof(uint16_t);
 		input = exec_key + exec_key_len;
-		input_len = xfer_len - sizeof(uint16_t) - exec_key_len;
+		input_len = head_len - sizeof(uint16_t) - exec_key_len;
 
 		/*
 		 * Slice C6c: record the kvdev cb_arg on the request so a later tenant
@@ -577,6 +722,48 @@ nvmf_kvdev_ctrlr_process_io_cmd(struct spdk_nvmf_ns *ns, struct spdk_io_channel 
 		 * correctly. KV Exec is the only long-running KV op that needs this.
 		 */
 		req->kvdev_io_ctx = kv_req;
+
+		/*
+		 * B-i V3 (bead spdk-avu, MIXED-SGL): VRAM-direct result sink. When the
+		 * transport resolved this request's DPTR to a [RAM head][dma-buf body]
+		 * mixed SGL (kv_dmabuf_fd >= 0 from the detection above), route to the
+		 * dma-buf exec op so a two-tier backend RDMA-WRITEs the result straight
+		 * into VRAM (nkvx_front_forward_dmabuf) instead of into a host VA. The
+		 * key+input were parsed from the RAM head above; the result lands ENTIRELY
+		 * in the dma-buf segment, so output_len == the dma-buf segment length
+		 * (kv_dmabuf_len). A non-dma-buf sink (kv_dmabuf_fd < 0) falls through to
+		 * the unchanged VA path.
+		 *
+		 * NOTE: kv_req->bounce holds the RAM head copy ONLY (input). The result is
+		 * never copied back to a host VA, so nvmf_kvdev_exec_done must NOT scatter
+		 * the bounce back into req->iov[] for the dma-buf path -- it would hit the
+		 * dma-buf segment's sentinel VA. kv_req->xfer_len is left at 0 below so the
+		 * completion's scatter-back is a no-op (the guarded copy only runs when
+		 * xfer_len > 0).
+		 */
+		if (kv_dmabuf_fd >= 0) {
+			/* The result is VRAM-only: disable host scatter-back in the
+			 * completion (the bounce is the input head, not an output sink). */
+			kv_req->xfer_len = 0;
+			rc = spdk_kvdev_exec_dmabuf(ns->kvdev_desc, ch, exec_key,
+						    exec_key_len, op_id, ns->kv_read_only,
+						    binding_arg, input, input_len,
+						    kv_dmabuf_fd, kv_dmabuf_off,
+						    kv_dmabuf_len, kv_dmabuf_iova,
+						    nvmf_kvdev_exec_done, kv_req);
+			if (rc == -ENOTSUP) {
+				/* Backend cannot target a dma-buf sink (single-tier, or no
+				 * two-tier front): fail rather than write the result to the
+				 * wrong place. */
+				req->kvdev_io_ctx = NULL;
+				free(kv_req->bounce);
+				free(kv_req);
+				rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+				rsp->status.sc = SPDK_NVME_SC_INVALID_OPCODE;
+				return SPDK_NVMF_REQUEST_EXEC_STATUS_COMPLETE;
+			}
+			break;
+		}
 
 		rc = spdk_kvdev_exec(ns->kvdev_desc, ch, exec_key, exec_key_len, op_id,
 				     ns->kv_read_only, binding_arg, input, input_len,

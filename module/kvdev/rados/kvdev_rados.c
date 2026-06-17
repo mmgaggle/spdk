@@ -1851,6 +1851,57 @@ kvdev_rados_nkvx_exec_forward(struct kvdev_rados_io_channel *ch,
 }
 
 /*
+ * B-i V2 (bead spdk-avu): like kvdev_rados_nkvx_exec_forward(), but the result
+ * sink is a dma-buf (exported GPU VRAM) given by (sink_fd, sink_offset, sink_len)
+ * rather than a host VA. Identical per-command cancel retention; only the bridge
+ * call differs (kvdev_rados_nkvx_front_forward_dmabuf -> nkvx_front_forward_dmabuf).
+ * sink_va is the advertised VA / cache key (NULL for a pure-VRAM sink).
+ */
+static int
+kvdev_rados_nkvx_exec_forward_dmabuf(struct kvdev_rados_io_channel *ch,
+				     const void *key, uint8_t key_len,
+				     uint32_t op_id, bool read_only, uint8_t runtime,
+				     const char *module_key, const char *module_ns,
+				     const uint8_t *sha256, bool sha256_valid,
+				     uint64_t caps,
+				     const void *input, uint32_t input_len,
+				     void *sink_va, uint32_t sink_len,
+				     int sink_fd, uint64_t sink_offset,
+				     spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_rados_nkvx_pending *p;
+	uint64_t token = KVDEV_RADOS_NKVX_TOKEN_NONE;
+	int frc;
+
+	p = calloc(1, sizeof(*p));
+	if (p == NULL) {
+		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_NOMEM, 0);
+		return 0;
+	}
+	p->ch = ch;
+	p->tenant_cb_fn = cb_fn;
+	p->tenant_cb_arg = cb_arg;
+
+	/* Insert retention BEFORE forwarding (same ordering invariant as the VA path). */
+	TAILQ_INSERT_TAIL(&ch->nkvx_pending, p, link);
+
+	frc = kvdev_rados_nkvx_front_forward_dmabuf(ch->front, key, key_len, op_id,
+						    read_only, runtime, module_key, module_ns,
+						    sha256, sha256_valid, caps,
+						    input, input_len, sink_va, sink_len,
+						    sink_fd, sink_offset,
+						    kvdev_rados_nkvx_fwd_done, p, &token);
+	if (frc != 0) {
+		TAILQ_REMOVE(&ch->nkvx_pending, p, link);
+		free(p);
+		cb_fn(cb_arg, kvdev_rados_xlate_status(KVDEV_RADOS_OP_NKVX_EXEC, frc), 0);
+		return 0;
+	}
+	p->token = token;
+	return 0;
+}
+
+/*
  * Slice C6c per-command (tenant NVMe ABORT) abort entrypoint. Find the in-flight
  * two-tier Exec forward submitted with this opaque \p cb_arg and route it through
  * the UAF-safe per-command cancel handshake (the executor stops PUSHing into the
@@ -2117,6 +2168,101 @@ kvdev_rados_exec(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
 }
 
 /*
+ * B-i V2 (bead spdk-avu): KV Exec whose RESULT SINK is a dma-buf (exported GPU
+ * VRAM) rather than a host VA. ONLY the two-tier (ch->front != NULL) wasm/built-in
+ * path is supported: the dma-buf fd is forwarded to the remote executor, which
+ * RDMA-WRITEs the result straight into VRAM (nkvx_front_forward_dmabuf). Any other
+ * shape -- single-tier (in-process executor / legacy cls, which have no remote
+ * RDMA sink), a non-wasm/non-built-in binding, or a build without Mercury --
+ * returns -ENOTSUP so the NVMf layer fails the command rather than mis-targeting
+ * the result. The auth/runtime gating mirrors kvdev_rados_exec() exactly.
+ */
+static int
+kvdev_rados_exec_dmabuf(struct spdk_io_channel *_ch, const void *key, uint8_t key_len,
+			uint32_t op_id, bool read_only,
+			const struct spdk_kv_exec_binding *binding,
+			const void *input, uint32_t input_len,
+			int sink_fd, uint64_t sink_offset, uint32_t sink_len,
+			uint64_t sink_va,
+			spdk_kvdev_io_completion_cb cb_fn, void *cb_arg)
+{
+	struct kvdev_rados_io_channel *ch = spdk_io_channel_get_ctx(_ch);
+	/*
+	 * B-i V3: sink_va is the guest IOVA the result_sink SGL segment advertised. It
+	 * is load-bearing as the verbs/irdma dma-buf MR base (FI_MR_VIRT_ADDR) and is
+	 * forwarded as the bulk's advertised VA; it is NEVER dereferenced here.
+	 */
+	void *sink_va_p = (void *)(uintptr_t)sink_va;
+
+	(void)op_id;
+
+	if (binding == NULL) {
+		SPDK_ERRLOG("KV Exec (dma-buf): missing structured binding\n");
+		cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+		return 0;
+	}
+	if (sink_fd < 0) {
+		return -EINVAL;
+	}
+
+#ifdef SPDK_CONFIG_MERCURY
+	/* Two-tier only: a dma-buf sink has no meaning for the in-process executor. */
+	if (ch->front == NULL) {
+		return -ENOTSUP;
+	}
+
+	/* Verified wasm binding (same deny-by-default gates as kvdev_rados_exec). */
+	if (binding->runtime == SPDK_KV_EXEC_RUNTIME_WASM) {
+		const char *module = binding->module_key;
+
+		if (module == NULL || module[0] == '\0' || !binding->sha256_valid ||
+		    binding->module_namespace == NULL || binding->module_namespace[0] == '\0') {
+			SPDK_ERRLOG("nkvx(dma-buf): wasm binding missing module/sha256/locator "
+				    "— REJECTED\n");
+			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+			return 0;
+		}
+		return kvdev_rados_nkvx_exec_forward_dmabuf(ch, key, key_len, op_id,
+				read_only, (uint8_t)binding->runtime,
+				binding->module_key, binding->module_namespace,
+				binding->sha256, true, binding->caps,
+				input, input_len, sink_va_p, sink_len,
+				sink_fd, sink_offset, cb_fn, cb_arg);
+	}
+
+	/* Built-in "nkvx:<module>" (cls namespace == "nkvx", no sha256). */
+	if (binding->runtime == SPDK_KV_EXEC_RUNTIME_CLS &&
+	    binding->module_namespace != NULL &&
+	    strcmp(binding->module_namespace, KVDEV_RADOS_NKVX_CLS_NAMESPACE) == 0) {
+		const char *module = binding->module_key;
+
+		if (module == NULL || module[0] == '\0' ||
+		    strncmp(module, KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX,
+			    strlen(KVDEV_RADOS_NKVX_MODULE_WASM_PREFIX)) == 0) {
+			SPDK_ERRLOG("nkvx(dma-buf): invalid/real-wasm built-in module — REJECTED\n");
+			cb_fn(cb_arg, SPDK_KVDEV_IO_STATUS_INVALID, 0);
+			return 0;
+		}
+		return kvdev_rados_nkvx_exec_forward_dmabuf(ch, key, key_len, op_id,
+				read_only, (uint8_t)SPDK_KV_EXEC_RUNTIME_CLS,
+				module, KVDEV_RADOS_NKVX_CLS_NAMESPACE,
+				NULL, false, 0,
+				input, input_len, sink_va_p, sink_len,
+				sink_fd, sink_offset, cb_fn, cb_arg);
+	}
+
+	/* A legacy Ceph object-class method has no remote RDMA sink: unsupported. */
+	return -ENOTSUP;
+#else
+	(void)ch; (void)key; (void)key_len; (void)read_only; (void)binding;
+	(void)input; (void)input_len; (void)sink_offset; (void)sink_len; (void)cb_fn;
+	(void)cb_arg; (void)sink_va_p;
+	/* No Mercury: no two-tier remote executor to RDMA into the dma-buf. */
+	return -ENOTSUP;
+#endif
+}
+
+/*
  * List is deferred for the rados backend (ADR-0002): rados object enumeration is
  * an unordered cursor that cannot seek to a spec start-key, so spec-conformant
  * paginated List is out of scope for this slice. Report command-not-supported.
@@ -2323,6 +2469,9 @@ static const struct spdk_kvdev_fn_table kvdev_rados_fn_table = {
 	.exist		= kvdev_rados_exist,
 	.list		= kvdev_rados_list,
 	.exec		= kvdev_rados_exec,
+	/* B-i V2 (bead spdk-avu): VRAM-direct (dma-buf) result-sink Exec. Always
+	 * present; without CONFIG_MERCURY (or single-tier) it returns -ENOTSUP. */
+	.exec_dmabuf	= kvdev_rados_exec_dmabuf,
 #ifdef SPDK_CONFIG_MERCURY
 	/* Slice C6c: per-command (tenant NVMe ABORT) cancel of an in-flight two-tier
 	 * Exec forward. Only present under CONFIG_MERCURY: a non-Mercury build has no
