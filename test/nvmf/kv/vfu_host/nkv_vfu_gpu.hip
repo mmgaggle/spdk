@@ -140,35 +140,93 @@ ring_wavefront(struct spdk_nvme_cmd *sq, uint16_t base, uint16_t depth,
 }
 
 /*
- * Fire n GPU-initiated KV Stores in a single wavefront + single doorbell, then
- * reap n completions. Keys are <prefix>0..<prefix>(n-1); each value is distinct.
+ * Ring n pre-built SQEs in one wavefront + one doorbell, then reap n completions.
+ * Returns the number that completed SUCCESS, or -1 on a GPU/timeout error.
+ * Callers fill cmds[i] (incl. cid) and any DMA buffers before calling.
  */
+static int
+gpu_batch_ring_reap(struct nvfu_dev *d, struct spdk_nvme_cmd *cmds, uint32_t n)
+{
+	struct nvfu_queue *q = &d->io;
+	struct spdk_nvme_cmd *cmds_dev = NULL;
+	uint16_t base = q->sq_tail;
+	uint16_t new_tail = (uint16_t)((base + n) % q->depth);
+	uint32_t reaped, ok = 0;
+	hipError_t e;
+
+	e = hipHostRegister(cmds, n * sizeof(*cmds), hipHostRegisterMapped);
+	if (e != hipSuccess) {
+		fprintf(stderr, "hipHostRegister(cmds): %s\n", hipGetErrorString(e));
+		return -1;
+	}
+	(void)hipHostGetDevicePointer((void **)&cmds_dev, cmds, 0);
+
+	ring_wavefront<<<1, n>>>(g_sq_dev, base, q->depth, cmds_dev, n,
+				 g_db_dev, q->sq_db, new_tail);
+	e = hipDeviceSynchronize();
+	hipHostUnregister(cmds);
+	if (e != hipSuccess) {
+		fprintf(stderr, "wavefront kernel failed: %s\n", hipGetErrorString(e));
+		return -1;
+	}
+	q->sq_tail = new_tail;
+
+	for (reaped = 0; reaped < n; reaped++) {
+		volatile struct spdk_nvme_cpl *cqe = &q->cq[q->cq_head];
+		uint64_t deadline = spdk_get_ticks() + 5 * spdk_get_ticks_hz();
+
+		while (cqe->status.p != q->cq_phase) {
+			if (spdk_get_ticks() > deadline) {
+				fprintf(stderr, "batch reap timeout %u/%u\n", reaped, n);
+				return (int)ok;
+			}
+			spdk_pause();
+		}
+		spdk_rmb();
+		if (cqe->status.sc == 0 && cqe->status.sct == 0) {
+			ok++;
+		}
+		q->cq_head = (q->cq_head + 1) % q->depth;
+		if (q->cq_head == 0) {
+			q->cq_phase ^= 1;
+		}
+		d->doorbells[q->cq_db] = q->cq_head;
+	}
+	return (int)ok;
+}
+
+static const char *
+wf_desc(uint32_t n)	/* "1 wavefront" / "3 wavefronts" */
+{
+	static char b[24];
+	uint32_t w = (n + 31) / 32;
+
+	snprintf(b, sizeof(b), "%u wavefront%s", w, (w > 1) ? "s" : "");
+	return b;
+}
+
+/* n GPU-initiated KV Stores in one wavefront + one doorbell. */
 static int
 gpu_store_batch(struct nvfu_dev *d, const char *prefix, uint32_t n)
 {
 	struct nvfu_queue *q = &d->io;
 	const uint32_t SLOT = 4096;	/* one page per value -> single PRP */
-	struct spdk_nvme_cmd *cmds = NULL, *cmds_dev = NULL;
+	struct spdk_nvme_cmd *cmds = NULL;
 	char *vbuf = NULL;
 	uint64_t vbuf_iova = 0;
-	uint16_t base, new_tail;
-	uint32_t i, reaped, ok = 0;
-	hipError_t e;
-	int rc = -EIO;
+	uint32_t i;
+	int ok, rc = -EIO;
 
 	if (n == 0 || n > q->depth || n > 1024) {
 		fprintf(stderr, "batch n must be 1..%u\n", (q->depth < 1024) ? q->depth : 1024);
 		return -EINVAL;
 	}
-
 	cmds = (struct spdk_nvme_cmd *)nvfu_dma_alloc(n * sizeof(*cmds), NULL);
 	vbuf = (char *)nvfu_dma_alloc((size_t)n * SLOT, &vbuf_iova);
 	if (!cmds || !vbuf) {
 		fprintf(stderr, "batch alloc failed\n");
 		goto done;
 	}
-
-	base = q->sq_tail;
 	for (i = 0; i < n; i++) {
 		char key[32], val[64];
 		int klen = snprintf(key, sizeof(key), "%s%u", prefix, i);
@@ -186,55 +244,88 @@ gpu_store_batch(struct nvfu_dev *d, const char *prefix, uint32_t n)
 	}
 	spdk_wmb();
 
-	e = hipHostRegister(cmds, n * sizeof(*cmds), hipHostRegisterMapped);
-	if (e != hipSuccess) {
-		fprintf(stderr, "hipHostRegister(cmds): %s\n", hipGetErrorString(e));
+	ok = gpu_batch_ring_reap(d, cmds, n);
+	if (ok < 0) {
 		goto done;
 	}
-	(void)hipHostGetDevicePointer((void **)&cmds_dev, cmds, 0);
-
-	new_tail = (uint16_t)((base + n) % q->depth);
-	ring_wavefront<<<1, n>>>(g_sq_dev, base, q->depth, cmds_dev, n,
-				 g_db_dev, q->sq_db, new_tail);
-	e = hipDeviceSynchronize();
-	hipHostUnregister(cmds);
-	if (e != hipSuccess) {
-		fprintf(stderr, "wavefront kernel failed: %s\n", hipGetErrorString(e));
-		goto done;
-	}
-	q->sq_tail = new_tail;
-
-	/* reap n completions (any order; all should be SUCCESS) */
-	for (reaped = 0; reaped < n; reaped++) {
-		volatile struct spdk_nvme_cpl *cqe = &q->cq[q->cq_head];
-		uint64_t deadline = spdk_get_ticks() + 5 * spdk_get_ticks_hz();
-
-		while (cqe->status.p != q->cq_phase) {
-			if (spdk_get_ticks() > deadline) {
-				fprintf(stderr, "batch reap timeout %u/%u\n", reaped, n);
-				goto done;
-			}
-			spdk_pause();
-		}
-		spdk_rmb();
-		if (cqe->status.sc == 0 && cqe->status.sct == 0) {
-			ok++;
-		}
-		q->cq_head = (q->cq_head + 1) % q->depth;
-		if (q->cq_head == 0) {
-			q->cq_phase ^= 1;
-		}
-		d->doorbells[q->cq_db] = q->cq_head;
-	}
-
-	printf("WAVEFRONT STORE-BATCH ok: %u/%u GPU-initiated stores in ONE doorbell "
-	       "(%u-lane launch = %u wavefront%s), keys %s0..%s%u\n",
-	       ok, n, n, (n + 31) / 32, ((n + 31) / 32 > 1) ? "s" : "",
-	       prefix, prefix, n - 1);
-	rc = (ok == n) ? 0 : -EIO;
+	printf("WAVEFRONT STORE-BATCH ok: %d/%u GPU-initiated stores in ONE doorbell "
+	       "(%u-lane = %s), keys %s0..%s%u\n",
+	       ok, n, n, wf_desc(n), prefix, prefix, n - 1);
+	rc = ((uint32_t)ok == n) ? 0 : -EIO;
 done:
 	spdk_dma_free(cmds);
 	spdk_dma_free(vbuf);
+	return rc;
+}
+
+/*
+ * n GPU-initiated KV Execs (op_id) against keys <prefix>0..<prefix>(n-1) in one
+ * wavefront + one doorbell. Each Exec routes through rados-nkv to the two-tier
+ * rados-nkvx executor; results land back in per-Exec buffers (in-place).
+ */
+static int
+gpu_exec_batch(struct nvfu_dev *d, const char *prefix, uint32_t op_id, uint32_t n)
+{
+	struct nvfu_queue *q = &d->io;
+	const uint32_t SLOT = 4096;
+	struct spdk_nvme_cmd *cmds = NULL;
+	char *buf = NULL;
+	uint64_t buf_iova = 0;
+	uint32_t i;
+	int ok, rc = -EIO;
+
+	if (n == 0 || n > q->depth || n > 1024) {
+		fprintf(stderr, "batch n must be 1..%u\n", (q->depth < 1024) ? q->depth : 1024);
+		return -EINVAL;
+	}
+	cmds = (struct spdk_nvme_cmd *)nvfu_dma_alloc(n * sizeof(*cmds), NULL);
+	buf = (char *)nvfu_dma_alloc((size_t)n * SLOT, &buf_iova);
+	if (!cmds || !buf) {
+		fprintf(stderr, "batch alloc failed\n");
+		goto done;
+	}
+	for (i = 0; i < n; i++) {
+		char key[32];
+		uint8_t klen = (uint8_t)snprintf(key, sizeof(key), "%s%u", prefix, i);
+		uint16_t klp = klen;
+		char *slot = buf + (size_t)i * SLOT;
+		struct spdk_nvme_cmd *c = &cmds[i];
+		uint32_t payload_len = (uint32_t)sizeof(uint16_t) + klen;	/* input_len 0 */
+
+		/* ADR-0014 request head: [u16 key_len][key] */
+		memcpy(slot, &klp, sizeof(klp));
+		memcpy(slot + sizeof(klp), key, klen);
+		memset(c, 0, sizeof(*c));
+		c->opc = SPDK_NVME_OPC_KV_EXEC;
+		c->nsid = KV_NSID;
+		c->dptr.prp.prp1 = buf_iova + (uint64_t)i * SLOT;
+		c->cdw10_bits.kv.vsize = payload_len;
+		c->cdw12_bits.kv_exec.osize = SLOT;
+		c->cdw13_bits.kv_exec.op_id = op_id;
+		c->cid = q->cid++;
+	}
+	spdk_wmb();
+
+	ok = gpu_batch_ring_reap(d, cmds, n);
+	if (ok < 0) {
+		goto done;
+	}
+	spdk_rmb();
+	printf("WAVEFRONT EXEC-BATCH ok: %d/%u GPU-initiated Execs (op %u) in ONE doorbell "
+	       "(%u-lane = %s) -> two-tier executor, keys %s0..%s%u\n",
+	       ok, n, op_id, n, wf_desc(n), prefix, prefix, n - 1);
+	if (op_id == 10) {	/* nkvx:bytecount -> LE u64 per Exec, in its own buffer */
+		uint64_t c0 = 0, cl = 0;
+
+		memcpy(&c0, buf, 8);
+		memcpy(&cl, buf + (size_t)(n - 1) * SLOT, 8);
+		printf("  sample bytecount: %s0=%llu  %s%u=%llu\n",
+		       prefix, (unsigned long long)c0, prefix, n - 1, (unsigned long long)cl);
+	}
+	rc = ((uint32_t)ok == n) ? 0 : -EIO;
+done:
+	spdk_dma_free(cmds);
+	spdk_dma_free(buf);
 	return rc;
 }
 
@@ -247,10 +338,11 @@ usage(const char *prog)
 		"  %s <traddr> retrieve   <key>           GPU-initiated KV Retrieve\n"
 		"  %s <traddr> exec       <key> <op_id>   GPU-initiated KV Exec (10=bytecount, 11=identity)\n"
 		"  %s <traddr> store-batch <prefix> <N>   N GPU Stores in ONE wavefront + ONE doorbell\n"
+		"  %s <traddr> exec-batch <prefix> <op_id> <N>  N GPU Execs in ONE wavefront (two-tier)\n"
 		"  %s <traddr> [demo]                     store+retrieve self-test\n"
 		"  %s <traddr> demo-exec                  store+retrieve+exec self-test\n"
 		"<traddr> is the VFIOUSER listener dir containing 'cntrl'.\n",
-		prog, prog, prog, prog, prog, prog);
+		prog, prog, prog, prog, prog, prog, prog);
 }
 
 int
@@ -276,7 +368,8 @@ main(int argc, char **argv)
 	if ((!strcmp(mode, "store") && argc != 5) ||
 	    (!strcmp(mode, "retrieve") && argc != 4) ||
 	    (!strcmp(mode, "exec") && argc != 5) ||
-	    (!strcmp(mode, "store-batch") && argc != 5)) {
+	    (!strcmp(mode, "store-batch") && argc != 5) ||
+	    (!strcmp(mode, "exec-batch") && argc != 6)) {
 		usage(argv[0]);
 		return 1;
 	}
@@ -316,6 +409,14 @@ main(int argc, char **argv)
 		const char *prefix = argv[3];
 		uint32_t nbatch = (uint32_t)strtoul(argv[4], NULL, 0);
 		if (gpu_store_batch(&d, prefix, nbatch) != 0) {
+			goto out;
+		}
+		rc = 0;
+	} else if (!strcmp(mode, "exec-batch")) {
+		const char *prefix = argv[3];
+		uint32_t op_id = (uint32_t)strtoul(argv[4], NULL, 0);
+		uint32_t nbatch = (uint32_t)strtoul(argv[5], NULL, 0);
+		if (gpu_exec_batch(&d, prefix, op_id, nbatch) != 0) {
 			goto out;
 		}
 		rc = 0;
