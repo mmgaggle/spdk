@@ -81,6 +81,70 @@ int spdk_nvme_kv_store(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 		       uint8_t options);
 
 /**
+ * Size-versioned options for spdk_nvme_kv_store_ext().
+ *
+ * Vendor extension (ADR-0003). The struct is versioned by its leading \c size
+ * field so later additions stay ABI-compatible: callers set \c size to
+ * sizeof(struct spdk_nvme_kv_store_ext_opts) and the driver only reads members
+ * that fall within the supplied size. Populate via
+ * spdk_nvme_kv_store_ext_opts_init() before setting fields.
+ */
+struct spdk_nvme_kv_store_ext_opts {
+	/** Size of this structure as known to the caller. Must be set first. */
+	size_t		size;
+	/**
+	 * Time-to-live in seconds. When non-zero, the driver sets CDW12 to this
+	 * value and the TTL Valid Store Option bit
+	 * (SPDK_NVME_KV_STORE_OPT_TTL_VALID) in CDW11. The target persists the
+	 * TTL but does NOT enforce expiry (store-only). A zero TTL means "no
+	 * TTL" and leaves CDW12 / the TTL Valid bit clear.
+	 */
+	uint32_t	ttl;
+};
+
+/**
+ * Initialize a KV Store ext options struct to defaults. \c size is typically
+ * sizeof(struct spdk_nvme_kv_store_ext_opts).
+ */
+static inline void
+spdk_nvme_kv_store_ext_opts_init(struct spdk_nvme_kv_store_ext_opts *opts, size_t size)
+{
+	memset(opts, 0, size);
+	opts->size = size;
+}
+
+/**
+ * Submit a KV Store command with vendor extension options (ADR-0003).
+ *
+ * Behaves exactly like spdk_nvme_kv_store() but additionally carries a
+ * size-versioned opts struct. When opts->ttl is non-zero the command sets the
+ * TTL Valid Store Option bit and CDW12 = opts->ttl (seconds); the target
+ * persists the TTL without enforcing expiry.
+ *
+ * \param ns NVMe namespace to submit the KV Store command.
+ * \param qpair I/O queue pair to submit the request.
+ * \param key Pointer to the key buffer.
+ * \param key_len Length of the key in bytes (SPDK_NVME_KV_KEY_MIN_LEN to SPDK_NVME_KV_KEY_MAX_LEN).
+ * \param value Pointer to the value buffer.
+ * \param value_len Length of the value in bytes.
+ * \param cb_fn Callback function to invoke when the I/O is completed.
+ * \param cb_arg Argument to pass to the callback function.
+ * \param options Store options, see spdk_nvme_kv_store_option in nvme_spec.h.
+ * \param opts Size-versioned extension options (may be NULL for none).
+ *
+ * \return 0 if successfully submitted, negated errnos on the following error conditions:
+ * -EINVAL: The request is malformed.
+ * -ENOMEM: The request cannot be allocated.
+ * -ENXIO: The qpair is failed at the transport level.
+ */
+int spdk_nvme_kv_store_ext(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+			   const void *key, uint8_t key_len,
+			   const void *value, uint32_t value_len,
+			   spdk_nvme_cmd_cb cb_fn, void *cb_arg,
+			   uint8_t options,
+			   const struct spdk_nvme_kv_store_ext_opts *opts);
+
+/**
  * Submit a KV Retrieve command to the specified NVMe namespace.
  *
  * The command is submitted to a qpair allocated by spdk_nvme_ctrlr_alloc_io_qpair().
@@ -178,6 +242,49 @@ int spdk_nvme_kv_exist(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 int spdk_nvme_kv_list(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 		      const void *start_key, uint8_t start_key_len,
 		      void *buffer, uint32_t buffer_len,
+		      spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+
+/**
+ * Submit a vendor KV Exec command (ADR-0005) to the specified NVMe namespace.
+ *
+ * KV Exec runs a server-side operation selected by \c op_id against \c key. It
+ * is bidirectional over a single data buffer: the \c input blob is sent to the
+ * controller, and the controller's output is scattered back into \c output
+ * (bounded by \c output_len). The true output length is returned in the
+ * completion's DW0; if it exceeds \c output_len the output is truncated to
+ * \c output_len bytes (same contract as KV Retrieve), and the command still
+ * succeeds.
+ *
+ * \c input and \c output may be the same buffer. When distinct, the first
+ * \c input_len bytes of \c input are staged into \c output before submission,
+ * so \c output must be DMA-capable and \c input_len must not exceed
+ * \c output_len.
+ *
+ * The command is submitted to a qpair allocated by
+ * spdk_nvme_ctrlr_alloc_io_qpair(). The user must ensure that only one thread
+ * submits I/O on a given qpair at any given time.
+ *
+ * \param ns NVMe namespace to submit the KV Exec command.
+ * \param qpair I/O queue pair to submit the request.
+ * \param key Pointer to the key buffer.
+ * \param key_len Length of the key in bytes (SPDK_NVME_KV_KEY_MIN_LEN to SPDK_NVME_KV_KEY_MAX_LEN).
+ * \param op_id Operation identifier selecting the server-side operation.
+ * \param input Pointer to the input blob (may be NULL when input_len is 0).
+ * \param input_len Length of the input blob in bytes (<= output_len).
+ * \param output Pointer to the (DMA-capable) output buffer.
+ * \param output_len Length of the output buffer in bytes (also the max output).
+ * \param cb_fn Callback function to invoke when the I/O is completed.
+ * \param cb_arg Argument to pass to the callback function.
+ *
+ * \return 0 if successfully submitted, negated errnos on the following error conditions:
+ * -EINVAL: The request is malformed (bad key, NULL/zero output, input_len > output_len).
+ * -ENOMEM: The request cannot be allocated.
+ * -ENXIO: The qpair is failed at the transport level.
+ */
+int spdk_nvme_kv_exec(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+		      const void *key, uint8_t key_len, uint32_t op_id,
+		      const void *input, uint32_t input_len,
+		      void *output, uint32_t output_len,
 		      spdk_nvme_cmd_cb cb_fn, void *cb_arg);
 
 #ifdef __cplusplus
