@@ -433,8 +433,8 @@ tgt_endpoint_realize(struct spdk_vfu_endpoint *endpoint)
 			      region->nr_sparse_mmaps, region->fd);
 	}
 
-	ret = vfu_setup_device_dma(endpoint->vfu_ctx, tgt_memory_region_add_cb,
-				   tgt_memory_region_remove_cb);
+	ret = vfu_setup_device_dma(endpoint->vfu_ctx, LIBVFIO_USER_MAX_DMA_REGIONS,
+				   tgt_memory_region_add_cb, tgt_memory_region_remove_cb);
 	if (ret < 0) {
 		SPDK_ERRLOG("vfu_ctx %p failed to setup dma callback\n", endpoint->vfu_ctx);
 		goto error;
